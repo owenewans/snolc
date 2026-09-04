@@ -4,6 +4,8 @@
 
 userspace-stack proxy for linux and android.
 
+<a href="https://count.owenewans.org/owenewans/owenclave?theme=moebooru-h&notitle"><img src="https://count.owenewans.org/owenewans/owenclave?theme=moebooru-h&notitle" alt="repository views"></a>
+
 `rust` `smoltcp` `tcp` `udp` `ipv4` `ipv6`
 
 </div>
@@ -73,7 +75,3 @@ cargo test --all-targets
 ```
 
 Native Windows is not supported. Use WSL.
-
-## license
-
-BSD-2-Clause. See `LICENSE`.
