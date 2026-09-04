@@ -1,0 +1,20 @@
+pub mod carrier;
+pub mod cli;
+pub mod config;
+pub mod error;
+pub mod fragment;
+pub mod frame;
+pub mod handshake;
+pub mod identity;
+pub mod inbound;
+pub mod logging;
+pub mod mux;
+pub mod outbound;
+pub mod protection;
+pub mod routing;
+pub mod runtime;
+pub mod tunnel;
+pub mod wire_io;
+
+pub const COMMIT_VERSION: &str = env!("SNOLC_COMMIT");
+pub const WIRE_VERSION: u32 = 1;
