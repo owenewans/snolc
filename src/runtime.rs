@@ -220,7 +220,6 @@ async fn run_server(path: PathBuf, config: Config, logger: Logger) -> Result<()>
         .ok_or_else(|| Error::Config("server limits are required".to_owned()))?;
     let mode = config.protection.mode;
     let heartbeat = Duration::from_secs(config.heartbeat);
-    let carrier = Arc::new(CarrierRuntime::server(config.carrier.clone(), logger.clone()).await?);
 
     let allowed = tunnel::decode_public_keys(
         config
@@ -240,6 +239,11 @@ async fn run_server(path: PathBuf, config: Config, logger: Logger) -> Result<()>
     let (auth_tx, auth_rx) = watch::channel(ServerAuth::new(allowed, unknown));
     tokio::spawn(reload_auth(path, auth_tx, logger.clone()));
 
+    if matches!(config.carrier, crate::config::Carrier::Ssh { .. }) {
+        return run_ssh_server(bind, mode, heartbeat, limits, auth_rx, logger).await;
+    }
+
+    let carrier = Arc::new(CarrierRuntime::server(config.carrier.clone(), logger.clone()).await?);
     let listener = TcpListener::bind(&bind).await?;
     let semaphore = Arc::new(Semaphore::new(limits.connections));
 
@@ -303,10 +307,26 @@ async fn handle_connection(
     auth: watch::Receiver<ServerAuth>,
     logger: &Logger,
 ) -> Result<()> {
-    let mut stream = match carrier.accept(stream).await? {
+    let stream = match carrier.accept(stream).await? {
         Accepted::Tunnel(stream) => stream,
         Accepted::Handled => return Ok(()),
     };
+    serve_tunnel(stream, mode, heartbeat, limits, auth, logger).await
+}
+
+/// Runs the snolc handshake and, on success, the multiplexed session, over
+/// an already carrier-established stream. Shared by every carrier: for
+/// plain/acme/steal HTTP carriers `stream` comes from one accepted TCP
+/// connection; for the SSH carrier it comes from one opened SSH channel
+/// (see [`run_ssh_server`]), of which there may be several per connection.
+async fn serve_tunnel(
+    mut stream: crate::carrier::BoxedStream,
+    mode: ProtectionMode,
+    heartbeat: Duration,
+    limits: crate::config::Limits,
+    auth: watch::Receiver<ServerAuth>,
+    logger: &Logger,
+) -> Result<()> {
     let hello = read_client_hello(&mut stream).await?;
     let identity = crate::handshake::peek_client_identity(&hello.payload)?;
 
@@ -319,6 +339,61 @@ async fn handle_connection(
     let window = limits.streams * yamux::DEFAULT_CREDIT as usize;
     let (server_mux, incoming) = mux::spawn(stream, yamux::Mode::Server, limits.streams, window)?;
     tunnel::serve_session(incoming, server_mux, established.master, mode, heartbeat).await
+}
+
+/// The SSH carrier's server accept loop. Structurally different from the
+/// other carriers: russh owns the per-connection protocol loop and hands
+/// channels to a callback rather than returning a stream synchronously, so
+/// it cannot go through [`CarrierRuntime::accept`]. `serve_tunnel` runs once
+/// per opened "session" channel.
+async fn run_ssh_server(
+    bind: String,
+    mode: ProtectionMode,
+    heartbeat: Duration,
+    limits: crate::config::Limits,
+    auth_rx: watch::Receiver<ServerAuth>,
+    logger: Logger,
+) -> Result<()> {
+    let host_key = Arc::new(crate::ssh::generate_host_key()?);
+    let listener = TcpListener::bind(&bind).await?;
+    let semaphore = Arc::new(Semaphore::new(limits.connections));
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        stream.set_nodelay(true)?;
+
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            logger.record(Level::Warning, "connection limit reached, dropping client");
+            continue;
+        };
+
+        let host_key = host_key.clone();
+        let auth_for_connection = auth_rx.clone();
+        let limits_for_connection = limits.clone();
+        let logger_for_connection = logger.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let auth_for_channel = auth_for_connection;
+            let limits_for_channel = limits_for_connection;
+            let logger_for_channel = logger_for_connection.clone();
+            let callback: Arc<dyn Fn(crate::carrier::BoxedStream) + Send + Sync> =
+                Arc::new(move |stream| {
+                    let auth = auth_for_channel.clone();
+                    let limits = limits_for_channel.clone();
+                    let logger = logger_for_channel.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            serve_tunnel(stream, mode, heartbeat, limits, auth, &logger).await
+                        {
+                            logger.record(Level::Debug, &format!("client {peer}: {error}"));
+                        }
+                    });
+                });
+            if let Err(error) = crate::ssh::accept(stream, host_key, callback).await {
+                logger_for_connection.record(Level::Debug, &format!("client {peer}: {error}"));
+            }
+        });
+    }
 }
 
 async fn respond_to_unknown_client(
@@ -465,6 +540,133 @@ http: null
 
         let server = tokio::spawn(async move { run(&server_path, Logger::disabled()).await });
         let client = tokio::spawn(async move { run(&client_path, Logger::disabled()).await });
+
+        let mut socks_stream = connect_with_retries(socks_port).await;
+        socks_stream.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0_u8; 2];
+        socks_stream.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        let mut request = vec![5, 1, 0, 1];
+        let IpAddr::V4(ip) = destination_address.ip() else {
+            unreachable!("loopback listener is always IPv4 here")
+        };
+        request.extend_from_slice(&ip.octets());
+        request.extend_from_slice(&destination_address.port().to_be_bytes());
+        socks_stream.write_all(&request).await.unwrap();
+        let mut reply = [0_u8; 10];
+        socks_stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0, "SOCKS5 CONNECT must succeed");
+
+        socks_stream.write_all(b"snolc").await.unwrap();
+        let mut echoed = [0_u8; 5];
+        socks_stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"snolc");
+
+        drop(socks_stream);
+        echo.await.unwrap();
+        server.abort();
+        client.abort();
+    }
+
+    /// Same end-to-end flow as above, but through the SSH carrier instead of
+    /// the HTTP one: a real SSH key exchange and session, a "session"
+    /// channel used as the transport, and a real snolc handshake and
+    /// yamux session running inside it.
+    #[tokio::test]
+    async fn client_and_server_runtimes_proxy_over_the_ssh_carrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity::generate().unwrap();
+
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_address = destination.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await.unwrap();
+            let mut buffer = [0_u8; 5];
+            stream.read_exact(&mut buffer).await.unwrap();
+            stream.write_all(&buffer).await.unwrap();
+        });
+
+        let server_port = free_port().await;
+        let socks_port = free_port().await;
+
+        let server_path = directory.path().join("server.yml");
+        std::fs::write(
+            &server_path,
+            format!(
+                r#"
+role: server
+remote: null
+bind: "127.0.0.1:{server_port}"
+carrier:
+  kind: ssh
+  transport: tcp
+protection:
+  mode: chacha poly
+  key: null
+  clients:
+    - key: {public}
+  unknown:
+    mode: error
+heartbeat: 1
+reconnect: null
+limits:
+  connections: 4
+  streams: 8
+  fragments: 16
+  memory: 2097152
+routing: null
+tun: null
+socks: null
+http: null
+"#,
+                public = identity.public_base64(),
+            ),
+        )
+        .unwrap();
+
+        let client_path = directory.path().join("client.yml");
+        std::fs::write(
+            &client_path,
+            format!(
+                r#"
+role: client
+remote: "127.0.0.1:{server_port}"
+bind: null
+carrier:
+  kind: ssh
+  transport: tcp
+protection:
+  mode: chacha poly
+  key: {private}
+  clients: null
+  unknown: null
+heartbeat: 1
+reconnect: -1
+limits: null
+routing: null
+tun: null
+socks:
+  pass: null
+  user: null
+  host: 127.0.0.1
+  port: {socks_port}
+  listen: true
+http: null
+"#,
+                private = identity.private_base64().as_str(),
+            ),
+        )
+        .unwrap();
+
+        let server = tokio::spawn(async move { run(&server_path, Logger::disabled()).await });
+        let client = tokio::spawn(async move { run(&client_path, Logger::disabled()).await });
+
+        // The SOCKS listener starts accepting immediately, but the SSH key
+        // exchange + snolc handshake to the server takes a little longer
+        // than the HTTP carrier's near-instant preface; give it a moment
+        // rather than racing the very first CONNECT against it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let mut socks_stream = connect_with_retries(socks_port).await;
         socks_stream.write_all(&[5, 1, 0]).await.unwrap();

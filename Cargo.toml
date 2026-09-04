@@ -21,6 +21,8 @@ hmac = "0.13.0"
 ipnet = { version = "2.11.0", features = ["serde"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
+russh = { version = "0.63", default-features = false, features = ["ring"] }
+rand = "0.10"
 serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"

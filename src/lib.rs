@@ -15,6 +15,7 @@ pub mod outbound;
 pub mod protection;
 pub mod routing;
 pub mod runtime;
+pub mod ssh;
 pub mod steal;
 pub mod tunnel;
 pub mod wire_io;

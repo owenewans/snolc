@@ -104,9 +104,11 @@ impl CarrierRuntime {
                 stream.flush().await?;
                 Ok(Box::new(stream))
             }
-            Carrier::Ssh { .. } => Err(Error::Carrier(
-                "SSH carrier is not available in this build".to_owned(),
-            )),
+            Carrier::Ssh { .. } => {
+                let stream = TcpStream::connect(remote).await?;
+                stream.set_nodelay(true)?;
+                crate::ssh::connect(stream).await
+            }
             Carrier::Webrtc { .. } => Err(Error::Carrier(
                 "WebRTC carrier is not available in this build".to_owned(),
             )),
@@ -185,8 +187,13 @@ impl CarrierRuntime {
                     }
                 }
             }
+            // The SSH server accept loop is structurally different (russh
+            // hands channels to a Handler callback rather than returning a
+            // stream synchronously) and is run directly by
+            // `runtime::run_server`, not through this method.
             Carrier::Ssh { .. } => Err(Error::Carrier(
-                "SSH carrier is not available in this build".to_owned(),
+                "SSH carrier connections are not accepted through CarrierRuntime::accept"
+                    .to_owned(),
             )),
             Carrier::Webrtc { .. } => Err(Error::Carrier(
                 "WebRTC carrier requires a UDP listener".to_owned(),
