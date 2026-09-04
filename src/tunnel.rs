@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -6,7 +6,6 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -17,6 +16,7 @@ use crate::frame::{Frame, FrameType};
 use crate::handshake::{ClientHandshake, accept_client};
 use crate::identity::Identity;
 use crate::mux::{MuxHandle, MuxStream};
+use crate::outbound::{connect_tcp, connect_udp};
 use crate::protection::{ProtectionMode, SESSION_KEY_LEN, Side, StreamProtector};
 use crate::wire_io::{read_frame, write_frame};
 
@@ -30,13 +30,13 @@ pub struct ClientSession {
     mode: ProtectionMode,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Target {
     pub host: TargetHost,
     pub port: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TargetHost {
     Ip(IpAddr),
     Domain(String),
@@ -110,6 +110,11 @@ impl ClientSession {
         self.open(request).await
     }
 
+    pub async fn open_udp(&self, target: &Target) -> Result<ProtectedStream> {
+        let request = encode_open(&OpenRequest::Udp(target.clone()))?;
+        self.open(request).await
+    }
+
     async fn open_control(&self) -> Result<ProtectedStream> {
         self.open(encode_open(&OpenRequest::Control)?).await
     }
@@ -171,6 +176,29 @@ impl ClientSession {
 impl ProtectedStream {
     pub async fn send(&mut self, payload: &[u8]) -> Result<()> {
         let frame = self.protector.seal(FrameType::Data, 0, payload)?;
+        write_frame(&mut self.stream.io, &frame, self.protector.tag_len()).await
+    }
+
+    /// Reads the next application payload from the stream. Used by the UDP
+    /// relay paths, where each `Data` frame carries exactly one datagram
+    /// rather than an arbitrary byte-stream chunk. `Ok(None)` means the
+    /// remote side closed the stream cleanly.
+    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        let tag_len = self.protector.tag_len();
+        let frame = read_frame(&mut self.stream.io, tag_len).await?;
+        let kind = frame.kind;
+        let payload = self.protector.open(frame)?;
+        match kind {
+            FrameType::Data => Ok(Some(payload)),
+            FrameType::Close if payload.is_empty() => Ok(None),
+            FrameType::Error => Err(Error::Carrier("remote stream failed".to_owned())),
+            _ => Err(Error::Protocol("unexpected relay frame".to_owned())),
+        }
+    }
+
+    /// Signals a clean end of the datagram stream to the remote side.
+    pub async fn close(&mut self) -> Result<()> {
+        let frame = self.protector.seal(FrameType::Close, 0, &[])?;
         write_frame(&mut self.stream.io, &frame, self.protector.tag_len()).await
     }
 
@@ -407,11 +435,46 @@ async fn serve_stream(
             send_open_ok(&mut stream, &mut protector, mode).await?;
             ProtectedStream { stream, protector }.relay(remote).await
         }
-        OpenRequest::Udp(_) => {
-            send_open_error(&mut stream, &mut protector, mode).await?;
-            Err(Error::Carrier(
-                "UDP streams are not connected yet".to_owned(),
-            ))
+        OpenRequest::Udp(target) => {
+            let socket = match timeout(CONNECT_TIMEOUT, connect_udp(&target)).await {
+                Ok(Ok(socket)) => socket,
+                Ok(Err(error)) => {
+                    send_open_error(&mut stream, &mut protector, mode).await?;
+                    return Err(error);
+                }
+                Err(_) => {
+                    send_open_error(&mut stream, &mut protector, mode).await?;
+                    return Err(Error::Carrier("target connection timed out".to_owned()));
+                }
+            };
+            send_open_ok(&mut stream, &mut protector, mode).await?;
+            relay_udp(ProtectedStream { stream, protector }, socket).await
+        }
+    }
+}
+
+/// Datagram size ceiling for a single relayed UDP payload (the maximum
+/// theoretical UDP payload over IPv4/IPv6).
+const MAX_UDP_DATAGRAM: usize = 65_507;
+
+/// Pumps datagrams between a connected local UDP socket and a `Udp`
+/// tunnel stream, one `Data` frame per datagram in each direction.
+async fn relay_udp(mut stream: ProtectedStream, socket: tokio::net::UdpSocket) -> Result<()> {
+    let mut buffer = vec![0_u8; MAX_UDP_DATAGRAM];
+    loop {
+        tokio::select! {
+            received = socket.recv(&mut buffer) => {
+                let length = received?;
+                stream.send(&buffer[..length]).await?;
+            }
+            frame = stream.recv() => {
+                match frame? {
+                    Some(payload) => {
+                        socket.send(&payload).await?;
+                    }
+                    None => return Ok(()),
+                }
+            }
         }
     }
 }
@@ -457,13 +520,11 @@ async fn send_open_error(
     write_frame(&mut stream.io, &response, mode.tag_len()).await
 }
 
-async fn connect_target(target: &Target) -> Result<TcpStream> {
-    let stream = match &target.host {
-        TargetHost::Ip(ip) => TcpStream::connect(SocketAddr::new(*ip, target.port)).await?,
-        TargetHost::Domain(domain) => TcpStream::connect((domain.as_str(), target.port)).await?,
-    };
-    stream.set_nodelay(true)?;
-    Ok(stream)
+async fn connect_target(target: &Target) -> Result<tokio::net::TcpStream> {
+    match &target.host {
+        TargetHost::Ip(ip) => connect_tcp(std::net::SocketAddr::new(*ip, target.port)).await,
+        TargetHost::Domain(domain) => connect_tcp((domain.as_str(), target.port)).await,
+    }
 }
 
 fn plain_frame(kind: FrameType, payload: Vec<u8>) -> Frame {
@@ -666,6 +727,63 @@ mod tests {
         assert_eq!(&response, b"ping");
         drop(application);
         relay.await.unwrap().unwrap();
+        client.abort().await;
+        server_session.await.unwrap().unwrap();
+        echo.await.unwrap();
+    }
+
+    #[test]
+    fn udp_target_codec_round_trips() {
+        let target = Target::ip("203.0.113.9".parse().unwrap(), 5353).unwrap();
+        let encoded = encode_open(&OpenRequest::Udp(target.clone())).unwrap();
+        let OpenRequest::Udp(decoded) = decode_open(&encoded).unwrap() else {
+            panic!("decoded wrong protocol");
+        };
+        assert_eq!(decoded, target);
+    }
+
+    #[tokio::test]
+    async fn protected_udp_stream_relays_datagrams_to_a_real_udp_target() {
+        let destination = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination_address = destination.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buffer = [0_u8; 64];
+            let (length, peer) = destination.recv_from(&mut buffer).await.unwrap();
+            destination.send_to(&buffer[..length], peer).await.unwrap();
+        });
+
+        let identity = Identity::generate().unwrap();
+        let public = identity.public();
+        let (mut client_io, mut server_io) = tokio::io::duplex(128 * 1024);
+        let server_handshake_task = tokio::spawn(async move {
+            server_handshake(&mut server_io, ProtectionMode::ChaChaPoly, &[public])
+                .await
+                .map(|established| (server_io, established))
+        });
+        let client_master = client_handshake(&mut client_io, &identity, ProtectionMode::ChaChaPoly)
+            .await
+            .unwrap();
+        let (server_io, server) = server_handshake_task.await.unwrap().unwrap();
+
+        let window = 8 * yamux::DEFAULT_CREDIT as usize;
+        let (client_mux, _) = mux::spawn(client_io, Mode::Client, 8, window).unwrap();
+        let (server_mux, incoming) = mux::spawn(server_io, Mode::Server, 8, window).unwrap();
+        let server_session = tokio::spawn(serve_session(
+            incoming,
+            server_mux,
+            server.master,
+            ProtectionMode::ChaChaPoly,
+            Duration::from_secs(2),
+        ));
+        let client = ClientSession::new(client_mux, client_master, ProtectionMode::ChaChaPoly);
+        let mut protected = client
+            .open_udp(&Target::ip(destination_address.ip(), destination_address.port()).unwrap())
+            .await
+            .unwrap();
+        protected.send(b"ping").await.unwrap();
+        let reply = protected.recv().await.unwrap().unwrap();
+        assert_eq!(&reply, b"ping");
+        protected.close().await.unwrap();
         client.abort().await;
         server_session.await.unwrap().unwrap();
         echo.await.unwrap();

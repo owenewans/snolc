@@ -8,6 +8,7 @@ use crate::config::{Carrier, CarrierTls};
 use crate::error::{Error, Result};
 use crate::logging::{Level, Logger};
 use crate::mirror;
+use crate::outbound::connect_tcp;
 use crate::{acme, steal};
 
 const MAX_HTTP_HEADER: usize = 16 * 1024;
@@ -79,8 +80,7 @@ impl CarrierRuntime {
                 tls: None,
                 ..
             } => {
-                let mut stream = TcpStream::connect(remote).await?;
-                stream.set_nodelay(true)?;
+                let mut stream = connect_tcp(remote).await?;
                 client_http_preface(&mut stream, host, path).await?;
                 Ok(Box::new(stream))
             }
@@ -88,16 +88,14 @@ impl CarrierRuntime {
                 tls: Some(CarrierTls::Acme { domain, .. }),
                 ..
             } => {
-                let stream = TcpStream::connect(remote).await?;
-                stream.set_nodelay(true)?;
+                let stream = connect_tcp(remote).await?;
                 acme::connect(stream, domain).await
             }
             Carrier::Http {
                 tls: Some(CarrierTls::Steal { donor, secret, .. }),
                 ..
             } => {
-                let mut stream = TcpStream::connect(remote).await?;
-                stream.set_nodelay(true)?;
+                let mut stream = connect_tcp(remote).await?;
                 let secret = decode_secret(secret)?;
                 let hello = steal::client_hello(donor, &secret)?;
                 stream.write_all(&hello).await?;
@@ -105,13 +103,10 @@ impl CarrierRuntime {
                 Ok(Box::new(stream))
             }
             Carrier::Ssh { .. } => {
-                let stream = TcpStream::connect(remote).await?;
-                stream.set_nodelay(true)?;
+                let stream = connect_tcp(remote).await?;
                 crate::ssh::connect(stream).await
             }
-            Carrier::Webrtc { .. } => Err(Error::Carrier(
-                "WebRTC carrier is not available in this build".to_owned(),
-            )),
+            Carrier::Webrtc { .. } => crate::webrtc::connect(remote).await,
             Carrier::Socks { .. } => Err(Error::Carrier(
                 "SOCKS carrier is not available in this build".to_owned(),
             )),
@@ -196,7 +191,7 @@ impl CarrierRuntime {
                     .to_owned(),
             )),
             Carrier::Webrtc { .. } => Err(Error::Carrier(
-                "WebRTC carrier requires a UDP listener".to_owned(),
+                "WebRTC connections are accepted by the UDP listener".to_owned(),
             )),
             Carrier::Socks { .. } => Err(Error::Carrier(
                 "SOCKS carrier is not available in this build".to_owned(),

@@ -34,10 +34,34 @@ const RELOAD_INTERVAL: Duration = Duration::from_millis(200);
 
 pub async fn run(path: &Path, logger: Logger) -> Result<()> {
     let config = Config::load(path)?;
-    match config.role {
-        Role::Client => run_client(path.to_path_buf(), config, logger).await,
-        Role::Server => run_server(path.to_path_buf(), config, logger).await,
+    let shutdown_logger = logger.clone();
+    tokio::select! {
+        result = async {
+            match config.role {
+                Role::Client => run_client(path.to_path_buf(), config, logger).await,
+                Role::Server => run_server(path.to_path_buf(), config, logger).await,
+            }
+        } => result,
+        result = shutdown_signal() => {
+            result?;
+            shutdown_logger.record(Level::Debug, "shutdown signal received");
+            Ok(())
+        }
     }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 // ---------------------------------------------------------------------
@@ -45,12 +69,6 @@ pub async fn run(path: &Path, logger: Logger) -> Result<()> {
 // ---------------------------------------------------------------------
 
 async fn run_client(path: PathBuf, config: Config, logger: Logger) -> Result<()> {
-    if config.tun.is_some() {
-        return Err(Error::Interface(
-            "tun inbound is not connected to the runtime yet".to_owned(),
-        ));
-    }
-
     let identity = Identity::from_base64(
         config
             .protection
@@ -85,6 +103,11 @@ async fn run_client(path: PathBuf, config: Config, logger: Logger) -> Result<()>
         let connector = connector.clone();
         let logger = logger.clone();
         inbounds.spawn(async move { http_inbound::serve(http, connector, logger).await });
+    }
+    if let Some(tun) = config.tun.clone() {
+        let connector = connector.clone();
+        let logger = logger.clone();
+        inbounds.spawn(async move { crate::tun::run(tun, connector, logger).await });
     }
     if inbounds.is_empty() {
         return Err(Error::Config(
@@ -242,6 +265,9 @@ async fn run_server(path: PathBuf, config: Config, logger: Logger) -> Result<()>
     if matches!(config.carrier, crate::config::Carrier::Ssh { .. }) {
         return run_ssh_server(bind, mode, heartbeat, limits, auth_rx, logger).await;
     }
+    if matches!(config.carrier, crate::config::Carrier::Webrtc { .. }) {
+        return run_webrtc_server(bind, mode, heartbeat, limits, auth_rx, logger).await;
+    }
 
     let carrier = Arc::new(CarrierRuntime::server(config.carrier.clone(), logger.clone()).await?);
     let listener = TcpListener::bind(&bind).await?;
@@ -391,6 +417,38 @@ async fn run_ssh_server(
                 });
             if let Err(error) = crate::ssh::accept(stream, host_key, callback).await {
                 logger_for_connection.record(Level::Debug, &format!("client {peer}: {error}"));
+            }
+        });
+    }
+}
+
+/// The WebRTC carrier has a UDP signaling listener and yields one stream per
+/// established SCTP data channel, so it cannot use the TCP accept loop shared
+/// by the HTTP carriers.
+async fn run_webrtc_server(
+    bind: String,
+    mode: ProtectionMode,
+    heartbeat: Duration,
+    limits: crate::config::Limits,
+    auth_rx: watch::Receiver<ServerAuth>,
+    logger: Logger,
+) -> Result<()> {
+    let mut listener =
+        crate::webrtc::Listener::bind(&bind, limits.connections, logger.clone()).await?;
+    loop {
+        let accepted = listener.accept().await?;
+        let auth = auth_rx.clone();
+        let limits = limits.clone();
+        let logger = logger.clone();
+        tokio::spawn(async move {
+            let _permit = accepted.permit;
+            if let Err(error) =
+                serve_tunnel(accepted.stream, mode, heartbeat, limits, auth, &logger).await
+            {
+                logger.record(
+                    Level::Debug,
+                    &format!("WebRTC client {}: {error}", accepted.peer),
+                );
             }
         });
     }

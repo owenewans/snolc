@@ -21,7 +21,9 @@ handshake, chacha/AES/no-op protection, one yamux session per carrier
 connection, heartbeat + reconnect, server connection limits, hot key
 revocation (config file re-read, applied in well under a second), the
 unknown-client fallbacks (`error`/`file`/`site`/`service`), SOCKS4/5 and HTTP
-proxy inbounds, plain-text routing rules, and three HTTP-carrier TLS modes:
+proxy inbounds (including full SOCKS5 `UDP ASSOCIATE`), a `tun` inbound with
+a real smoltcp TCP/IP stack for both TCP and UDP, plain-text routing rules,
+and three HTTP-carrier TLS modes:
 
 - `tls: null` -- no TLS, camouflaged only as an HTTP `CONNECT` proxy.
 - `tls: { mode: acme }` -- a real, publicly trusted certificate obtained
@@ -75,12 +77,45 @@ key alongside a final `- match: any` rule, which the converter deliberately
 leaves out (only the user knows whether the default should be `direct` or
 `proxy`).
 
-Not wired up yet: `tun` inbound (no smoltcp integration -- a transparent TCP
-proxy over a virtual interface needs root/CAP_NET_ADMIN and per-flow
-connection tracking that has not been implemented and verified against a
-real device) and the WebRTC carrier (real ICE/DTLS/SCTP data channels from
-scratch). Selecting either in a config fails loudly at connection time
-instead of silently doing nothing.
+The `tun` inbound is a real smoltcp userspace TCP/IP stack over a virtual
+interface (root/`CAP_NET_ADMIN` required). Every new outbound TCP SYN gets
+its own dedicated listening socket bridged into the same
+`outbound::Connector` the SOCKS/HTTP inbounds use; UDP is connectionless, so
+instead one smoltcp UDP socket is bound per distinct destination port seen,
+and this module demultiplexes datagrams arriving on it by 4-tuple into their
+own outbound flow. `auto: true` installs a default route (both address
+families) into a dedicated policy-routing table so all otherwise-unmarked
+traffic is captured; `auto: false` requires an explicit `include` list of
+prefixes to capture instead. `exclude` prefixes, and (unless
+`strict_route: true`) the usual multicast/broadcast/link-local ranges, get
+`throw` routes in that same table so they fall through to the host's normal
+routing instead of the tun device. snolc's own outbound sockets (carrier,
+mirror, target, and this policy-routing rule's escape hatch) all carry a
+fixed `SO_MARK`, which is exactly what stops the process from recapturing
+its own connection attempts back into the tun device. `include`/`exclude`
+capture with `auto: false` is verified live against a real VPS: an HTTP
+`GET` and a raw DNS query both round-tripped correctly through the tunnel,
+and every route/rule/interface/`rp_filter` change was fully undone on
+shutdown. `auto: true`'s default-route capture and `strict_route` are
+covered by unit tests on the route/rule construction only -- not yet
+exercised live against a real default route, to avoid capturing an
+in-use host's own unrelated traffic during testing.
+
+The WebRTC carrier is real ICE/DTLS/SCTP built on `webrtc-rs/webrtc`, with a
+custom UDP-based signaling protocol (`SNLCWRTC` offer/answer packets with
+retransmission) carrying the SDP exchange, plus a minimal embedded STUN
+Binding responder on that same signaling socket -- so a client behind NAT
+gets a real server-reflexive candidate from the snolc server itself, with no
+dependency on a third-party STUN service. Verified live end to end over the
+real internet (not loopback): a SOCKS request through a local client
+reached a real HTTPS site via ICE/DTLS/SCTP through a VPS server.
+
+UDP end to end: SOCKS5 `UDP ASSOCIATE` relays arbitrary per-destination
+datagrams (each destination gets its own outbound flow, direct or tunneled,
+chosen by the same routing rules as `CONNECT`), and the wire protocol's
+`Udp` stream type carries one datagram per frame in each direction on the
+server side. `tun`'s own UDP support (above) reuses the same
+`Connector::connect_udp`.
 
 ## commands
 

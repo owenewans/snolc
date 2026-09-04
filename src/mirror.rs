@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::error::Result;
+use crate::outbound::connect_tcp;
 
 const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CACHED_RESPONSE: usize = 256 * 1024;
@@ -76,8 +76,7 @@ pub async fn splice(
     target: &str,
     prefix: &[u8],
 ) -> Result<()> {
-    let mut outbound = TcpStream::connect(target).await?;
-    outbound.set_nodelay(true)?;
+    let mut outbound = connect_tcp(target).await?;
     if !prefix.is_empty() {
         outbound.write_all(prefix).await?;
     }
@@ -110,8 +109,7 @@ pub async fn serve(
         return Ok(());
     }
 
-    let mut outbound = TcpStream::connect(target).await?;
-    outbound.set_nodelay(true)?;
+    let mut outbound = connect_tcp(target).await?;
     if !prefix.is_empty() {
         outbound.write_all(prefix).await?;
     }

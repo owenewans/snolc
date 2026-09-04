@@ -17,7 +17,9 @@ pub mod routing;
 pub mod runtime;
 pub mod ssh;
 pub mod steal;
+pub mod tun;
 pub mod tunnel;
+pub mod webrtc;
 pub mod wire_io;
 
 pub const COMMIT_VERSION: &str = env!("SNOLC_COMMIT");
