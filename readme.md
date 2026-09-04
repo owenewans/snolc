@@ -48,9 +48,39 @@ get an exact byte-for-byte copy of its traffic, with optional in-memory
 response caching) is also used by the `site`/`service` unknown-client
 fallbacks.
 
-Not wired up yet: `tun` inbound (no smoltcp integration), SSH/WebRTC
-carriers, and the geoip/geosite rule converter. Selecting any of these in a
-config fails loudly at connection time instead of silently doing nothing.
+The `ssh` carrier is also real: a genuine SSH key exchange, transport
+encryption, and one opened "session" channel used as the transport. The
+server accepts any SSH public key -- the real per-client check is the snolc
+handshake carried inside the channel, the same camouflage-vs-real-auth split
+used by `acme`/`steal`. The host key is generated once at server startup and
+reused for the process lifetime, like a real `sshd`'s.
+
+`snolc-geoconv`, a separate binary (not a `snolc` subcommand -- `snolc`
+itself only ever accepts `run`/`version`/`keygen`), converts plain-text
+geoip/geosite source lists into routing-rule fragments:
+
+```sh
+snolc-geoconv geosite --action direct domain-list-community-file.txt > fragment.yml
+snolc-geoconv geoip --action direct ipdeny-country-file.txt >> fragment.yml
+```
+
+It reads the domain-list-community line format (`domain:`/`full:`, the
+plain-text source sing-box and Xray themselves compile their binary geosite
+databases from) and plain CIDR-per-line files (e.g. ipdeny.com's per-country
+zone files) -- not sing-box's or Xray's own compiled binary databases, which
+this tool does not parse. `keyword:`/`regexp:`/`include:` entries have no
+equivalent in snolc's exact/suffix-only domain matching and are skipped, not
+mistranslated; the output is meant to be assembled by hand under a `rules:`
+key alongside a final `- match: any` rule, which the converter deliberately
+leaves out (only the user knows whether the default should be `direct` or
+`proxy`).
+
+Not wired up yet: `tun` inbound (no smoltcp integration -- a transparent TCP
+proxy over a virtual interface needs root/CAP_NET_ADMIN and per-flow
+connection tracking that has not been implemented and verified against a
+real device) and the WebRTC carrier (real ICE/DTLS/SCTP data channels from
+scratch). Selecting either in a config fails loudly at connection time
+instead of silently doing nothing.
 
 ## commands
 

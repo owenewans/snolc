@@ -8,6 +8,14 @@ repository = "https://github.com/owenewans/snolc"
 description = "Userspace-stack proxy resistant to traffic filtering"
 publish = false
 
+[[bin]]
+name = "snolc"
+path = "src/main.rs"
+
+[[bin]]
+name = "snolc-geoconv"
+path = "src/bin/geoconv.rs"
+
 [dependencies]
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 base64 = "0.22.1"

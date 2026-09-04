@@ -186,4 +186,49 @@ mod tests {
         };
         assert!(rules.normalize_and_validate().is_err());
     }
+
+    /// `snolc-geoconv`'s output (see `src/bin/geoconv.rs`) is a sequence of
+    /// rule fragments meant to be pasted under an existing `rules:` key,
+    /// plus a final `any` rule the converter deliberately leaves out. This
+    /// checks that assembling them exactly that way -- indenting the
+    /// converter's own output under `rules:`, no other edits -- produces a
+    /// file this module accepts.
+    #[test]
+    fn geoconv_output_format_loads_after_the_documented_assembly_step() {
+        let converter_output = "\
+- match: domain
+  value: example.com
+  action: direct
+- match: ip
+  value: 10.0.0.0/8
+  action: direct
+";
+        let mut source = "rules:\n".to_owned();
+        for line in converter_output.lines() {
+            source.push_str("  ");
+            source.push_str(line);
+            source.push('\n');
+        }
+        source.push_str("  - match: any\n    action: proxy\n");
+
+        let mut rules: RuleSet =
+            yaml_serde::from_str(&source).expect("geoconv output must parse as a RuleSet");
+        rules.normalize_and_validate().unwrap();
+        assert_eq!(
+            rules.decide(Some("www.example.com"), None).unwrap(),
+            Action::Direct
+        );
+        assert_eq!(
+            rules
+                .decide(None, Some("10.1.2.3".parse().unwrap()))
+                .unwrap(),
+            Action::Direct
+        );
+        assert_eq!(
+            rules
+                .decide(Some("other.example"), Some("8.8.8.8".parse().unwrap()))
+                .unwrap(),
+            Action::Proxy
+        );
+    }
 }
