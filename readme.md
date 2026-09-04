@@ -21,13 +21,36 @@ handshake, chacha/AES/no-op protection, one yamux session per carrier
 connection, heartbeat + reconnect, server connection limits, hot key
 revocation (config file re-read, applied in well under a second), the
 unknown-client fallbacks (`error`/`file`/`site`/`service`), SOCKS4/5 and HTTP
-proxy inbounds, plain-text routing rules, and the HTTP carrier (no TLS yet,
-disguised as an HTTP `CONNECT` proxy).
+proxy inbounds, plain-text routing rules, and three HTTP-carrier TLS modes:
 
-Not wired up yet: `tun` inbound (no smoltcp integration), SSH/WebRTC carriers,
-HTTP carrier TLS (`acme`/`steal`), and the geoip/geosite rule converter.
-Selecting any of these in a config fails loudly at connection time instead of
-silently doing nothing.
+- `tls: null` -- no TLS, camouflaged only as an HTTP `CONNECT` proxy.
+- `tls: { mode: acme }` -- a real, publicly trusted certificate obtained
+  autonomously from Let's Encrypt (TLS-ALPN-01, via `rustls-acme`). `bind`
+  and `remote` must use port 443: that is where the CA always validates the
+  challenge, independent of the port the service would otherwise prefer.
+  Verified live against a real domain: full trust chain to ISRG Root,
+  client and server both terminate genuine TLS.
+- `tls: { mode: steal }` -- REALITY-style camouflage. The client sends a
+  syntactically valid TLS 1.3 `ClientHello` for `donor`'s SNI carrying a
+  time-windowed HMAC tag in `session_id`. A server that recognizes the tag
+  switches straight to the snolc protocol without ever completing a TLS
+  handshake with the real client; anyone else -- a browser, a scanner, a
+  censor actively probing the server -- is spliced byte-for-byte to `donor`
+  and gets its genuine TLS session back, verified live against a real site
+  (donor's real, browser-trusted certificate, full page content, response
+  optionally cached for repeat requests). This is *not* a byte-perfect
+  JA3/JA4 clone of a specific browser -- the cipher/extension list is a
+  small, plausible, hand-built set, not a `wreq`/`boring`-level fingerprint
+  emulation, which is not wired into the carrier layer yet.
+
+The `mirror` primitive behind `steal`'s donor fallback (point at any address,
+get an exact byte-for-byte copy of its traffic, with optional in-memory
+response caching) is also used by the `site`/`service` unknown-client
+fallbacks.
+
+Not wired up yet: `tun` inbound (no smoltcp integration), SSH/WebRTC
+carriers, and the geoip/geosite rule converter. Selecting any of these in a
+config fails loudly at connection time instead of silently doing nothing.
 
 ## commands
 

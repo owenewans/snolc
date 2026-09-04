@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod carrier;
 pub mod cli;
 pub mod config;
@@ -8,11 +9,13 @@ pub mod handshake;
 pub mod identity;
 pub mod inbound;
 pub mod logging;
+pub mod mirror;
 pub mod mux;
 pub mod outbound;
 pub mod protection;
 pub mod routing;
 pub mod runtime;
+pub mod steal;
 pub mod tunnel;
 pub mod wire_io;
 

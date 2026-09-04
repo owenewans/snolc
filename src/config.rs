@@ -64,8 +64,29 @@ pub enum Transport {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum CarrierTls {
-    Acme { domain: String, stack: TlsStack },
-    Steal { donor: String, stack: TlsStack },
+    /// A real, publicly trusted certificate obtained autonomously from Let's
+    /// Encrypt (TLS-ALPN-01). `bind`/`remote` must use port 443 for this: the
+    /// CA always validates the TLS-ALPN-01 challenge against port 443 of the
+    /// domain's resolved address, independent of what port the service would
+    /// otherwise prefer.
+    Acme {
+        domain: String,
+        stack: TlsStack,
+        cache: PathBuf,
+    },
+    /// REALITY-style camouflage: the client sends a syntactically valid TLS
+    /// 1.3 ClientHello for `donor`'s SNI carrying a time-windowed HMAC tag in
+    /// the session_id field. A server that recognizes the tag switches to the
+    /// snolc protocol; anyone else (a real browser, a scanner, active probing
+    /// by a censor) is spliced byte-for-byte to `donor` and gets `donor`'s
+    /// genuine TLS session back, indistinguishable from contacting it
+    /// directly.
+    Steal {
+        donor: String,
+        stack: TlsStack,
+        secret: String,
+        mirror: MirrorConfig,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -73,6 +94,16 @@ pub enum CarrierTls {
 pub enum TlsStack {
     Boringssl,
     Wreq,
+}
+
+/// Response caching for a mirrored (spliced) connection: identical requests
+/// get replayed from memory instead of re-contacting the target. Never
+/// persisted to disk.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorConfig {
+    pub cache: bool,
+    pub ttl: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -94,9 +125,17 @@ pub struct ClientKey {
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum UnknownClient {
     Error,
-    Site { target: String },
-    File { path: PathBuf },
-    Service { target: String },
+    Site {
+        target: String,
+        mirror: MirrorConfig,
+    },
+    File {
+        path: PathBuf,
+    },
+    Service {
+        target: String,
+        mirror: MirrorConfig,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -196,12 +235,19 @@ impl Config {
     }
 
     fn validate_client(&self) -> Result<()> {
-        validate_endpoint(
-            self.remote
-                .as_deref()
-                .ok_or_else(|| config_error("client remote is required"))?,
-            "remote",
-        )?;
+        let remote = self
+            .remote
+            .as_deref()
+            .ok_or_else(|| config_error("client remote is required"))?;
+        validate_endpoint(remote, "remote")?;
+        if self
+            .carrier
+            .tls()
+            .is_some_and(CarrierTls::requires_port_443)
+            && !remote.ends_with(":443")
+        {
+            return Err(config_error("acme carrier requires port 443"));
+        }
         if self.bind.is_some() {
             return Err(config_error("client cannot set bind"));
         }
@@ -222,12 +268,19 @@ impl Config {
     }
 
     fn validate_server(&self) -> Result<()> {
-        validate_endpoint(
-            self.bind
-                .as_deref()
-                .ok_or_else(|| config_error("server bind is required"))?,
-            "bind",
-        )?;
+        let bind = self
+            .bind
+            .as_deref()
+            .ok_or_else(|| config_error("server bind is required"))?;
+        validate_endpoint(bind, "bind")?;
+        if self
+            .carrier
+            .tls()
+            .is_some_and(CarrierTls::requires_port_443)
+            && !bind.ends_with(":443")
+        {
+            return Err(config_error("acme carrier requires port 443"));
+        }
         if self.remote.is_some() {
             return Err(config_error("server cannot set remote"));
         }
@@ -281,15 +334,53 @@ impl Carrier {
             _ => Ok(()),
         }
     }
+
+    pub const fn tls(&self) -> Option<&CarrierTls> {
+        match self {
+            Self::Http { tls, .. } => tls.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 impl CarrierTls {
     fn validate(&self) -> Result<()> {
-        let host = match self {
-            Self::Acme { domain, .. } => domain,
-            Self::Steal { donor, .. } => donor,
-        };
-        validate_hostname(host, "TLS host")
+        match self {
+            Self::Acme { domain, cache, .. } => {
+                validate_hostname(domain, "TLS domain")?;
+                if cache.as_os_str().is_empty() {
+                    return Err(config_error("acme cache directory cannot be empty"));
+                }
+                Ok(())
+            }
+            Self::Steal {
+                donor,
+                secret,
+                mirror,
+                ..
+            } => {
+                validate_hostname(donor, "TLS donor")?;
+                validate_key(secret, "steal secret")?;
+                mirror.validate()
+            }
+        }
+    }
+
+    /// Whether this mode requires binding/dialing port 443 specifically.
+    /// TLS-ALPN-01 validation always targets port 443 of the domain's
+    /// resolved address, regardless of the port the service would otherwise
+    /// run on.
+    pub const fn requires_port_443(&self) -> bool {
+        matches!(self, Self::Acme { .. })
+    }
+}
+
+impl MirrorConfig {
+    fn validate(&self) -> Result<()> {
+        if self.cache && self.ttl == 0 {
+            return Err(config_error("mirror cache ttl must be greater than zero"));
+        }
+        Ok(())
     }
 }
 
@@ -323,12 +414,26 @@ impl Protection {
                 for client in clients {
                     validate_key(&client.key, "client public key")?;
                 }
-                if self.unknown.is_none() {
+                if let Some(unknown) = &self.unknown {
+                    unknown.validate()?;
+                } else {
                     return Err(config_error("unknown-client behavior is required"));
                 }
             }
         }
         Ok(())
+    }
+}
+
+impl UnknownClient {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Error | Self::File { .. } => Ok(()),
+            Self::Site { target, mirror } | Self::Service { target, mirror } => {
+                validate_endpoint(target, "unknown-client target")?;
+                mirror.validate()
+            }
+        }
     }
 }
 
@@ -495,6 +600,10 @@ carrier:
     mode: steal
     donor: example.com
     stack: wreq
+    secret: {KEY}
+    mirror:
+      cache: true
+      ttl: 60
 protection:
   mode: chacha poly
   key: {KEY}

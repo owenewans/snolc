@@ -1,60 +1,211 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::config::Carrier;
+use crate::config::{Carrier, CarrierTls};
 use crate::error::{Error, Result};
+use crate::logging::{Level, Logger};
+use crate::mirror;
+use crate::{acme, steal};
 
 const MAX_HTTP_HEADER: usize = 16 * 1024;
 
-pub async fn connect(remote: &str, carrier: &Carrier) -> Result<TcpStream> {
-    match carrier {
-        Carrier::Http {
-            host,
-            path,
-            tls: None,
-            ..
-        } => {
-            let mut stream = TcpStream::connect(remote).await?;
-            stream.set_nodelay(true)?;
-            client_http_preface(&mut stream, host, path).await?;
-            Ok(stream)
+/// A carrier connection regardless of its concrete transport: plain TCP
+/// (camouflaged with an HTTP CONNECT preface), a steal-mode TCP connection
+/// (camouflaged by a one-shot fake TLS ClientHello), or a real TLS
+/// connection in "self"/acme mode.
+pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+pub type BoxedStream = Box<dyn Duplex>;
+
+/// The outcome of accepting one inbound connection on the carrier's port.
+pub enum Accepted {
+    /// A connection that should proceed to the snolc handshake.
+    Tunnel(BoxedStream),
+    /// The connection was fully handled here (an ACME challenge response, or
+    /// a mirror splice to a donor/fallback target) and is already closed;
+    /// there is nothing more for the caller to do.
+    Handled,
+}
+
+/// Long-lived, carrier-specific state built once at startup and reused for
+/// every connection: the ACME certificate resolver (self mode) and the
+/// mirror response cache (steal mode's donor fallback), if applicable.
+pub struct CarrierRuntime {
+    config: Carrier,
+    acme: Option<Arc<acme::AcmeAcceptor>>,
+    mirror_cache: Option<Arc<mirror::Cache>>,
+    logger: Logger,
+}
+
+impl CarrierRuntime {
+    pub fn client(config: Carrier) -> Self {
+        Self {
+            config,
+            acme: None,
+            mirror_cache: None,
+            logger: Logger::disabled(),
         }
-        Carrier::Http { tls: Some(_), .. } => Err(Error::Carrier(
-            "HTTP TLS carrier is not available in this build".to_owned(),
-        )),
-        Carrier::Ssh { .. } => Err(Error::Carrier(
-            "SSH carrier is not available in this build".to_owned(),
-        )),
-        Carrier::Webrtc { .. } => Err(Error::Carrier(
-            "WebRTC carrier is not available in this build".to_owned(),
-        )),
-        Carrier::Socks { .. } => Err(Error::Carrier(
-            "SOCKS carrier is not available in this build".to_owned(),
-        )),
+    }
+
+    pub async fn server(config: Carrier, logger: Logger) -> Result<Self> {
+        let acme = match config.tls() {
+            Some(CarrierTls::Acme { domain, cache, .. }) => Some(Arc::new(
+                acme::AcmeAcceptor::start(domain.clone(), cache.clone(), logger.clone()),
+            )),
+            _ => None,
+        };
+        let mirror_cache = match config.tls() {
+            Some(CarrierTls::Steal { mirror, .. }) if mirror.cache => Some(Arc::new(
+                mirror::Cache::new(Duration::from_secs(mirror.ttl)),
+            )),
+            _ => None,
+        };
+        Ok(Self {
+            config,
+            acme,
+            mirror_cache,
+            logger,
+        })
+    }
+
+    pub async fn connect(&self, remote: &str) -> Result<BoxedStream> {
+        match &self.config {
+            Carrier::Http {
+                host,
+                path,
+                tls: None,
+                ..
+            } => {
+                let mut stream = TcpStream::connect(remote).await?;
+                stream.set_nodelay(true)?;
+                client_http_preface(&mut stream, host, path).await?;
+                Ok(Box::new(stream))
+            }
+            Carrier::Http {
+                tls: Some(CarrierTls::Acme { domain, .. }),
+                ..
+            } => {
+                let stream = TcpStream::connect(remote).await?;
+                stream.set_nodelay(true)?;
+                acme::connect(stream, domain).await
+            }
+            Carrier::Http {
+                tls: Some(CarrierTls::Steal { donor, secret, .. }),
+                ..
+            } => {
+                let mut stream = TcpStream::connect(remote).await?;
+                stream.set_nodelay(true)?;
+                let secret = decode_secret(secret)?;
+                let hello = steal::client_hello(donor, &secret)?;
+                stream.write_all(&hello).await?;
+                stream.flush().await?;
+                Ok(Box::new(stream))
+            }
+            Carrier::Ssh { .. } => Err(Error::Carrier(
+                "SSH carrier is not available in this build".to_owned(),
+            )),
+            Carrier::Webrtc { .. } => Err(Error::Carrier(
+                "WebRTC carrier is not available in this build".to_owned(),
+            )),
+            Carrier::Socks { .. } => Err(Error::Carrier(
+                "SOCKS carrier is not available in this build".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn accept(&self, mut stream: TcpStream) -> Result<Accepted> {
+        match &self.config {
+            Carrier::Http {
+                host,
+                path,
+                tls: None,
+                ..
+            } => {
+                server_http_preface(&mut stream, host, path).await?;
+                Ok(Accepted::Tunnel(Box::new(stream)))
+            }
+            Carrier::Http {
+                tls: Some(CarrierTls::Acme { .. }),
+                ..
+            } => {
+                let acceptor = self
+                    .acme
+                    .as_ref()
+                    .expect("acme carrier always builds an acceptor in CarrierRuntime::server");
+                match acceptor.accept(stream).await? {
+                    Some(tls) => Ok(Accepted::Tunnel(tls)),
+                    None => Ok(Accepted::Handled),
+                }
+            }
+            Carrier::Http {
+                tls: Some(CarrierTls::Steal { donor, secret, .. }),
+                ..
+            } => {
+                let secret = decode_secret(secret)?;
+                // The donor is always contacted over TLS on 443; the
+                // hostname alone (as validated in the config) is not a
+                // dialable address.
+                let target = format!("{donor}:443");
+                let outcome = steal::accept(&mut stream, &secret, donor).await?;
+                match outcome {
+                    steal::Accept::Authenticated => {
+                        self.logger.record(Level::Debug, "steal: authenticated");
+                        Ok(Accepted::Tunnel(Box::new(stream)))
+                    }
+                    // A complete ClientHello record was captured: safe to
+                    // treat as one request and, if configured, cache its
+                    // response.
+                    steal::Accept::Unauthenticated {
+                        prefix,
+                        complete: true,
+                    } => {
+                        self.logger.record(
+                            Level::Debug,
+                            &format!("steal: mirroring an unrecognized client to {target}"),
+                        );
+                        mirror::serve(stream, &target, &prefix, self.mirror_cache.as_deref())
+                            .await?;
+                        Ok(Accepted::Handled)
+                    }
+                    // Only a partial read: relay live, uncached, so nothing
+                    // waits on a request that was never fully forwarded.
+                    steal::Accept::Unauthenticated {
+                        prefix,
+                        complete: false,
+                    } => {
+                        self.logger.record(
+                            Level::Debug,
+                            &format!("steal: mirroring a non-TLS-shaped connection to {target}"),
+                        );
+                        mirror::splice(stream, &target, &prefix).await?;
+                        Ok(Accepted::Handled)
+                    }
+                }
+            }
+            Carrier::Ssh { .. } => Err(Error::Carrier(
+                "SSH carrier is not available in this build".to_owned(),
+            )),
+            Carrier::Webrtc { .. } => Err(Error::Carrier(
+                "WebRTC carrier requires a UDP listener".to_owned(),
+            )),
+            Carrier::Socks { .. } => Err(Error::Carrier(
+                "SOCKS carrier is not available in this build".to_owned(),
+            )),
+        }
     }
 }
 
-pub async fn accept(stream: &mut TcpStream, carrier: &Carrier) -> Result<()> {
-    match carrier {
-        Carrier::Http {
-            host,
-            path,
-            tls: None,
-            ..
-        } => server_http_preface(stream, host, path).await,
-        Carrier::Http { tls: Some(_), .. } => Err(Error::Carrier(
-            "HTTP TLS carrier is not available in this build".to_owned(),
-        )),
-        Carrier::Ssh { .. } => Err(Error::Carrier(
-            "SSH carrier is not available in this build".to_owned(),
-        )),
-        Carrier::Webrtc { .. } => Err(Error::Carrier(
-            "WebRTC carrier requires a UDP listener".to_owned(),
-        )),
-        Carrier::Socks { .. } => Err(Error::Carrier(
-            "SOCKS carrier is not available in this build".to_owned(),
-        )),
-    }
+fn decode_secret(value: &str) -> Result<[u8; 32]> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| Error::Config("steal secret is not base64".to_owned()))?;
+    bytes
+        .try_into()
+        .map_err(|_| Error::Config("steal secret must contain 32 bytes".to_owned()))
 }
 
 pub(crate) async fn client_http_preface<S>(stream: &mut S, host: &str, path: &str) -> Result<()>

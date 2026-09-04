@@ -7,12 +7,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::time::interval;
 
-use crate::carrier;
+use crate::carrier::{Accepted, CarrierRuntime};
 use crate::config::{Config, Role, UnknownClient};
 use crate::error::{Error, Result};
 use crate::identity::Identity;
 use crate::inbound::{http as http_inbound, socks as socks_inbound};
 use crate::logging::{Level, Logger};
+use crate::mirror;
 use crate::mux;
 use crate::outbound::Connector;
 use crate::protection::ProtectionMode;
@@ -91,11 +92,12 @@ async fn run_client(path: PathBuf, config: Config, logger: Logger) -> Result<()>
         ));
     }
 
+    let carrier = CarrierRuntime::client(config.carrier.clone());
     let mut attempts: i32 = 0;
     loop {
         let outcome = connect_once(
             &remote,
-            &config.carrier,
+            &carrier,
             &identity,
             mode,
             heartbeat,
@@ -144,14 +146,14 @@ async fn run_client(path: PathBuf, config: Config, logger: Logger) -> Result<()>
 
 async fn connect_once(
     remote: &str,
-    carrier_config: &crate::config::Carrier,
+    carrier: &CarrierRuntime,
     identity: &Identity,
     mode: ProtectionMode,
     heartbeat: Duration,
     sessions_tx: &watch::Sender<Option<ClientSession>>,
     logger: &Logger,
 ) -> Result<()> {
-    let mut stream = carrier::connect(remote, carrier_config).await?;
+    let mut stream = carrier.connect(remote).await?;
     let master = tunnel::client_handshake(&mut stream, identity, mode).await?;
     logger.record(Level::Debug, "handshake established");
 
@@ -182,6 +184,29 @@ async fn connect_once(
 struct ServerAuth {
     allowed: Vec<[u8; 32]>,
     unknown: UnknownClient,
+    /// Response cache for the unknown-client mirror fallback, when enabled.
+    /// Rebuilt (and its previous contents dropped) on every config reload.
+    mirror_cache: Option<Arc<mirror::Cache>>,
+}
+
+impl ServerAuth {
+    fn new(allowed: Vec<[u8; 32]>, unknown: UnknownClient) -> Self {
+        let mirror_cache = mirror_config(&unknown)
+            .filter(|mirror| mirror.cache)
+            .map(|mirror| Arc::new(mirror::Cache::new(Duration::from_secs(mirror.ttl))));
+        Self {
+            allowed,
+            unknown,
+            mirror_cache,
+        }
+    }
+}
+
+fn mirror_config(unknown: &UnknownClient) -> Option<&crate::config::MirrorConfig> {
+    match unknown {
+        UnknownClient::Site { mirror, .. } | UnknownClient::Service { mirror, .. } => Some(mirror),
+        UnknownClient::Error | UnknownClient::File { .. } => None,
+    }
 }
 
 async fn run_server(path: PathBuf, config: Config, logger: Logger) -> Result<()> {
@@ -195,7 +220,7 @@ async fn run_server(path: PathBuf, config: Config, logger: Logger) -> Result<()>
         .ok_or_else(|| Error::Config("server limits are required".to_owned()))?;
     let mode = config.protection.mode;
     let heartbeat = Duration::from_secs(config.heartbeat);
-    let carrier_config = config.carrier.clone();
+    let carrier = Arc::new(CarrierRuntime::server(config.carrier.clone(), logger.clone()).await?);
 
     let allowed = tunnel::decode_public_keys(
         config
@@ -212,7 +237,7 @@ async fn run_server(path: PathBuf, config: Config, logger: Logger) -> Result<()>
         .clone()
         .ok_or_else(|| Error::Config("unknown-client behavior is required".to_owned()))?;
 
-    let (auth_tx, auth_rx) = watch::channel(ServerAuth { allowed, unknown });
+    let (auth_tx, auth_rx) = watch::channel(ServerAuth::new(allowed, unknown));
     tokio::spawn(reload_auth(path, auth_tx, logger.clone()));
 
     let listener = TcpListener::bind(&bind).await?;
@@ -227,22 +252,14 @@ async fn run_server(path: PathBuf, config: Config, logger: Logger) -> Result<()>
             continue;
         };
 
-        let carrier_config = carrier_config.clone();
+        let carrier = carrier.clone();
         let auth = auth_rx.clone();
         let limits = limits.clone();
         let logger = logger.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(
-                stream,
-                carrier_config,
-                mode,
-                heartbeat,
-                limits,
-                auth,
-                &logger,
-            )
-            .await
+            if let Err(error) =
+                handle_connection(stream, carrier, mode, heartbeat, limits, auth, &logger).await
             {
                 logger.record(Level::Debug, &format!("client {peer}: {error}"));
             }
@@ -270,7 +287,7 @@ async fn reload_auth(path: PathBuf, sender: watch::Sender<ServerAuth>, logger: L
         else {
             continue;
         };
-        if sender.send(ServerAuth { allowed, unknown }).is_err() {
+        if sender.send(ServerAuth::new(allowed, unknown)).is_err() {
             return;
         }
         let _ = &logger;
@@ -278,21 +295,24 @@ async fn reload_auth(path: PathBuf, sender: watch::Sender<ServerAuth>, logger: L
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
-    carrier_config: crate::config::Carrier,
+    stream: TcpStream,
+    carrier: Arc<CarrierRuntime>,
     mode: ProtectionMode,
     heartbeat: Duration,
     limits: crate::config::Limits,
     auth: watch::Receiver<ServerAuth>,
     logger: &Logger,
 ) -> Result<()> {
-    carrier::accept(&mut stream, &carrier_config).await?;
+    let mut stream = match carrier.accept(stream).await? {
+        Accepted::Tunnel(stream) => stream,
+        Accepted::Handled => return Ok(()),
+    };
     let hello = read_client_hello(&mut stream).await?;
     let identity = crate::handshake::peek_client_identity(&hello.payload)?;
 
     let auth = auth.borrow().clone();
     if !auth.allowed.contains(&identity) {
-        return respond_to_unknown_client(stream, &hello, &auth.unknown, logger).await;
+        return respond_to_unknown_client(stream, &hello, &auth, logger).await;
     }
 
     let established = server_handshake_with_hello(&mut stream, hello, mode, &auth.allowed).await?;
@@ -302,16 +322,16 @@ async fn handle_connection(
 }
 
 async fn respond_to_unknown_client(
-    mut stream: TcpStream,
+    mut stream: crate::carrier::BoxedStream,
     hello: &crate::frame::Frame,
-    behavior: &UnknownClient,
+    auth: &ServerAuth,
     logger: &Logger,
 ) -> Result<()> {
     logger.record(
         Level::Warning,
         "rejected connection from an unknown client key",
     );
-    match behavior {
+    match &auth.unknown {
         UnknownClient::Error => {
             drop(stream);
             Err(Error::Authentication("unknown client key".to_owned()))
@@ -322,11 +342,9 @@ async fn respond_to_unknown_client(
             stream.shutdown().await?;
             Err(Error::Authentication("unknown client key".to_owned()))
         }
-        UnknownClient::Site { target } | UnknownClient::Service { target } => {
-            let mut backend = TcpStream::connect(target).await?;
-            backend.write_all(&encode_plain_frame(hello)?).await?;
-            backend.flush().await?;
-            tokio::io::copy_bidirectional(&mut stream, &mut backend).await?;
+        UnknownClient::Site { target, .. } | UnknownClient::Service { target, .. } => {
+            let prefix = encode_plain_frame(hello)?;
+            mirror::serve(stream, target, &prefix, auth.mirror_cache.as_deref()).await?;
             Err(Error::Authentication("unknown client key".to_owned()))
         }
     }
@@ -495,15 +513,17 @@ http: null
             fragments: 16,
             memory: 8 * yamux::DEFAULT_CREDIT as usize,
         };
-        let (_auth_tx, auth_rx) = watch::channel(ServerAuth {
-            allowed: vec![known.public()],
-            unknown: UnknownClient::Error,
-        });
+        let (_auth_tx, auth_rx) =
+            watch::channel(ServerAuth::new(vec![known.public()], UnknownClient::Error));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
-        let server_carrier = carrier_config.clone();
+        let server_carrier = Arc::new(
+            CarrierRuntime::server(carrier_config, Logger::disabled())
+                .await
+                .unwrap(),
+        );
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             handle_connection(
