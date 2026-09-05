@@ -480,6 +480,10 @@ impl Tun {
         if self.descriptor.is_some_and(|descriptor| descriptor < 0) {
             return Err(config_error("tun descriptor cannot be negative"));
         }
+        #[cfg(target_os = "android")]
+        if self.descriptor.is_none() {
+            return Err(config_error("tun descriptor is required on Android"));
+        }
         Ok(())
     }
 }

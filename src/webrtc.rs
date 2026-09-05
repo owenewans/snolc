@@ -350,7 +350,7 @@ async fn build_peer(
     let peer = PeerConnectionBuilder::new()
         .with_configuration(configuration)
         .with_handler(Arc::new(events))
-        .with_runtime(Arc::new(MarkedRuntime(TokioRuntime)))
+        .with_runtime(Arc::new(EscapingRuntime(TokioRuntime)))
         .with_udp_addrs(ice_bind_addresses())
         .with_data_channel_send_buffer_limit(DATA_CHANNEL_SEND_BUFFER)
         .build()
@@ -540,7 +540,7 @@ async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr> {
 
 fn bind_udp(address: SocketAddr) -> Result<UdpSocket> {
     let socket = std::net::UdpSocket::bind(address)?;
-    crate::outbound::mark_udp_socket(&socket);
+    crate::outbound::prepare_udp_socket(&socket)?;
     socket.set_nonblocking(true)?;
     Ok(UdpSocket::from_std(socket)?)
 }
@@ -549,12 +549,12 @@ fn rtc_error(context: &str, error: impl std::fmt::Display) -> Error {
     Error::Carrier(format!("WebRTC {context}: {error}"))
 }
 
-/// Delegates to webrtc-rs's Tokio runtime while applying snolc's escape mark
-/// to every ICE UDP socket before the WebRTC driver starts using it.
+/// Delegates to webrtc-rs's Tokio runtime while applying snolc's socket
+/// escape policy before the WebRTC driver starts using each ICE socket.
 #[derive(Debug)]
-struct MarkedRuntime(TokioRuntime);
+struct EscapingRuntime(TokioRuntime);
 
-impl Runtime for MarkedRuntime {
+impl Runtime for EscapingRuntime {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> Box<dyn JoinHandle> {
         self.0.spawn(future)
     }
@@ -568,7 +568,7 @@ impl Runtime for MarkedRuntime {
     }
 
     fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-        crate::outbound::mark_udp_socket(&socket);
+        crate::outbound::prepare_udp_socket(&socket).map_err(io::Error::other)?;
         self.0.wrap_udp_socket(socket)
     }
 
@@ -583,7 +583,20 @@ impl Runtime for MarkedRuntime {
         &'a self,
         remote_addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn AsyncTcpStream>>> + Send + 'a>> {
-        self.0.connect_tcp(remote_addr)
+        Box::pin(async move {
+            let stream = crate::outbound::connect_tcp(remote_addr)
+                .await
+                .map_err(io::Error::other)?;
+            let local_addr = stream.local_addr()?;
+            let peer_addr = stream.peer_addr()?;
+            let (read_half, write_half) = stream.into_split();
+            Ok(Arc::new(EscapingTcpStream {
+                read_half,
+                write_half,
+                local_addr,
+                peer_addr,
+            }) as Arc<dyn AsyncTcpStream>)
+        })
     }
 
     fn resolve_host<'a>(
@@ -610,7 +623,71 @@ impl Runtime for MarkedRuntime {
     }
 
     fn name(&self) -> &'static str {
-        "tokio-marked"
+        "tokio-escaping"
+    }
+}
+
+#[derive(Debug)]
+struct EscapingTcpStream {
+    read_half: tokio::net::tcp::OwnedReadHalf,
+    write_half: tokio::net::tcp::OwnedWriteHalf,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+}
+
+impl AsyncTcpStream for EscapingTcpStream {
+    fn read<'a, 'b>(
+        &'a self,
+        buffer: &'b mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'b>>
+    where
+        'a: 'b,
+    {
+        Box::pin(async move {
+            loop {
+                self.read_half.readable().await?;
+                match self.read_half.try_read(buffer) {
+                    Ok(length) => return Ok(length),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+    }
+
+    fn write_all<'a, 'b>(
+        &'a self,
+        buffer: &'b [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'b>>
+    where
+        'a: 'b,
+    {
+        Box::pin(async move {
+            let mut remaining = buffer;
+            while !remaining.is_empty() {
+                self.write_half.writable().await?;
+                match self.write_half.try_write(remaining) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write any bytes",
+                        ));
+                    }
+                    Ok(length) => remaining = &remaining[length..],
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.peer_addr)
     }
 }
 

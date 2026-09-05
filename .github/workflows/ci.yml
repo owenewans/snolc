@@ -24,15 +24,6 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
-    env:
-      # ring/aws-lc-rs (pulled in by rustls) and boring-sys (BoringSSL, C++)
-      # compile native code and need a cross toolchain for the target; the
-      # Android NDK's clang wrapper provides one. API level 24 matches
-      # Android 7.0+.
-      CC_aarch64_linux_android: aarch64-linux-android24-clang
-      CXX_aarch64_linux_android: aarch64-linux-android24-clang++
-      AR_aarch64_linux_android: llvm-ar
-      CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android24-clang
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -42,7 +33,13 @@ jobs:
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
-          ndk-version: r27c
-      - run: echo "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          ndk-version: r29
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --target aarch64-linux-android
+      - name: Build standalone arm64 CLI
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: ./scripts/build-android.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snolc-android-arm64
+          path: target/aarch64-linux-android/release/snolc

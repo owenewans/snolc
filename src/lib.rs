@@ -20,6 +20,7 @@ pub mod ssh;
 pub mod steal;
 pub mod tun;
 pub mod tunnel;
+pub mod vpn;
 pub mod webrtc;
 pub mod wire_io;
 

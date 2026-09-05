@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,7 +86,28 @@ const MAX_POLL_WAIT_MS: i32 = 250;
 /// `inbound::{socks,http}::serve`, so it can be spawned into the same
 /// `JoinSet` as the other inbounds.
 pub async fn run(config: TunConfig, connector: Connector, logger: Logger) -> Result<()> {
-    if !config.auto
+    validate_runtime_config(&config)?;
+    let descriptor = config.descriptor.map(duplicate_descriptor).transpose()?;
+
+    let runtime = tokio::runtime::Handle::current();
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(stop.clone());
+    tokio::task::spawn_blocking(move || {
+        run_blocking(config, descriptor, connector, logger, runtime, stop)
+    })
+    .await
+    .map_err(|error| Error::Runtime(format!("tun task failed: {error}")))?
+}
+
+fn validate_runtime_config(config: &TunConfig) -> Result<()> {
+    #[cfg(target_os = "android")]
+    if config.descriptor.is_none() {
+        return Err(Error::Config(
+            "tun descriptor is required on Android".to_owned(),
+        ));
+    }
+    if config.descriptor.is_none()
+        && !config.auto
         && config
             .include
             .as_ref()
@@ -96,13 +117,16 @@ pub async fn run(config: TunConfig, connector: Connector, logger: Logger) -> Res
             "tun requires at least one include route when auto is false".to_owned(),
         ));
     }
+    Ok(())
+}
 
-    let runtime = tokio::runtime::Handle::current();
-    let stop = Arc::new(AtomicBool::new(false));
-    let _stop_on_drop = StopOnDrop(stop.clone());
-    tokio::task::spawn_blocking(move || run_blocking(config, connector, logger, runtime, stop))
-        .await
-        .map_err(|error| Error::Runtime(format!("tun task failed: {error}")))?
+fn duplicate_descriptor(descriptor: RawFd) -> Result<OwnedFd> {
+    // The embedding application owns the descriptor it passes. smoltcp closes
+    // its descriptor on drop, so give it a duplicate instead of consuming the
+    // application's ParcelFileDescriptor.
+    unsafe { BorrowedFd::borrow_raw(descriptor) }
+        .try_clone_to_owned()
+        .map_err(|error| Error::Interface(format!("cannot duplicate tun descriptor: {error}")))
 }
 
 /// Cancels the blocking smoltcp loop when its async owner is dropped.
@@ -116,16 +140,17 @@ impl Drop for StopOnDrop {
 
 fn run_blocking(
     config: TunConfig,
+    descriptor: Option<OwnedFd>,
     connector: Connector,
     logger: Logger,
     runtime: tokio::runtime::Handle,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let interface_existed = interface_exists(&config.name);
+    let externally_managed = descriptor.is_some();
+    let interface_existed = !externally_managed && interface_exists(&config.name);
     let device_medium = Medium::Ip;
-    let mut device = if let Some(descriptor) = config.descriptor {
-        smoltcp::phy::TunTapInterface::from_fd(descriptor, device_medium, config.mtu as usize)
-            .map_err(|error| Error::Interface(format!("cannot attach tun descriptor: {error}")))?
+    let mut device = if let Some(descriptor) = descriptor {
+        attach_descriptor(descriptor, device_medium, config.mtu as usize)?
     } else {
         smoltcp::phy::TunTapInterface::new(&config.name, device_medium).map_err(|error| {
             Error::Interface(format!("cannot create tun device {}: {error}", config.name))
@@ -133,8 +158,17 @@ fn run_blocking(
     };
     let raw_fd = device.as_raw_fd();
 
-    let _network_cleanup = configure_interface(&config, !interface_existed)?;
-    logger.record(Level::Debug, &format!("tun device {} is up", config.name));
+    let _network_cleanup = if externally_managed {
+        None
+    } else {
+        Some(configure_interface(&config, !interface_existed)?)
+    };
+    let message = if externally_managed {
+        "external tun descriptor is attached".to_owned()
+    } else {
+        format!("tun device {} is up", config.name)
+    };
+    logger.record(Level::Debug, &message);
 
     let mut iface_config = IfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = {
@@ -242,6 +276,19 @@ fn run_blocking(
     }
 
     Ok(())
+}
+
+fn attach_descriptor(
+    descriptor: OwnedFd,
+    medium: Medium,
+    mtu: usize,
+) -> Result<smoltcp::phy::TunTapInterface> {
+    let raw_descriptor = descriptor.as_raw_fd();
+    let device = smoltcp::phy::TunTapInterface::from_fd(raw_descriptor, medium, mtu)
+        .map_err(|error| Error::Interface(format!("cannot attach tun descriptor: {error}")))?;
+    // TunTapInterface now owns and closes this descriptor.
+    std::mem::forget(descriptor);
+    Ok(device)
 }
 
 /// One iteration's worth of flow bookkeeping: promote newly established
@@ -1041,10 +1088,63 @@ fn read_packet(fd: RawFd, mtu: usize) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixDatagram;
+
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{Ipv4Address, Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber};
 
     use super::*;
+
+    fn descriptor_config(descriptor: RawFd) -> TunConfig {
+        TunConfig {
+            name: "external-test".to_owned(),
+            address: vec![
+                "172.19.0.2/30".parse().unwrap(),
+                "fd00::2/126".parse().unwrap(),
+            ],
+            mtu: 1500,
+            auto: false,
+            descriptor: Some(descriptor),
+            include: None,
+            exclude: None,
+            strict_route: false,
+        }
+    }
+
+    #[test]
+    fn external_descriptor_does_not_require_host_routes() {
+        let config = descriptor_config(7);
+        validate_runtime_config(&config).unwrap();
+
+        let mut managed = config;
+        managed.descriptor = None;
+        assert!(validate_runtime_config(&managed).is_err());
+    }
+
+    #[tokio::test]
+    async fn external_descriptor_skips_host_setup_and_remains_caller_owned() {
+        let (tun_side, peer) = UnixDatagram::pair().unwrap();
+        let descriptor = duplicate_descriptor(tun_side.as_raw_fd()).unwrap();
+        let config = descriptor_config(tun_side.as_raw_fd());
+        let (_sessions_tx, sessions_rx) =
+            tokio::sync::watch::channel::<Option<crate::tunnel::ClientSession>>(None);
+        let connector = Connector::new(sessions_rx, None);
+
+        run_blocking(
+            config,
+            Some(descriptor),
+            connector,
+            Logger::disabled(),
+            tokio::runtime::Handle::current(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+
+        peer.send(b"x").unwrap();
+        let mut received = [0_u8; 1];
+        assert_eq!(tun_side.recv(&mut received).unwrap(), 1);
+        assert_eq!(received, *b"x");
+    }
 
     /// Builds a real, checksum-correct IPv4+TCP packet using smoltcp's own
     /// wire representations, so this test exercises `detect_new_syn`

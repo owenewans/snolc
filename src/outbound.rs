@@ -1,3 +1,4 @@
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,9 +133,11 @@ async fn connect_direct(target: &Target) -> Result<TcpStream> {
     }
 }
 
-/// Opens a TCP connection on a socket carrying the process escape mark.
-/// Every connection created by snolc itself should use this helper so broad
-/// TUN routes cannot capture carrier, mirror, or server-target traffic.
+/// Opens a TCP connection on a socket prepared to escape the process TUN.
+/// Every external connection created by snolc should use this helper so broad
+/// TUN routes cannot capture carrier, mirror, or server-target traffic. Linux
+/// uses `SO_MARK`; an embedding application can additionally install a socket
+/// protector (Android's `VpnService.protect`, for example).
 pub(crate) async fn connect_tcp(address: impl ToSocketAddrs) -> Result<TcpStream> {
     let mut last_error = None;
     for address in tokio::net::lookup_host(address).await? {
@@ -143,7 +146,7 @@ pub(crate) async fn connect_tcp(address: impl ToSocketAddrs) -> Result<TcpStream
         } else {
             tokio::net::TcpSocket::new_v6()?
         };
-        mark_socket(&socket)?;
+        prepare_tcp_socket(&socket)?;
         match socket.connect(address).await {
             Ok(stream) => {
                 stream.set_nodelay(true)?;
@@ -158,7 +161,7 @@ pub(crate) async fn connect_tcp(address: impl ToSocketAddrs) -> Result<TcpStream
 }
 
 /// Opens a UDP socket "connected" to `target`, carrying the same escape
-/// mark as [`connect_tcp`] so its traffic bypasses a broad TUN route owned
+/// policy as [`connect_tcp`] so its traffic bypasses a broad TUN route owned
 /// by this process. A connected UDP socket restricts `send`/`recv` to that
 /// one peer, giving UDP the same per-destination lifetime as a TCP stream.
 pub(crate) async fn connect_udp(target: &Target) -> Result<UdpSocket> {
@@ -176,29 +179,27 @@ pub(crate) async fn connect_udp(target: &Target) -> Result<UdpSocket> {
     };
     let std_socket = std::net::UdpSocket::bind(bind_address)?;
     std_socket.set_nonblocking(true)?;
-    mark_udp_socket(&std_socket);
+    prepare_udp_socket(&std_socket)?;
     let socket = UdpSocket::from_std(std_socket)?;
     socket.connect(address).await?;
     Ok(socket)
 }
 
-#[cfg(target_os = "linux")]
-fn mark_socket(socket: &tokio::net::TcpSocket) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    mark_fd(socket.as_raw_fd());
-    Ok(())
+pub(crate) fn prepare_tcp_socket(socket: &tokio::net::TcpSocket) -> Result<()> {
+    prepare_socket(socket.as_raw_fd())
 }
 
-/// Marks UDP sockets created by the WebRTC stack so their ICE traffic also
+/// Prepares UDP sockets created by the WebRTC stack so their ICE traffic also
 /// bypasses a broad TUN route owned by this process.
-pub(crate) fn mark_udp_socket(socket: &std::net::UdpSocket) {
+pub(crate) fn prepare_udp_socket(socket: &std::net::UdpSocket) -> Result<()> {
+    prepare_socket(socket.as_raw_fd())
+}
+
+fn prepare_socket(descriptor: std::os::fd::RawFd) -> Result<()> {
+    crate::vpn::protect_socket(descriptor)?;
     #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        mark_fd(socket.as_raw_fd());
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = socket;
+    mark_fd(descriptor);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -217,19 +218,50 @@ fn mark_fd(fd: std::os::fd::RawFd) {
     // creating that interface already requires the same CAP_NET_ADMIN.
 }
 
-#[cfg(not(target_os = "linux"))]
-fn mark_socket(_socket: &tokio::net::TcpSocket) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::routing::Rule;
+    use crate::vpn::{self, SocketProtector};
+
+    #[tokio::test]
+    async fn socket_protector_runs_before_tcp_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let callback_observations = observations.clone();
+        let protector: SocketProtector = Arc::new(move |descriptor| {
+            let mut peer = std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
+            let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let connected = unsafe {
+                libc::getpeername(descriptor, peer.as_mut_ptr().cast(), &mut length) == 0
+            };
+            callback_observations
+                .lock()
+                .unwrap()
+                .push((descriptor, connected));
+            Ok(())
+        });
+        let previous = vpn::set_socket_protector(Some(protector));
+
+        let stream = connect_tcp(listener.local_addr().unwrap()).await.unwrap();
+        let descriptor = stream.as_raw_fd();
+        vpn::set_socket_protector(previous);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .find(|(observed, _)| *observed == descriptor)
+                .map(|(_, connected)| *connected),
+            Some(false)
+        );
+    }
 
     #[tokio::test]
     async fn direct_rule_bypasses_an_absent_proxy_session() {

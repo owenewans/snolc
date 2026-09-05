@@ -1,4 +1,5 @@
 [toolchain]
 channel = "1.98.0"
 components = ["clippy", "rustfmt"]
+targets = ["aarch64-linux-android"]
 profile = "minimal"

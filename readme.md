@@ -94,21 +94,26 @@ leaves out (only the user knows whether the default should be `direct` or
 `proxy`).
 
 The `tun` inbound is a real smoltcp userspace TCP/IP stack over a virtual
-interface (root/`CAP_NET_ADMIN` required). Every new outbound TCP SYN gets
-its own dedicated listening socket bridged into the same
-`outbound::Connector` the SOCKS/HTTP inbounds use; UDP is connectionless, so
+interface. Every new outbound TCP SYN gets its own dedicated listening socket
+bridged into the same `outbound::Connector` the SOCKS/HTTP inbounds use; UDP is connectionless, so
 instead one smoltcp UDP socket is bound per distinct destination port seen,
 and this module demultiplexes datagrams arriving on it by 4-tuple into their
-own outbound flow. `auto: true` installs a default route (both address
+own outbound flow. On Linux, a null `descriptor` makes snolc create and
+configure the interface itself (root/`CAP_NET_ADMIN` required). `auto: true`
+installs a default route (both address
 families) into a dedicated policy-routing table so all otherwise-unmarked
 traffic is captured; `auto: false` requires an explicit `include` list of
 prefixes to capture instead. `exclude` prefixes, and (unless
 `strict_route: true`) the usual multicast/broadcast/link-local ranges, get
 `throw` routes in that same table so they fall through to the host's normal
 routing instead of the tun device. snolc's own outbound sockets (carrier,
-mirror, target, and this policy-routing rule's escape hatch) all carry a
-fixed `SO_MARK`, which is exactly what stops the process from recapturing
-its own connection attempts back into the tun device. `include`/`exclude`
+mirror, target, and WebRTC ICE) all carry a fixed `SO_MARK`, which is exactly
+what stops the process from recapturing its own connection attempts back into
+the tun device. An embedding application can install
+`snolc::vpn::set_socket_protector`; that callback runs after each carrier,
+direct-target or WebRTC TCP/UDP socket is created but before it connects or
+sends traffic, which is where Android clients call
+`VpnService.protect(int)`. `include`/`exclude`
 capture with `auto: false` is verified live against a real VPS: an HTTP
 `GET` and a raw DNS query both round-tripped correctly through the tunnel,
 and every route/rule/interface/`rp_filter` change was fully undone on
@@ -116,6 +121,14 @@ shutdown. `auto: true`'s default-route capture and `strict_route` are
 covered by unit tests on the route/rule construction only -- not yet
 exercised live against a real default route, to avoid capturing an
 in-use host's own unrelated traffic during testing.
+
+When `descriptor` is an integer, snolc instead attaches to that already
+configured IP-mode TUN descriptor. It does not invoke `ip`, change host
+addresses/routes/rules or touch `rp_filter`; `auto`, `include`, `exclude` and
+`strict_route` are therefore host-setup metadata only in this mode. The
+configured `address` and `mtu` still drive smoltcp and must match the external
+interface. snolc duplicates the descriptor before giving it to smoltcp, so
+the caller retains ownership of the original descriptor.
 
 The WebRTC carrier is real ICE/DTLS/SCTP built on `webrtc-rs/webrtc`, with a
 custom UDP-based signaling protocol (`SNLCWRTC` offer/answer packets with
@@ -153,6 +166,46 @@ public: <base64 client public key>
 
 Keep `private` only in the client config. Put `public` into the server's
 `clients` list.
+
+## android cli
+
+The standalone arm64 CLI requires Android 7.0/API 24 or newer. Set the NDK
+path and run the build script; libc++ is linked into the executable, so the
+result is one file with no companion shared libraries.
+
+```sh
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+./scripts/build-android.sh
+```
+
+The output is `target/aarch64-linux-android/release/snolc`. It can be smoke
+tested on a connected device without installing an APK:
+
+```sh
+adb -s <serial> push target/aarch64-linux-android/release/snolc /data/local/tmp/snolc
+adb -s <serial> shell chmod 755 /data/local/tmp/snolc
+adb -s <serial> shell /data/local/tmp/snolc version
+adb -s <serial> shell /data/local/tmp/snolc keygen
+```
+
+The standalone CLI cannot acquire Android's `VpnService` permission itself.
+An Android application must create and configure the TUN with
+`VpnService.Builder`, put its live descriptor in the `tun.descriptor` config
+field, and keep the original descriptor open while snolc runs. Android
+requires a descriptor whenever `tun` is enabled; snolc never invokes `ip` or
+uses `SO_MARK` there.
+
+The same application must install a `snolc::vpn::SocketProtector` before
+starting the runtime. The callback may run concurrently on arbitrary runtime
+threads, receives a borrowed socket descriptor, and must synchronously forward
+it to `VpnService.protect(int)` without retaining or closing it. Returning an
+error aborts that connection instead of allowing it to loop back into the
+VPN. The JNI/FFI bridge belongs to the embedding application; the standalone
+CLI intentionally has no Java-specific code.
+
+Use an IP literal for the bootstrap `remote`, or resolve it through Android's
+underlying `Network` before establishing the TUN. System DNS resolution does
+not expose its socket descriptor to the protector hook.
 
 ## logs
 
