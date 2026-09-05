@@ -456,7 +456,7 @@ dependencies = [
 [[package]]
 name = "boring-sys"
 version = "5.2.0"
-source = "git+https://github.com/owenewans/boring?rev=57a18904014d478e649f65b2fb8a96eb9e788f42#57a18904014d478e649f65b2fb8a96eb9e788f42"
+source = "git+https://github.com/owenewans/owenboring?rev=3f66b77df55133132b21b04a0c35c56e3a3b8db8#3f66b77df55133132b21b04a0c35c56e3a3b8db8"
 dependencies = [
  "bindgen",
  "cmake",
