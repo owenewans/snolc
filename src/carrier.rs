@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::logging::{Level, Logger};
 use crate::mirror;
 use crate::outbound::connect_tcp;
-use crate::{acme, steal};
+use crate::{acme, impersonate, steal};
 
 const MAX_HTTP_HEADER: usize = 16 * 1024;
 
@@ -92,12 +92,24 @@ impl CarrierRuntime {
                 acme::connect(stream, domain).await
             }
             Carrier::Http {
-                tls: Some(CarrierTls::Steal { donor, secret, .. }),
+                tls:
+                    Some(CarrierTls::Steal {
+                        donor,
+                        fingerprint,
+                        secret,
+                        ..
+                    }),
                 ..
             } => {
                 let mut stream = connect_tcp(remote).await?;
                 let secret = decode_secret(secret)?;
-                let hello = steal::client_hello(donor, &secret)?;
+                let hello = match impersonate::client_hello_bytes(*fingerprint, donor).await? {
+                    Some(mut hello) => {
+                        steal::patch_session_id_tag(&mut hello, donor, &secret)?;
+                        hello
+                    }
+                    None => steal::client_hello(donor, &secret)?,
+                };
                 stream.write_all(&hello).await?;
                 stream.flush().await?;
                 Ok(Box::new(stream))

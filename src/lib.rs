@@ -7,6 +7,7 @@ pub mod fragment;
 pub mod frame;
 pub mod handshake;
 pub mod identity;
+pub mod impersonate;
 pub mod inbound;
 pub mod logging;
 pub mod mirror;
@@ -23,4 +24,7 @@ pub mod webrtc;
 pub mod wire_io;
 
 pub const COMMIT_VERSION: &str = env!("SNOLC_COMMIT");
-pub const WIRE_VERSION: u32 = 1;
+/// Bumped whenever a change makes this build's config or wire behavior
+/// incompatible with a previous release; a client and server built with
+/// different values are expected not to interoperate correctly.
+pub const WIRE_VERSION: u32 = 2;

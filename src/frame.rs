@@ -159,7 +159,7 @@ mod tests {
             tag: Vec::new(),
         };
         let mut encoded = frame.encode(0).unwrap();
-        encoded[6] = 2;
+        encoded[6] = encoded[6].wrapping_add(1);
         assert!(Frame::decode(&encoded, 0).is_err());
 
         let mut encoded = frame.encode(0).unwrap();

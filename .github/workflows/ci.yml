@@ -25,10 +25,12 @@ jobs:
   android:
     runs-on: ubuntu-latest
     env:
-      # ring/aws-lc-rs (pulled in by rustls) compile native code and need a
-      # cross C toolchain for the target; the Android NDK's clang wrapper
-      # provides one. API level 24 matches Android 7.0+.
+      # ring/aws-lc-rs (pulled in by rustls) and boring-sys (BoringSSL, C++)
+      # compile native code and need a cross toolchain for the target; the
+      # Android NDK's clang wrapper provides one. API level 24 matches
+      # Android 7.0+.
       CC_aarch64_linux_android: aarch64-linux-android24-clang
+      CXX_aarch64_linux_android: aarch64-linux-android24-clang++
       AR_aarch64_linux_android: llvm-ar
       CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android24-clang
     steps:

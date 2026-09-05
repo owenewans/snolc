@@ -123,6 +123,26 @@ pub fn client_hello(donor: &str, secret: &[u8; 32]) -> Result<Vec<u8>> {
     Ok(record)
 }
 
+/// Overwrites the `session_id` field (always at the fixed byte range
+/// 44..76 of a real TLS 1.2/1.3 `ClientHello`, regardless of which
+/// generator produced the rest of the record -- see
+/// [`crate::impersonate`]) with the auth tag for `donor`/`secret`.
+///
+/// Used for both the hand-built hello above (where it's redundant with the
+/// tag already written directly into `body`, but exercised the same way
+/// for a single code path) and for a real browser-shaped hello produced by
+/// [`crate::impersonate::client_hello_bytes`].
+pub fn patch_session_id_tag(record: &mut [u8], donor: &str, secret: &[u8; 32]) -> Result<()> {
+    if record.len() < HELLO_PREFIX_LEN || record[0] != 0x16 || record[5] != 0x01 || record[43] != 32
+    {
+        return Err(Error::Protocol(
+            "not a well-formed ClientHello record".to_owned(),
+        ));
+    }
+    record[44..76].copy_from_slice(&tag(secret, donor, current_bucket()));
+    Ok(())
+}
+
 /// Reads the fixed-position prefix of an incoming connection and decides
 /// whether it carries a valid auth tag for `secret`/`donor`. On success, any
 /// remaining bytes of the declared TLS record are also consumed so the
@@ -330,6 +350,35 @@ mod tests {
         };
         assert!(!complete);
         assert_eq!(prefix, b"GET / HTTP/1.1\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_real_browser_shaped_hello_authenticates_the_same_way() {
+        use crate::config::Fingerprint;
+        use crate::impersonate::client_hello_bytes;
+
+        let secret = [11_u8; 32];
+        for fingerprint in [Fingerprint::Chrome131, Fingerprint::Firefox133] {
+            let mut hello = client_hello_bytes(fingerprint, "petrovich.ru")
+                .await
+                .unwrap()
+                .expect("a real fingerprint always produces bytes");
+            patch_session_id_tag(&mut hello, "petrovich.ru", &secret).unwrap();
+            hello.extend_from_slice(b"SNLC-FOLLOWS");
+            let mut stream = reader_for(hello).await;
+
+            let outcome = accept(&mut stream, &secret, "petrovich.ru").await.unwrap();
+            assert!(
+                matches!(outcome, Accept::Authenticated),
+                "{fingerprint:?} hello was not authenticated"
+            );
+
+            let mut rest = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest)
+                .await
+                .unwrap();
+            assert_eq!(rest, b"SNLC-FOLLOWS");
+        }
     }
 
     #[test]

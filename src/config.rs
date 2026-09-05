@@ -69,11 +69,7 @@ pub enum CarrierTls {
     /// CA always validates the TLS-ALPN-01 challenge against port 443 of the
     /// domain's resolved address, independent of what port the service would
     /// otherwise prefer.
-    Acme {
-        domain: String,
-        stack: TlsStack,
-        cache: PathBuf,
-    },
+    Acme { domain: String, cache: PathBuf },
     /// REALITY-style camouflage: the client sends a syntactically valid TLS
     /// 1.3 ClientHello for `donor`'s SNI carrying a time-windowed HMAC tag in
     /// the session_id field. A server that recognizes the tag switches to the
@@ -83,7 +79,13 @@ pub enum CarrierTls {
     /// directly.
     Steal {
         donor: String,
-        stack: TlsStack,
+        /// Which TLS ClientHello shape the client sends for this
+        /// camouflage. `none` is the built-in hand-shaped hello (no extra
+        /// native dependency); the others drive a real BoringSSL handshake
+        /// (via `boring`) configured to match that browser's real
+        /// cipher/extension/ALPN shape byte-for-byte, so the same library a
+        /// real browser uses produces the observable bytes.
+        fingerprint: Fingerprint,
         secret: String,
         mirror: MirrorConfig,
     },
@@ -91,9 +93,10 @@ pub enum CarrierTls {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum TlsStack {
-    Boringssl,
-    Wreq,
+pub enum Fingerprint {
+    None,
+    Chrome131,
+    Firefox133,
 }
 
 /// Response caching for a mirrored (spliced) connection: identical requests
@@ -599,7 +602,7 @@ carrier:
   tls:
     mode: steal
     donor: example.com
-    stack: wreq
+    fingerprint: chrome131
     secret: {KEY}
     mirror:
       cache: true

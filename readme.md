@@ -40,10 +40,26 @@ and three HTTP-carrier TLS modes:
   censor actively probing the server -- is spliced byte-for-byte to `donor`
   and gets its genuine TLS session back, verified live against a real site
   (donor's real, browser-trusted certificate, full page content, response
-  optionally cached for repeat requests). This is *not* a byte-perfect
-  JA3/JA4 clone of a specific browser -- the cipher/extension list is a
-  small, plausible, hand-built set, not a `wreq`/`boring`-level fingerprint
-  emulation, which is not wired into the carrier layer yet.
+  optionally cached for repeat requests). `fingerprint` (required) picks the
+  shape of that outward-facing `ClientHello`:
+  - `fingerprint: none` -- a small, plausible, hand-built cipher/extension
+    set with no extra native dependency. Not a byte-perfect clone of any
+    real browser.
+  - `fingerprint: chrome131` / `firefox133` -- a real BoringSSL handshake
+    (via `boring`, the same library real Chrome releases are built on),
+    configured with that browser's real cipher list, curve list, signature
+    algorithms, ALPN, GREASE, and (Chrome only, matching its real behavior
+    since ~110) randomized extension order. No real TLS session is ever
+    completed by the client -- this only reuses BoringSSL to produce the
+    exact wire bytes of the first flight, then patches the same
+    fixed-position `session_id` field the hand-built path does. Verified
+    live end to end against a real VPS with both profiles, and against the
+    real donor fallback (an unmodified, tag-less request to the same port
+    still gets `example.com`'s genuine page back through the splice).
+    `wreq` was evaluated as a second engine but its BoringSSL fork
+    (`btls-sys`) and `boring`'s (`boring-sys`) both declare the same Cargo
+    `links = "boringssl"` key, so linking both into one binary is not
+    possible; `boring` was kept as the lower-level, more auditable option.
 
 The `mirror` primitive behind `steal`'s donor fallback (point at any address,
 get an exact byte-for-byte copy of its traffic, with optional in-memory
