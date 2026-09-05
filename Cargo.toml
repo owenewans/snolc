@@ -62,6 +62,6 @@ tempfile = "3.21.0"
 # files for the regular expression backend") when cross-compiling for
 # Android. Patched to pass `-DBUILD_TESTING=OFF` for that target, since we
 # only need libssl/libcrypto, never BoringSSL's own tests or benchmarks.
-# https://github.com/owenewans/boring/commit/c2a4d64b8ade28d995969259ef39f7263c3a4d02
+# https://github.com/owenewans/boring/commit/98352fd5f3f2950d2807241f2730d9720a17a6ec
 [patch.crates-io]
-boring-sys = { git = "https://github.com/owenewans/boring", rev = "c2a4d64b8ade28d995969259ef39f7263c3a4d02" }
+boring-sys = { git = "https://github.com/owenewans/boring", rev = "98352fd5f3f2950d2807241f2730d9720a17a6ec" }
