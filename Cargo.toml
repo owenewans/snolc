@@ -62,6 +62,12 @@ tempfile = "3.21.0"
 # files for the regular expression backend") when cross-compiling for
 # Android. Patched to pass `-DBUILD_TESTING=OFF` for that target, since we
 # only need libssl/libcrypto, never BoringSSL's own tests or benchmarks.
-# https://github.com/owenewans/boring/commit/98352fd5f3f2950d2807241f2730d9720a17a6ec
+# https://github.com/owenewans/boring/commit/57a18904014d478e649f65b2fb8a96eb9e788f42
+# (which also bumps the vendored boringssl submodule to
+# https://github.com/owenewans/boringssl/commit/20acc02f7111769fe9bab5ad9063f2863c0387c4,
+# forcing BUILD_TESTING off directly in BoringSSL's own CMakeLists.txt --
+# a `-DBUILD_TESTING=OFF` passed only from boring-sys's build script does
+# not reliably survive the Android NDK toolchain file's own internal
+# cache-reset/reconfigure).
 [patch.crates-io]
-boring-sys = { git = "https://github.com/owenewans/boring", rev = "98352fd5f3f2950d2807241f2730d9720a17a6ec" }
+boring-sys = { git = "https://github.com/owenewans/boring", rev = "57a18904014d478e649f65b2fb8a96eb9e788f42" }
