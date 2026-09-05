@@ -456,8 +456,7 @@ dependencies = [
 [[package]]
 name = "boring-sys"
 version = "5.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6993efa9d9f0ebf3b0c02c8e868cfe37d0854cd021d51204480a91ce23d6e444"
+source = "git+https://github.com/owenewans/boring?rev=c2a4d64b8ade28d995969259ef39f7263c3a4d02#c2a4d64b8ade28d995969259ef39f7263c3a4d02"
 dependencies = [
  "bindgen",
  "cmake",
