@@ -2,13 +2,39 @@
 
 # snolc
 
-userspace-stack proxy for linux and android.
+userspace-stack proxy for linux and android, resistant to traffic filtering.
 
-<a href="https://count.owenewans.org/owenewans/owenclave?theme=moebooru-h&notitle"><img src="https://count.owenewans.org/owenewans/owenclave?theme=moebooru-h&notitle" alt="repository views"></a>
+<a href="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle"><img src="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle" alt="repository views"></a>
 
-`rust` `smoltcp` `tcp` `udp` `ipv4` `ipv6`
+`rust` `proxy` `linux`
 
 </div>
+
+## install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/master/scripts/install.sh | sh
+```
+
+This resolves the latest release, downloads the build for the host
+architecture, verifies its published `sha256`, and installs `snolc` and
+`snolc-geoconv` into `~/.local/bin`. Add that directory to `PATH` if the
+installer says it is missing.
+
+Releases are built for `x86_64` and `aarch64` Linux against glibc 2.35, so
+they run on Ubuntu 22.04+, Debian 12+, RHEL 9+ and anything newer. There is
+no static build: `boring-sys` compiles BoringSSL through CMake with a C++
+toolchain, which is what makes a musl cross-build fragile enough not to ship.
+
+The install directory, release and mirror can all be overridden:
+
+```sh
+SNOLC_VERSION=v0.1.0 SNOLC_INSTALL_DIR=/usr/local/bin \
+    sh -c 'curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/master/scripts/install.sh | sh'
+```
+
+To build from source instead, use a Rust 1.98 toolchain and `cargo build
+--release`. Android has its own path, see [android cli](#android-cli).
 
 snolc moves TCP and UDP traffic through a userspace network stack. The host OS
 does not terminate tunneled flows. Inbound, routing, protection,
