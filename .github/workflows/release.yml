@@ -1,0 +1,120 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built natively on each architecture: boring-sys compiles BoringSSL
+          # with CMake and a C++ toolchain, which is what makes cross-compiling
+          # this tree fragile. ubuntu-22.04 pins the glibc floor at 2.35.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y cmake ninja-build
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin snolc --bin snolc-geoconv
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          dir="target/${{ matrix.target }}/release"
+          strip "$dir/snolc" "$dir/snolc-geoconv"
+          archive="snolc-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "$dir" snolc snolc-geoconv
+          sha256sum "$archive" > "$archive.sha256"
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snolc-${{ matrix.target }}
+          path: |
+            snolc-${{ matrix.target }}.tar.gz
+            snolc-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build release notes
+        id: notes
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          previous="$(git tag --sort=-creatordate | grep -Fxv "$TAG" | head -n1 || true)"
+          repo="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          if [ -n "$previous" ]; then
+              link="${repo}/compare/${previous}...${TAG}"
+          else
+              link="${repo}/commits/${TAG}"
+          fi
+          printf '**Full Changelog**: %s\n' "$link" > release-notes.md
+          cat release-notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release edit "$TAG" --notes-file release-notes.md --title "$TAG"
+              gh release upload "$TAG" artifacts/* --clobber
+          else
+              gh release create "$TAG" artifacts/* \
+                  --title "$TAG" \
+                  --notes-file release-notes.md
+          fi
