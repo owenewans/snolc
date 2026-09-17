@@ -290,7 +290,7 @@ enum Command {
     },
     Platform {
         event: PlatformEvent,
-        response: oneshot::Sender<()>,
+        response: Option<oneshot::Sender<()>>,
     },
 }
 
@@ -510,11 +510,15 @@ impl Engine {
                                 }
                                 self.snapshot.sessions.store(0, Ordering::Release);
                                 self.snapshot.flows.store(0, Ordering::Release);
-                                let _ = response.send(());
+                                if let Some(response) = response {
+                                    let _ = response.send(());
+                                }
                             }
                             PlatformEvent::VpnPermissionRevoked => {
                                 self.emit(Event::Lifecycle(Lifecycle::Stopping));
-                                let _ = response.send(());
+                                if let Some(response) = response {
+                                    let _ = response.send(());
+                                }
                                 break;
                             }
                         }
@@ -1705,10 +1709,20 @@ impl EngineHandle {
         commands
             .try_send(Command::Platform {
                 event,
-                response: response_tx,
+                response: Some(response_tx),
             })
             .map_err(|_| EngineError::CommandQueue)?;
         async_io::block_on(response_rx).map_err(|_| EngineError::Stopped)
+    }
+
+    pub fn request_platform_event(&self, event: PlatformEvent) -> Result<(), EngineError> {
+        let mut commands = self.commands.clone();
+        commands
+            .try_send(Command::Platform {
+                event,
+                response: None,
+            })
+            .map_err(|_| EngineError::CommandQueue)
     }
 }
 
