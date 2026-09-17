@@ -41,7 +41,10 @@ The local control socket accepts these methods:
 - `usage.get`
 - `sessions.list`, `sessions.disconnect`
 - `rules.replace`
-- maintenance backup and restore operations
+- `maintenance.backup`
+
+Restore uses the stopped-policy `restore_stopped_database` API and is not a
+live control method.
 
 A mutation carries `client_id`, monotonic `seq`, and required revision where
 the method changes an existing record. For one client, `last + 1` executes in
