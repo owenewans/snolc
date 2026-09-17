@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use thiserror::Error;
 
 pub const MAX_RESOLVED_ADDRESSES: usize = 64;
+pub const MAX_RESOLVED_ADDRESS_BYTES: usize = 2 + MAX_RESOLVED_ADDRESSES * 17;
 
 #[derive(Debug, Error)]
 pub enum ResolvedAddressError {

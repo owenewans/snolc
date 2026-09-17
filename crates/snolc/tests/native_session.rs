@@ -1023,11 +1023,15 @@ fn native_policy_local_debits_before_forwarding_payload() {
         &directory.join("client-state/policy.redb"),
         Some(&credential),
     );
-    let server = build_side(
+    let server = build_side_with_adapter(
         "server-metered",
         "server",
         carrier_endpoint,
         true,
+        (
+            "adapter_direct",
+            b"dns_mode = \"system\"\nmax_pending_opens = 8\nmax_resolved_addresses = 16\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+        ),
         ("protection_noise", server_protection.as_bytes()),
         ("policy_local", server_policy.as_bytes()),
     );
@@ -1095,15 +1099,39 @@ fn native_policy_local_debits_before_forwarding_payload() {
         assert!(Instant::now() < deadline, "quota accounting timed out");
         thread::sleep(Duration::from_millis(10));
     }
-    let revoke = format!(
-        "method = \"credential.revoke\"\nclient_id = \"native-test\"\nseq = 3\ncredential_sha256 = \"{credential_digest}\"\n"
-    );
+    let rules = r#"terminal = "allow"
+[[entries]]
+action = "deny"
+direction = "both"
+protocol = "any"
+unavailable = "deny"
+cidr = "127.0.0.0/8"
+[[entries]]
+action = "deny"
+direction = "both"
+protocol = "any"
+unavailable = "deny"
+cidr = "::1/128"
+"#;
+    let rules_request = toml::to_string(&toml::Table::from_iter([
+        ("method".into(), toml::Value::String("rules.replace".into())),
+        (
+            "client_id".into(),
+            toml::Value::String("native-test".into()),
+        ),
+        ("seq".into(), toml::Value::Integer(3)),
+        ("profile".into(), toml::Value::String("default".into())),
+        ("apply".into(), toml::Value::String("active".into())),
+        ("rules_toml".into(), toml::Value::String(rules.into())),
+    ]))
+    .unwrap();
     futures::executor::block_on(
-        server_handle.control("policy-server-metered", revoke.into_bytes()),
+        server_handle.control("policy-server-metered", rules_request.into_bytes()),
     )
     .unwrap();
     release_target.send(()).unwrap();
     target_thread.join().unwrap();
+    socks.shutdown(Shutdown::Both).unwrap();
     while (client_handle.snapshot().flows != 0 || server_handle.snapshot().flows != 0)
         && Instant::now() < deadline
     {
@@ -1111,7 +1139,35 @@ fn native_policy_local_debits_before_forwarding_payload() {
     }
     assert_eq!(client_handle.snapshot().flows, 0);
     assert_eq!(server_handle.snapshot().flows, 0);
-    socks.shutdown(Shutdown::Both).unwrap();
+
+    let denied_target = TcpListener::bind("127.0.0.1:0").unwrap();
+    denied_target.set_nonblocking(true).unwrap();
+    let denied_endpoint = denied_target.local_addr().unwrap();
+    let mut denied = TcpStream::connect(socks_endpoint).unwrap();
+    denied
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    denied.write_all(&[5, 1, 0]).unwrap();
+    denied.read_exact(&mut greeting).unwrap();
+    let domain = b"localhost";
+    let mut request = vec![5, 1, 0, 3, domain.len() as u8];
+    request.extend_from_slice(domain);
+    request.extend_from_slice(&denied_endpoint.port().to_be_bytes());
+    denied.write_all(&request).unwrap();
+    denied.read_exact(&mut response).unwrap();
+    assert_ne!(response[1], 0);
+    assert!(matches!(
+        denied_target.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+
+    let revoke = format!(
+        "method = \"credential.revoke\"\nclient_id = \"native-test\"\nseq = 4\ncredential_sha256 = \"{credential_digest}\"\n"
+    );
+    futures::executor::block_on(
+        server_handle.control("policy-server-metered", revoke.into_bytes()),
+    )
+    .unwrap();
     loop {
         let request = format!("method = \"usage.get\"\nuser_id = \"{user_id}\"\n");
         let response = futures::executor::block_on(
@@ -1304,7 +1360,7 @@ fn build_side(
         listen,
         (
             "adapter_direct",
-            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nmax_resolved_addresses = 16\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
         ),
         protection,
         policy,
@@ -1339,7 +1395,7 @@ fn build_side_with_control(
         true,
         (
             "adapter_direct",
-            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nmax_resolved_addresses = 16\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
         ),
         protection,
         policy,
@@ -1385,7 +1441,7 @@ fn build_side_with_carrier(
         role,
         (
             "adapter_direct",
-            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nmax_resolved_addresses = 16\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
         ),
         carrier,
         protection,

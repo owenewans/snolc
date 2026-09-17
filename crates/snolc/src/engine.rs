@@ -152,6 +152,9 @@ struct PendingServerFlow {
     operation: u64,
     admitted: bool,
     adapter_cursor: usize,
+    resolved_addresses: Option<Vec<std::net::IpAddr>>,
+    resolved_cursor: usize,
+    resolution_complete: bool,
     adapter_flow: Option<(usize, u64)>,
     ports: Option<PendingPorts>,
     response_sent: bool,
@@ -229,6 +232,20 @@ impl OwnedFlowMetadata {
                 pointer: self.opaque.as_ptr(),
                 length: self.opaque.len(),
             },
+        }
+    }
+
+    fn resolved(&self, address: std::net::IpAddr) -> Self {
+        let (address_type, address) = match address {
+            std::net::IpAddr::V4(address) => (snolc_abi::ADDRESS_IPV4, address.octets().to_vec()),
+            std::net::IpAddr::V6(address) => (snolc_abi::ADDRESS_IPV6, address.octets().to_vec()),
+        };
+        Self {
+            kind: self.kind,
+            address_type,
+            address,
+            port: self.port,
+            opaque: self.opaque.clone(),
         }
     }
 }
@@ -1143,6 +1160,9 @@ impl EstablishedSession {
                     operation,
                     admitted: false,
                     adapter_cursor: 0,
+                    resolved_addresses: None,
+                    resolved_cursor: 0,
+                    resolution_complete: false,
                     adapter_flow: None,
                     ports: None,
                     response_sent: false,
@@ -1474,6 +1494,43 @@ impl EstablishedSession {
             return self.start_response(OpenStatus::Unsupported, "no adapter accepted the flow");
         }
         let adapter = binding.adapters[pending.adapter_cursor];
+        if !pending.resolution_complete {
+            if pending.resolved_addresses.is_none() {
+                match modules[adapter].adapter_resolve(pending.operation, &metadata, context) {
+                    Poll::Ready(Ok(Some(addresses))) => {
+                        pending.resolved_addresses = Some(addresses);
+                    }
+                    Poll::Ready(Ok(None)) => pending.resolution_complete = true,
+                    Poll::Ready(Err(error)) => {
+                        let (status, reason) = open_error(&error);
+                        return self.start_response(status, reason);
+                    }
+                    Poll::Pending => return Ok(()),
+                }
+            }
+            if let Some(addresses) = &pending.resolved_addresses {
+                if let Some(address) = addresses.get(pending.resolved_cursor).copied() {
+                    let resolved = pending.metadata.resolved(address);
+                    match modules[binding.policy].policy_admit_resolved(
+                        self.policy_session,
+                        &resolved.abi(),
+                        context,
+                    ) {
+                        Poll::Ready(Ok(())) => pending.resolved_cursor += 1,
+                        Poll::Ready(Err(error)) => {
+                            let (status, reason) = open_error(&error);
+                            return self.start_response(status, reason);
+                        }
+                        Poll::Pending => return Ok(()),
+                    }
+                }
+                if pending.resolved_cursor >= addresses.len() {
+                    pending.resolution_complete = true;
+                } else {
+                    return Ok(());
+                }
+            }
+        }
         match modules[adapter].adapter_open(pending.operation, &metadata, context) {
             Poll::Ready(Ok(flow)) => {
                 pending.adapter_flow = Some((adapter, flow));
@@ -1506,6 +1563,9 @@ impl EstablishedSession {
                 if pending.adapter_cursor + 1 < binding.adapters.len() =>
             {
                 pending.adapter_cursor += 1;
+                pending.resolved_addresses = None;
+                pending.resolved_cursor = 0;
+                pending.resolution_complete = false;
                 Ok(())
             }
             Poll::Ready(Err(error)) => {

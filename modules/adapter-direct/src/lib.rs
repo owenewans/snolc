@@ -23,7 +23,8 @@ use snolc_sdk::abi::{
     self, SnolAdapterApiV1, SnolByteIoV1, SnolBytes, SnolDatagramIoV1, SnolWakeHandle,
 };
 use snolc_sdk::{
-    ByteIo, DatagramIo, DatagramPump, DatagramRecv, ForeignByteIo, ForeignDatagramIo, HostApi, Pump,
+    ByteIo, DatagramIo, DatagramPump, DatagramRecv, ForeignByteIo, ForeignDatagramIo, HostApi,
+    MAX_RESOLVED_ADDRESSES, Pump, encode_resolved_addresses, resolved_addresses_size,
 };
 
 const MAX_UDP_PAYLOAD: usize = 65_507;
@@ -186,6 +187,7 @@ enum DnsMode {
 struct Options {
     dns_mode: DnsMode,
     max_pending_opens: usize,
+    max_resolved_addresses: usize,
     resolve_timeout_ms: u64,
     connect_timeout_ms: u64,
 }
@@ -198,6 +200,8 @@ fn parse_options(config: &[u8]) -> Result<Options, String> {
     let text = std::str::from_utf8(config).map_err(|_| "config is not UTF-8".to_owned())?;
     let options: Options = toml::from_str(text).map_err(|error| error.to_string())?;
     if options.max_pending_opens == 0
+        || options.max_resolved_addresses == 0
+        || options.max_resolved_addresses > MAX_RESOLVED_ADDRESSES
         || options.resolve_timeout_ms == 0
         || options.connect_timeout_ms == 0
     {
@@ -211,47 +215,62 @@ enum Destination {
     Domain(String, u16),
 }
 
-struct ConnectRequest {
-    kind: u32,
-    destination: Destination,
-    dns_mode: DnsMode,
-    resolve_timeout: Duration,
-    connect_timeout: Duration,
-    response: SyncSender<Result<Endpoint, DirectError>>,
-    wake: WorkerWake,
+enum WorkerRequest {
+    Resolve {
+        domain: String,
+        port: u16,
+        max_addresses: usize,
+        response: SyncSender<Result<Vec<SocketAddr>, DirectError>>,
+        wake: WorkerWake,
+    },
+    Connect {
+        kind: u32,
+        addresses: Vec<SocketAddr>,
+        connect_timeout: Duration,
+        response: SyncSender<Result<Endpoint, DirectError>>,
+        wake: WorkerWake,
+    },
 }
 
-struct WorkerWake(SnolWakeHandle);
+struct WorkerWake(Option<SnolWakeHandle>);
 
 unsafe impl Send for WorkerWake {}
 
 impl WorkerWake {
+    fn new(wake: SnolWakeHandle) -> Result<Self, u32> {
+        retain_wake(wake).map(Self)
+    }
+
     fn wake(&self) {
-        if let Some(wake) = self.0.wake {
-            unsafe { wake(self.0.context) };
+        if let Some(handle) = self.0
+            && let Some(wake) = handle.wake
+        {
+            unsafe { wake(handle.context) };
         }
+    }
+}
+
+impl Drop for WorkerWake {
+    fn drop(&mut self) {
+        release_wake(self.0.take());
     }
 }
 
 struct PendingOpen {
     response: Receiver<Result<Endpoint, DirectError>>,
-    retained_wake: Option<SnolWakeHandle>,
 }
 
-impl Drop for PendingOpen {
-    fn drop(&mut self) {
-        if let Some(wake) = self.retained_wake
-            && let Some(release) = wake.release
-        {
-            unsafe { release(wake.context) };
-        }
-    }
+struct PendingResolution {
+    response: Receiver<Result<Vec<SocketAddr>, DirectError>>,
+    deadline: Instant,
 }
 
 struct State {
     options: Options,
-    sender: Option<SyncSender<ConnectRequest>>,
+    sender: Option<SyncSender<WorkerRequest>>,
     worker: Option<JoinHandle<()>>,
+    pending_resolutions: HashMap<u64, PendingResolution>,
+    resolved: HashMap<u64, Vec<SocketAddr>>,
     pending: HashMap<u64, PendingOpen>,
     ready: HashMap<u64, Endpoint>,
     active: HashMap<u64, DirectFlow<ForeignByteIo>>,
@@ -468,6 +487,8 @@ fn initialize(
                 options,
                 sender: Some(sender),
                 worker: Some(worker),
+                pending_resolutions: HashMap::new(),
+                resolved: HashMap::new(),
                 pending: HashMap::new(),
                 ready: HashMap::new(),
                 active: HashMap::new(),
@@ -476,6 +497,133 @@ fn initialize(
         );
     });
     Ok(())
+}
+
+unsafe extern "C" fn resolve(
+    instance: u64,
+    operation: u64,
+    metadata: *const abi::SnolFlowMetadataV1,
+    wake: SnolWakeHandle,
+    output: abi::SnolBytesMut,
+    written: *mut usize,
+) -> u32 {
+    snolc_sdk::catch_status(|| {
+        if !INSTANCES.contains(instance) || operation == 0 {
+            return abi::STATUS_INVALID;
+        }
+        let Some(written) = (unsafe { written.as_mut() }) else {
+            return abi::STATUS_INVALID;
+        };
+        *written = 0;
+        let metadata = match unsafe { snolc_sdk::module::flow_metadata(metadata) } {
+            Ok(metadata) => metadata,
+            Err(status) => return status,
+        };
+        if !matches!(metadata.kind, abi::FLOW_TCP | abi::FLOW_UDP) {
+            return abi::STATUS_UNSUPPORTED;
+        }
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let Some(state) = states.get_mut(&instance) else {
+                return abi::STATUS_INVALID;
+            };
+            if let Some(addresses) = state.resolved.get(&operation) {
+                return write_resolved_addresses(addresses, output, written);
+            }
+            if let Some(pending) = state.pending_resolutions.remove(&operation) {
+                match pending.response.try_recv() {
+                    Ok(Ok(addresses)) => {
+                        state.resolved.insert(operation, addresses);
+                        let addresses = state.resolved.get(&operation).expect("inserted above");
+                        return write_resolved_addresses(addresses, output, written);
+                    }
+                    Ok(Err(error)) => return error_status(&error),
+                    Err(TryRecvError::Empty) if Instant::now() >= pending.deadline => {
+                        return abi::STATUS_IO;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        state.pending_resolutions.insert(operation, pending);
+                        return abi::STATUS_PENDING;
+                    }
+                    Err(TryRecvError::Disconnected) => return abi::STATUS_IO,
+                }
+            }
+            if state.pending.len() + state.pending_resolutions.len()
+                >= state.options.max_pending_opens
+            {
+                return abi::STATUS_RESOURCE;
+            }
+            let destination = match owned_destination(&metadata) {
+                Ok(destination) => destination,
+                Err(status) => return status,
+            };
+            match destination {
+                Destination::Ip(address) => {
+                    state.resolved.insert(operation, vec![address]);
+                    let addresses = state.resolved.get(&operation).expect("inserted above");
+                    write_resolved_addresses(addresses, output, written)
+                }
+                Destination::Domain(_, _)
+                    if matches!(state.options.dns_mode, DnsMode::RejectDomains) =>
+                {
+                    abi::STATUS_DENIED
+                }
+                Destination::Domain(domain, port) => {
+                    let Some(sender) = state.sender.as_ref() else {
+                        return abi::STATUS_IO;
+                    };
+                    let worker_wake = match WorkerWake::new(wake) {
+                        Ok(wake) => wake,
+                        Err(status) => return status,
+                    };
+                    let Some(deadline) = Instant::now()
+                        .checked_add(Duration::from_millis(state.options.resolve_timeout_ms))
+                    else {
+                        return abi::STATUS_INVALID;
+                    };
+                    let (response_tx, response_rx) = sync_channel(1);
+                    let request = WorkerRequest::Resolve {
+                        domain,
+                        port,
+                        max_addresses: state.options.max_resolved_addresses,
+                        response: response_tx,
+                        wake: worker_wake,
+                    };
+                    match sender.try_send(request) {
+                        Ok(()) => {
+                            state.pending_resolutions.insert(
+                                operation,
+                                PendingResolution {
+                                    response: response_rx,
+                                    deadline,
+                                },
+                            );
+                            abi::STATUS_PENDING
+                        }
+                        Err(TrySendError::Full(_)) => abi::STATUS_RESOURCE,
+                        Err(TrySendError::Disconnected(_)) => abi::STATUS_IO,
+                    }
+                }
+            }
+        })
+    })
+}
+
+fn write_resolved_addresses(
+    addresses: &[SocketAddr],
+    output: abi::SnolBytesMut,
+    written: *mut usize,
+) -> u32 {
+    let addresses: Vec<_> = addresses.iter().map(SocketAddr::ip).collect();
+    let length = match resolved_addresses_size(&addresses) {
+        Ok(length) => length,
+        Err(_) => return abi::STATUS_INTERNAL,
+    };
+    let mut encoded = vec![0; length];
+    if encode_resolved_addresses(&addresses, &mut encoded).is_err() {
+        return abi::STATUS_INTERNAL;
+    }
+    unsafe { snolc_sdk::module::write_output(&encoded, output, written) }
 }
 
 unsafe extern "C" fn open(
@@ -526,29 +674,28 @@ unsafe extern "C" fn open(
                     Err(TryRecvError::Disconnected) => return abi::STATUS_IO,
                 }
             }
-            if state.pending.len() >= state.options.max_pending_opens {
+            if state.pending.len() + state.pending_resolutions.len()
+                >= state.options.max_pending_opens
+            {
                 return abi::STATUS_RESOURCE;
             }
-            let destination = match owned_destination(&metadata) {
-                Ok(destination) => destination,
-                Err(status) => return status,
+            let Some(addresses) = state.resolved.get(&operation).cloned() else {
+                return abi::STATUS_INVALID;
             };
             let Some(sender) = state.sender.as_ref() else {
                 return abi::STATUS_IO;
             };
-            let retained_wake = match retain_wake(_wake) {
+            let worker_wake = match WorkerWake::new(_wake) {
                 Ok(wake) => wake,
                 Err(status) => return status,
             };
             let (response_tx, response_rx) = sync_channel(1);
-            let request = ConnectRequest {
+            let request = WorkerRequest::Connect {
                 kind: metadata.kind,
-                destination,
-                dns_mode: state.options.dns_mode,
-                resolve_timeout: Duration::from_millis(state.options.resolve_timeout_ms),
+                addresses,
                 connect_timeout: Duration::from_millis(state.options.connect_timeout_ms),
                 response: response_tx,
-                wake: WorkerWake(_wake),
+                wake: worker_wake,
             };
             match sender.try_send(request) {
                 Ok(()) => {
@@ -556,19 +703,12 @@ unsafe extern "C" fn open(
                         operation,
                         PendingOpen {
                             response: response_rx,
-                            retained_wake,
                         },
                     );
                     abi::STATUS_PENDING
                 }
-                Err(TrySendError::Full(_)) => {
-                    release_wake(retained_wake);
-                    abi::STATUS_RESOURCE
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    release_wake(retained_wake);
-                    abi::STATUS_IO
-                }
+                Err(TrySendError::Full(_)) => abi::STATUS_RESOURCE,
+                Err(TrySendError::Disconnected(_)) => abi::STATUS_IO,
             }
         })
     })
@@ -607,41 +747,61 @@ fn owned_destination(
     }
 }
 
-fn connect_worker(receiver: Receiver<ConnectRequest>, host: HostApi) {
+fn connect_worker(receiver: Receiver<WorkerRequest>, host: HostApi) {
     while let Ok(request) = receiver.recv() {
-        let result = connect_destination(
-            request.kind,
-            request.destination,
-            request.dns_mode,
-            request.resolve_timeout,
-            request.connect_timeout,
-            host,
-        );
-        let _ = request.response.send(result);
-        request.wake.wake();
+        match request {
+            WorkerRequest::Resolve {
+                domain,
+                port,
+                max_addresses,
+                response,
+                wake,
+            } => {
+                let result = resolve_destination(&domain, port, max_addresses);
+                let _ = response.send(result);
+                wake.wake();
+            }
+            WorkerRequest::Connect {
+                kind,
+                addresses,
+                connect_timeout,
+                response,
+                wake,
+            } => {
+                let result = connect_addresses(kind, addresses, connect_timeout, host);
+                let _ = response.send(result);
+                wake.wake();
+            }
+        }
     }
 }
 
-fn connect_destination(
+fn resolve_destination(
+    domain: &str,
+    port: u16,
+    max_addresses: usize,
+) -> Result<Vec<SocketAddr>, DirectError> {
+    let mut addresses = (domain, port)
+        .to_socket_addrs()?
+        .take(max_addresses + 1)
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(DirectError::NoAddress);
+    }
+    if addresses.len() > max_addresses {
+        return Err(DirectError::Resource);
+    }
+    Ok(addresses)
+}
+
+fn connect_addresses(
     kind: u32,
-    destination: Destination,
-    dns_mode: DnsMode,
-    _resolve_timeout: Duration,
+    addresses: Vec<SocketAddr>,
     connect_timeout: Duration,
     host: HostApi,
 ) -> Result<Endpoint, DirectError> {
-    let addresses = match destination {
-        Destination::Ip(address) => vec![address],
-        Destination::Domain(_, _) if matches!(dns_mode, DnsMode::RejectDomains) => {
-            return Err(DirectError::Denied);
-        }
-        Destination::Domain(domain, port) => {
-            let mut addresses: Vec<_> = (domain.as_str(), port).to_socket_addrs()?.collect();
-            addresses.sort_unstable();
-            addresses.dedup();
-            addresses
-        }
-    };
     if addresses.is_empty() {
         return Err(DirectError::NoAddress);
     }
@@ -867,6 +1027,7 @@ unsafe extern "C" fn attach(
             let Some(endpoint) = state.ready.remove(&flow) else {
                 return abi::STATUS_INVALID;
             };
+            state.resolved.remove(&flow);
             let Endpoint::Tcp(endpoint) = endpoint else {
                 state.ready.insert(flow, endpoint);
                 return abi::STATUS_INVALID;
@@ -903,6 +1064,7 @@ unsafe extern "C" fn attach_datagram(
             let Some(endpoint) = state.ready.remove(&flow) else {
                 return abi::STATUS_INVALID;
             };
+            state.resolved.remove(&flow);
             let Endpoint::Udp(endpoint) = endpoint else {
                 state.ready.insert(flow, endpoint);
                 return abi::STATUS_INVALID;
@@ -945,7 +1107,9 @@ unsafe extern "C" fn close_flow(instance: u64, flow: u64) -> u32 {
             let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
-            let removed = state.pending.remove(&flow).is_some()
+            let removed = state.pending_resolutions.remove(&flow).is_some()
+                | state.resolved.remove(&flow).is_some()
+                | state.pending.remove(&flow).is_some()
                 | state.ready.remove(&flow).is_some()
                 | state.active.remove(&flow).is_some()
                 | state.active_datagrams.remove(&flow).is_some();
@@ -1015,7 +1179,7 @@ static ADAPTER: SnolAdapterApiV1 = SnolAdapterApiV1 {
     close_flow: Some(close_flow),
     attach_datagram: Some(attach_datagram),
     attach_packet_port: None,
-    resolve: None,
+    resolve: Some(resolve),
 };
 
 snolc_sdk::declare_stateful_module! {
@@ -1165,14 +1329,12 @@ mod tests {
         let worker = thread::spawn(move || connect_worker(receiver, host));
         let (response_tx, response_rx) = sync_channel(1);
         sender
-            .try_send(ConnectRequest {
+            .try_send(WorkerRequest::Connect {
                 kind: abi::FLOW_TCP,
-                destination: Destination::Ip(address),
-                dns_mode: DnsMode::RejectDomains,
-                resolve_timeout: Duration::from_secs(1),
+                addresses: vec![address],
                 connect_timeout: Duration::from_secs(1),
                 response: response_tx,
-                wake: WorkerWake(no_wake()),
+                wake: WorkerWake::new(no_wake()).unwrap(),
             })
             .unwrap();
         let stream = response_rx
@@ -1196,7 +1358,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let accept = thread::spawn(move || listener.accept().unwrap().0);
         let descriptor = unsafe { &*snolc_module_entry() };
-        let config = b"dns_mode = \"reject-domains\"\nmax_pending_opens = 2\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n";
+        let config = b"dns_mode = \"reject-domains\"\nmax_pending_opens = 2\nmax_resolved_addresses = 16\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n";
         let mut instance = 0;
         let state = ProtectState {
             allow: AtomicBool::new(true),
@@ -1241,6 +1403,28 @@ mod tests {
             },
         };
         let adapter = unsafe { &*descriptor.adapter };
+        let mut resolved = [0; 32];
+        let mut resolved_length = 0;
+        assert_eq!(
+            unsafe {
+                adapter.resolve.unwrap()(
+                    instance,
+                    42,
+                    &metadata,
+                    no_wake(),
+                    abi::SnolBytesMut {
+                        pointer: resolved.as_mut_ptr(),
+                        length: resolved.len(),
+                    },
+                    &mut resolved_length,
+                )
+            },
+            abi::STATUS_OK
+        );
+        assert_eq!(
+            snolc_sdk::decode_resolved_addresses(&resolved[..resolved_length]).unwrap(),
+            [address.ip()]
+        );
         let mut flow = 0;
         assert_eq!(
             unsafe { adapter.open.unwrap()(instance, 42, &metadata, no_wake(), &mut flow) },

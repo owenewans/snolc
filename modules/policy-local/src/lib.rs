@@ -749,6 +749,58 @@ unsafe extern "C" fn admit_flow(
     })
 }
 
+unsafe extern "C" fn admit_resolved(
+    instance: u64,
+    session: u64,
+    metadata: *const abi::SnolFlowMetadataV1,
+    _wake: SnolWakeHandle,
+) -> u32 {
+    snolc_sdk::catch_status(|| {
+        if !INSTANCES.contains(instance) || session == 0 {
+            return abi::STATUS_INVALID;
+        }
+        let metadata = match unsafe { snolc_sdk::module::flow_metadata(metadata) } {
+            Ok(metadata)
+                if matches!(metadata.address_type, abi::ADDRESS_IPV4 | abi::ADDRESS_IPV6) =>
+            {
+                metadata
+            }
+            Ok(_) => return abi::STATUS_INVALID,
+            Err(status) => return status,
+        };
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let Some(state) = states.get_mut(&instance) else {
+                return abi::STATUS_INVALID;
+            };
+            if state.maintenance {
+                return abi::STATUS_PENDING;
+            }
+            let (role, user_id) = match state.sessions.get(&session) {
+                Some(PolicySession {
+                    role,
+                    auth: AuthState::Authenticated(user_id),
+                    ..
+                }) => (*role, user_id),
+                Some(_) => return abi::STATUS_PENDING,
+                None => return abi::STATUS_INVALID,
+            };
+            if matches!(role, PolicyRole::Client) {
+                return abi::STATUS_OK;
+            }
+            let Some(user) = state.admin.users.get(user_id) else {
+                return abi::STATUS_DENIED;
+            };
+            if !flow_available_at(state, user, current_utc())
+                || destination_policy(state, user, &metadata).is_err()
+            {
+                return abi::STATUS_DENIED;
+            }
+            abi::STATUS_OK
+        })
+    })
+}
+
 unsafe extern "C" fn attach_flow(
     instance: u64,
     session: u64,
@@ -2728,7 +2780,7 @@ static POLICY: SnolPolicyApiV1 = SnolPolicyApiV1 {
     admit_flow: Some(admit_flow),
     attach_flow: Some(attach_flow),
     attach_datagram_flow: Some(attach_datagram_flow),
-    admit_resolved: Some(admit_flow),
+    admit_resolved: Some(admit_resolved),
 };
 
 snolc_sdk::declare_stateful_module! {

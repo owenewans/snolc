@@ -6,5 +6,6 @@ role = "server"
 [options]
 dns_mode = "system"
 max_pending_opens = 8
+max_resolved_addresses = 16
 resolve_timeout_ms = 15000
 connect_timeout_ms = 15000

@@ -271,6 +271,50 @@ impl LoadedModule {
         }
     }
 
+    pub fn adapter_resolve(
+        &self,
+        operation: u64,
+        metadata: &SnolFlowMetadataV1,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Option<Vec<std::net::IpAddr>>, LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let adapter = match unsafe { self.descriptor().adapter.as_ref() } {
+            Some(adapter) => adapter,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))),
+        };
+        let Some(resolve) = adapter.resolve else {
+            return Poll::Ready(Ok(None));
+        };
+        let mut output = [0; snolc_sdk::MAX_RESOLVED_ADDRESS_BYTES];
+        let mut written = 0;
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe {
+            resolve(
+                instance,
+                operation,
+                metadata,
+                wake.handle(),
+                bytes_mut(&mut output),
+                &mut written,
+            )
+        };
+        match status {
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            snolc_abi::STATUS_UNSUPPORTED => Poll::Ready(Ok(None)),
+            snolc_abi::STATUS_OK if written <= output.len() => {
+                match snolc_sdk::decode_resolved_addresses(&output[..written]) {
+                    Ok(addresses) => Poll::Ready(Ok(Some(addresses))),
+                    Err(_) => Poll::Ready(Err(LoadError::FlowMetadata)),
+                }
+            }
+            snolc_abi::STATUS_OK => Poll::Ready(Err(LoadError::FlowMetadata)),
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
+        }
+    }
+
     pub(crate) fn adapter_accept(
         &self,
         context: &mut Context<'_>,
@@ -550,6 +594,33 @@ impl LoadedModule {
             None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_POLICY))),
         };
         let admit = match policy.admit_flow {
+            Some(admit) => admit,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe { admit(instance, policy_session, metadata, wake.handle()) };
+        match status {
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            snolc_abi::STATUS_OK => Poll::Ready(Ok(())),
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
+        }
+    }
+
+    pub fn policy_admit_resolved(
+        &self,
+        policy_session: u64,
+        metadata: &SnolFlowMetadataV1,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let policy = match unsafe { self.descriptor().policy.as_ref() } {
+            Some(policy) => policy,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_POLICY))),
+        };
+        let admit = match policy.admit_resolved {
             Some(admit) => admit,
             None => return Poll::Ready(Err(LoadError::MissingFunction)),
         };
