@@ -236,12 +236,14 @@ fn native_policy_local_debits_before_forwarding_payload() {
     drop(carrier_listener);
     let target = TcpListener::bind("127.0.0.1:0").unwrap();
     let target_endpoint = target.local_addr().unwrap();
+    let (release_target, target_release) = std::sync::mpsc::sync_channel(1);
     let target_thread = thread::spawn(move || {
         let (mut stream, _) = target.accept().unwrap();
         let mut input = [0; 12];
         stream.read_exact(&mut input).unwrap();
         assert_eq!(&input, b"quota-upload");
         stream.write_all(b"quota-down").unwrap();
+        target_release.recv().unwrap();
     });
     let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let socks_endpoint = socks_listener.local_addr().unwrap();
@@ -345,7 +347,14 @@ fn native_policy_local_debits_before_forwarding_payload() {
         assert!(Instant::now() < deadline, "quota accounting timed out");
         thread::sleep(Duration::from_millis(10));
     }
-    socks.shutdown(Shutdown::Both).unwrap();
+    let revoke = format!(
+        "method = \"credential.revoke\"\nclient_id = \"native-test\"\nseq = 3\ncredential_sha256 = \"{credential_digest}\"\n"
+    );
+    futures::executor::block_on(
+        server_handle.control("policy-server-metered", revoke.into_bytes()),
+    )
+    .unwrap();
+    release_target.send(()).unwrap();
     target_thread.join().unwrap();
     while (client_handle.snapshot().flows != 0 || server_handle.snapshot().flows != 0)
         && Instant::now() < deadline
@@ -354,6 +363,7 @@ fn native_policy_local_debits_before_forwarding_payload() {
     }
     assert_eq!(client_handle.snapshot().flows, 0);
     assert_eq!(server_handle.snapshot().flows, 0);
+    socks.shutdown(Shutdown::Both).unwrap();
     loop {
         let request = format!("method = \"usage.get\"\nuser_id = \"{user_id}\"\n");
         let response = futures::executor::block_on(
