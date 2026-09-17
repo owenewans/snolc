@@ -76,6 +76,7 @@ fn load(path: &Path) -> Result<(Config, Vec<LoadedModule>), String> {
             &library,
             options,
             &module_config.base_directory,
+            &module_path,
         )
         .map_err(|error| error.to_string())?;
         if loaded.class_mask() & class == 0 {

@@ -1,9 +1,19 @@
 use std::ffi::CStr;
+use std::io;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::ptr::NonNull;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
+use futures::io::{AsyncRead, AsyncWrite};
 use libloading::{Library, Symbol};
-use snolc_abi::{ModuleEntry, SnolBytes, SnolBytesMut, SnolHostApiV1, SnolModuleDescriptor};
+use snolc_abi::{
+    ModuleEntry, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolHostApiV1, SnolIoResult,
+    SnolModuleDescriptor, SnolWakeHandle,
+};
 use thiserror::Error;
 
 const KNOWN_CLASSES: u32 = snolc_abi::CLASS_ADAPTER
@@ -15,7 +25,8 @@ const MAX_CONFIG_ERROR: usize = 4096;
 
 pub struct LoadedModule {
     descriptor: NonNull<SnolModuleDescriptor>,
-    library: Library,
+    library: Arc<Library>,
+    source_config: PathBuf,
     path: PathBuf,
     instance_name: String,
     name: String,
@@ -34,9 +45,10 @@ impl LoadedModule {
         path: &Path,
         config: Vec<u8>,
         base_directory: &Path,
+        source_config: &Path,
     ) -> Result<Self, LoadError> {
         // loading trusted native code can execute library initializers.
-        let library = unsafe { Library::new(path) }.map_err(LoadError::Open)?;
+        let library = Arc::new(unsafe { Library::new(path) }.map_err(LoadError::Open)?);
         // the entry symbol and descriptor remain valid while library is owned.
         let (descriptor, name, class_mask) = unsafe {
             let entry: Symbol<'_, ModuleEntry> = library
@@ -50,6 +62,7 @@ impl LoadedModule {
         let module = Self {
             descriptor,
             library,
+            source_config: source_config.to_path_buf(),
             path: path.to_path_buf(),
             instance_name,
             name,
@@ -76,6 +89,10 @@ impl LoadedModule {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn source_config(&self) -> &Path {
+        &self.source_config
     }
 
     pub fn describe(&self) -> Result<Vec<u8>, LoadError> {
@@ -163,6 +180,123 @@ impl LoadedModule {
             Ok(())
         } else {
             Err(LoadError::ModuleStatus(status))
+        }
+    }
+
+    pub fn carrier_connect(
+        &self,
+        endpoint: &[u8],
+        context: &mut Context<'_>,
+    ) -> Poll<Result<ModuleByteIo, LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let carrier = match unsafe { self.descriptor().carrier.as_ref() } {
+            Some(carrier) => carrier,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_CARRIER))),
+        };
+        let connect = match carrier.connect {
+            Some(connect) => connect,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let mut stream = 0;
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe { connect(instance, bytes(endpoint), wake.handle(), &mut stream) };
+        self.finish_byte_io(status, stream, vec![Arc::clone(&self.library)])
+    }
+
+    pub fn carrier_accept(
+        &self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<ModuleByteIo, LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let carrier = match unsafe { self.descriptor().carrier.as_ref() } {
+            Some(carrier) => carrier,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_CARRIER))),
+        };
+        let accept = match carrier.accept {
+            Some(accept) => accept,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let mut stream = 0;
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe { accept(instance, wake.handle(), &mut stream) };
+        self.finish_byte_io(status, stream, vec![Arc::clone(&self.library)])
+    }
+
+    pub fn protection_wrap(
+        &self,
+        lower: &mut Option<ModuleByteIo>,
+        context_bytes: &[u8],
+        context: &mut Context<'_>,
+    ) -> Poll<Result<ModuleByteIo, LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let protection = match unsafe { self.descriptor().protection.as_ref() } {
+            Some(protection) => protection,
+            None => {
+                return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_PROTECTION)));
+            }
+        };
+        let wrap = match protection.wrap {
+            Some(wrap) => wrap,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let (lower_handle, lower_io) = match lower.as_ref() {
+            Some(lower) => lower.raw_parts(),
+            None => return Poll::Ready(Err(LoadError::InvalidHandle)),
+        };
+        let mut wrapped = 0;
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe {
+            wrap(
+                instance,
+                lower_handle,
+                lower_io.as_ptr(),
+                bytes(context_bytes),
+                wake.handle(),
+                &mut wrapped,
+            )
+        };
+        let mut libraries = lower
+            .as_ref()
+            .map(|lower| lower.libraries.clone())
+            .unwrap_or_default();
+        libraries.push(Arc::clone(&self.library));
+        match self.finish_byte_io(status, wrapped, libraries) {
+            Poll::Ready(Ok(output)) => {
+                if let Some(lower) = lower.take() {
+                    lower.transfer();
+                }
+                Poll::Ready(Ok(output))
+            }
+            result => result,
+        }
+    }
+
+    fn finish_byte_io(
+        &self,
+        status: u32,
+        handle: u64,
+        libraries: Vec<Arc<Library>>,
+    ) -> Poll<Result<ModuleByteIo, LoadError>> {
+        match status {
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            snolc_abi::STATUS_OK if handle == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
+            snolc_abi::STATUS_OK => {
+                let io = match NonNull::new(self.descriptor().byte_io.cast_mut()) {
+                    Some(io) => io,
+                    None => return Poll::Ready(Err(LoadError::ByteIo)),
+                };
+                Poll::Ready(Ok(ModuleByteIo::new(handle, io, libraries)))
+            }
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
         }
     }
 
@@ -269,7 +403,266 @@ fn validate_class_tables(descriptor: &SnolModuleDescriptor) -> Result<(), LoadEr
             return Err(LoadError::ClassTable(class));
         }
     }
+    if descriptor.class_mask & (snolc_abi::CLASS_PROTECTION | snolc_abi::CLASS_CARRIER) != 0 {
+        validate_byte_io(descriptor.byte_io)?;
+    }
+    if descriptor.class_mask & snolc_abi::CLASS_ADAPTER != 0 {
+        let adapter = unsafe { descriptor.adapter.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))?;
+        if adapter.struct_size < size_of::<snolc_abi::SnolAdapterApiV1>() as u32
+            || adapter.reserved != 0
+            || adapter.open.is_none()
+        {
+            return Err(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER));
+        }
+    }
+    if descriptor.class_mask & snolc_abi::CLASS_PROTECTION != 0 {
+        let protection = unsafe { descriptor.protection.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_PROTECTION))?;
+        if protection.struct_size < size_of::<snolc_abi::SnolProtectionApiV1>() as u32
+            || protection.reserved != 0
+            || protection.wrap.is_none()
+        {
+            return Err(LoadError::ClassTable(snolc_abi::CLASS_PROTECTION));
+        }
+    }
+    if descriptor.class_mask & snolc_abi::CLASS_CARRIER != 0 {
+        let carrier = unsafe { descriptor.carrier.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_CARRIER))?;
+        if carrier.struct_size < size_of::<snolc_abi::SnolCarrierApiV1>() as u32
+            || carrier.reserved != 0
+            || carrier.connect.is_none()
+            || carrier.accept.is_none()
+        {
+            return Err(LoadError::ClassTable(snolc_abi::CLASS_CARRIER));
+        }
+    }
+    if descriptor.class_mask & snolc_abi::CLASS_POLICY != 0 {
+        let policy = unsafe { descriptor.policy.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_POLICY))?;
+        if policy.struct_size < size_of::<snolc_abi::SnolPolicyApiV1>() as u32
+            || policy.reserved != 0
+            || policy.attach_session.is_none()
+            || policy.admit_flow.is_none()
+            || policy.attach_flow.is_none()
+        {
+            return Err(LoadError::ClassTable(snolc_abi::CLASS_POLICY));
+        }
+    }
     Ok(())
+}
+
+fn validate_byte_io(io: *const SnolByteIoV1) -> Result<(), LoadError> {
+    let io = unsafe { io.as_ref() }.ok_or(LoadError::ByteIo)?;
+    if io.struct_size < size_of::<SnolByteIoV1>() as u32
+        || io.reserved != 0
+        || io.read.is_none()
+        || io.write.is_none()
+        || io.flush.is_none()
+        || io.shutdown_write.is_none()
+        || io.close.is_none()
+    {
+        return Err(LoadError::ByteIo);
+    }
+    Ok(())
+}
+
+pub struct ModuleByteIo {
+    handle: u64,
+    io: NonNull<SnolByteIoV1>,
+    libraries: Vec<Arc<Library>>,
+    closed: bool,
+    not_send: PhantomData<Rc<()>>,
+}
+
+impl ModuleByteIo {
+    fn new(handle: u64, io: NonNull<SnolByteIoV1>, libraries: Vec<Arc<Library>>) -> Self {
+        Self {
+            handle,
+            io,
+            libraries,
+            closed: false,
+            not_send: PhantomData,
+        }
+    }
+
+    fn raw_parts(&self) -> (u64, NonNull<SnolByteIoV1>) {
+        (self.handle, self.io)
+    }
+
+    fn transfer(mut self) {
+        self.closed = true;
+    }
+
+    fn table(&self) -> &SnolByteIoV1 {
+        unsafe { self.io.as_ref() }
+    }
+
+    fn action(
+        &mut self,
+        context: &mut Context<'_>,
+        function: Option<snolc_abi::IoActionFn>,
+    ) -> Poll<io::Result<()>> {
+        let function = match function {
+            Some(function) => function,
+            None => return Poll::Ready(Err(io::Error::other("module I/O function is missing"))),
+        };
+        let wake = WakeCall::new(context.waker());
+        let result = unsafe { function(self.handle, wake.handle()) };
+        map_action(result)
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let close = self
+            .table()
+            .close
+            .ok_or_else(|| io::Error::other("module close function is missing"))?;
+        let status = unsafe { close(self.handle) };
+        self.closed = true;
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(status_error(status))
+        }
+    }
+}
+
+impl AsyncRead for ModuleByteIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let read = match self.table().read {
+            Some(read) => read,
+            None => return Poll::Ready(Err(io::Error::other("module read function is missing"))),
+        };
+        let wake = WakeCall::new(context.waker());
+        let result = unsafe { read(self.handle, bytes_mut(output), wake.handle()) };
+        map_io(result, output.len(), true)
+    }
+}
+
+impl AsyncWrite for ModuleByteIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let write = match self.table().write {
+            Some(write) => write,
+            None => return Poll::Ready(Err(io::Error::other("module write function is missing"))),
+        };
+        let wake = WakeCall::new(context.waker());
+        let result = unsafe { write(self.handle, bytes(input), wake.handle()) };
+        map_io(result, input.len(), false)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let function = self.table().flush;
+        self.action(context, function)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let function = self.table().shutdown_write;
+        self.action(context, function)
+    }
+}
+
+impl Drop for ModuleByteIo {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn map_io(result: SnolIoResult, limit: usize, read: bool) -> Poll<io::Result<usize>> {
+    match result.tag {
+        snolc_abi::IO_PROGRESS if result.code == snolc_abi::STATUS_OK && result.count <= limit => {
+            Poll::Ready(Ok(result.count))
+        }
+        snolc_abi::IO_PENDING if result.code == snolc_abi::STATUS_OK && result.count == 0 => {
+            Poll::Pending
+        }
+        snolc_abi::IO_EOF if read && result.code == snolc_abi::STATUS_OK && result.count == 0 => {
+            Poll::Ready(Ok(0))
+        }
+        snolc_abi::IO_ERROR if result.count == 0 => Poll::Ready(Err(status_error(result.code))),
+        _ => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "module returned an invalid I/O result",
+        ))),
+    }
+}
+
+fn map_action(result: SnolIoResult) -> Poll<io::Result<()>> {
+    match result.tag {
+        snolc_abi::IO_PROGRESS if result.code == snolc_abi::STATUS_OK && result.count == 0 => {
+            Poll::Ready(Ok(()))
+        }
+        snolc_abi::IO_PENDING if result.code == snolc_abi::STATUS_OK && result.count == 0 => {
+            Poll::Pending
+        }
+        snolc_abi::IO_ERROR if result.count == 0 => Poll::Ready(Err(status_error(result.code))),
+        _ => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "module returned an invalid I/O action result",
+        ))),
+    }
+}
+
+fn status_error(status: u32) -> io::Error {
+    io::Error::other(format!("module I/O failed with status {status}"))
+}
+
+struct WakeCall {
+    pointer: *const Waker,
+}
+
+impl WakeCall {
+    fn new(waker: &Waker) -> Self {
+        Self {
+            pointer: Arc::into_raw(Arc::new(waker.clone())),
+        }
+    }
+
+    fn handle(&self) -> SnolWakeHandle {
+        SnolWakeHandle {
+            context: self.pointer.cast_mut().cast(),
+            wake: Some(ffi_wake),
+            retain: Some(ffi_wake_retain),
+            release: Some(ffi_wake_release),
+        }
+    }
+}
+
+impl Drop for WakeCall {
+    fn drop(&mut self) {
+        unsafe { Arc::decrement_strong_count(self.pointer) };
+    }
+}
+
+unsafe extern "C" fn ffi_wake(context: *mut std::ffi::c_void) {
+    let Some(waker) = (unsafe { (context as *const Waker).as_ref() }) else {
+        return;
+    };
+    waker.wake_by_ref();
+}
+
+unsafe extern "C" fn ffi_wake_retain(context: *mut std::ffi::c_void) -> u32 {
+    if context.is_null() {
+        return snolc_abi::STATUS_INVALID;
+    }
+    unsafe { Arc::increment_strong_count(context as *const Waker) };
+    snolc_abi::STATUS_OK
+}
+
+unsafe extern "C" fn ffi_wake_release(context: *mut std::ffi::c_void) {
+    if !context.is_null() {
+        unsafe { Arc::decrement_strong_count(context as *const Waker) };
+    }
 }
 
 fn bytes(input: &[u8]) -> SnolBytes {
@@ -320,6 +713,8 @@ pub enum LoadError {
     ClassMask(u32),
     #[error("module class {0:#x} has no API table")]
     ClassTable(u32),
+    #[error("module byte I/O table is invalid")]
+    ByteIo,
     #[error("module name is invalid")]
     Name,
     #[error("module omits a required function")]
@@ -343,6 +738,10 @@ pub enum LoadError {
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -394,6 +793,39 @@ mod tests {
         open: Some(open),
     };
 
+    static CLOSED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn io_read(_: u64, output: SnolBytesMut, _: SnolWakeHandle) -> SnolIoResult {
+        if output.length < 2 || output.pointer.is_null() {
+            return SnolIoResult::buffer_too_small(2);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(b"io".as_ptr(), output.pointer, 2) };
+        SnolIoResult::progress(2)
+    }
+
+    unsafe extern "C" fn io_write(_: u64, input: SnolBytes, _: SnolWakeHandle) -> SnolIoResult {
+        SnolIoResult::progress(input.length)
+    }
+
+    unsafe extern "C" fn io_action(_: u64, _: SnolWakeHandle) -> SnolIoResult {
+        SnolIoResult::progress(0)
+    }
+
+    unsafe extern "C" fn io_close(_: u64) -> u32 {
+        CLOSED.store(true, Ordering::Release);
+        snolc_abi::STATUS_OK
+    }
+
+    static BYTE_IO: SnolByteIoV1 = SnolByteIoV1 {
+        struct_size: size_of::<SnolByteIoV1>() as u32,
+        reserved: 0,
+        read: Some(io_read),
+        write: Some(io_write),
+        flush: Some(io_action),
+        shutdown_write: Some(io_action),
+        close: Some(io_close),
+    };
+
     fn descriptor() -> SnolModuleDescriptor {
         SnolModuleDescriptor {
             struct_size: size_of::<SnolModuleDescriptor>() as u32,
@@ -440,5 +872,48 @@ mod tests {
             unsafe { validate_descriptor(NonNull::from(&mut descriptor)) },
             Err(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))
         ));
+    }
+
+    #[test]
+    fn module_byte_io_maps_callbacks_and_closes_once() {
+        CLOSED.store(false, Ordering::Release);
+        let mut io = ModuleByteIo::new(1, NonNull::from(&BYTE_IO), Vec::new());
+        async_io::block_on(async {
+            let mut output = [0; 2];
+            io.read_exact(&mut output).await.unwrap();
+            assert_eq!(&output, b"io");
+            io.write_all(b"write").await.unwrap();
+            io.flush().await.unwrap();
+            AsyncWriteExt::close(&mut io).await.unwrap();
+        });
+        drop(io);
+        assert!(CLOSED.load(Ordering::Acquire));
+    }
+
+    struct CountWake(AtomicUsize);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn ffi_wake_supports_retained_module_handles() {
+        let state = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&state));
+        let call = WakeCall::new(&waker);
+        let handle = call.handle();
+        assert_eq!(
+            unsafe { handle.retain.unwrap()(handle.context) },
+            snolc_abi::STATUS_OK
+        );
+        unsafe { handle.wake.unwrap()(handle.context) };
+        unsafe { handle.release.unwrap()(handle.context) };
+        assert_eq!(state.0.load(Ordering::Relaxed), 1);
     }
 }
