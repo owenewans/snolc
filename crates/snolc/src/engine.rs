@@ -29,6 +29,7 @@ const MODULE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 type ContextMap = HashMap<(u64, Vec<u8>), Vec<u8>>;
 
 pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, EngineError>> + Send>>;
+type ControlSender = oneshot::Sender<Result<Vec<u8>, EngineError>>;
 
 pub trait Host: Send + Sync + 'static {
     fn engine_event(&self, event: &Event);
@@ -106,6 +107,7 @@ pub struct Engine {
     wake: Arc<WakeState>,
     logger: Option<EngineLogger>,
     log_errors: Arc<Mutex<VecDeque<String>>>,
+    pending_controls: VecDeque<PendingControl>,
 }
 
 struct EngineLogger {
@@ -143,11 +145,18 @@ enum Command {
     Control {
         instance: String,
         request: Vec<u8>,
-        response: oneshot::Sender<Result<Vec<u8>, EngineError>>,
+        response: ControlSender,
     },
     Shutdown {
         response: oneshot::Sender<()>,
     },
+}
+
+struct PendingControl {
+    module: usize,
+    request: Vec<u8>,
+    max_response: usize,
+    response: ControlSender,
 }
 
 impl Engine {
@@ -246,6 +255,7 @@ impl Engine {
             }),
             logger,
             log_errors,
+            pending_controls: VecDeque::new(),
         };
         Ok((engine, handle))
     }
@@ -288,8 +298,12 @@ impl Engine {
             select! {
                 command = command => match command {
                     Some(Command::Control { instance, request, response }) => {
-                        let result = self.control(&instance, &request);
-                        let _ = response.send(result);
+                        match self.start_control(&instance, request, response) {
+                            Ok(()) => self.poll_controls(),
+                            Err((error, response)) => {
+                                let _ = response.send(Err(error));
+                            }
+                        }
                     }
                     Some(Command::Shutdown { response }) => {
                         self.emit(Event::Lifecycle(Lifecycle::Stopping));
@@ -304,6 +318,7 @@ impl Engine {
                 _ = timer => {
                     stack.poll();
                     self.poll_modules();
+                    self.poll_controls();
                     self.poll_tunnels(&mut tunnels);
                     self.drain_module_events();
                     self.drain_log_errors();
@@ -329,7 +344,12 @@ impl Engine {
         Ok(())
     }
 
-    fn control(&mut self, instance: &str, request: &[u8]) -> Result<Vec<u8>, EngineError> {
+    fn start_control(
+        &mut self,
+        instance: &str,
+        request: Vec<u8>,
+        response: ControlSender,
+    ) -> Result<(), (EngineError, ControlSender)> {
         let max_response = match &self.validated.config.control {
             ControlConfig::Off => 65_536,
             ControlConfig::Unix {
@@ -339,10 +359,35 @@ impl Engine {
         let module = self
             .validated
             .modules
-            .iter_mut()
-            .find(|module| module.instance_name() == instance)
-            .ok_or_else(|| EngineError::InstanceNotFound(instance.to_owned()))?;
-        module.control(request, max_response).map_err(Into::into)
+            .iter()
+            .position(|module| module.instance_name() == instance);
+        let Some(module) = module else {
+            return Err((EngineError::InstanceNotFound(instance.to_owned()), response));
+        };
+        self.pending_controls.push_back(PendingControl {
+            module,
+            request,
+            max_response,
+            response,
+        });
+        Ok(())
+    }
+
+    fn poll_controls(&mut self) {
+        let count = self.pending_controls.len();
+        for _ in 0..count {
+            let Some(control) = self.pending_controls.pop_front() else {
+                break;
+            };
+            match self.validated.modules[control.module]
+                .poll_control(&control.request, control.max_response)
+            {
+                Poll::Ready(result) => {
+                    let _ = control.response.send(result.map_err(Into::into));
+                }
+                Poll::Pending => self.pending_controls.push_back(control),
+            }
+        }
     }
 
     fn poll_modules(&mut self) {

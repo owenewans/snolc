@@ -143,7 +143,11 @@ impl LoadedModule {
         }
     }
 
-    pub fn control(&mut self, request: &[u8], max_response: usize) -> Result<Vec<u8>, LoadError> {
+    pub fn poll_control(
+        &mut self,
+        request: &[u8],
+        max_response: usize,
+    ) -> Poll<Result<Vec<u8>, LoadError>> {
         let instance = self.instance.ok_or(LoadError::NotCreated)?;
         let function = self
             .descriptor()
@@ -161,9 +165,12 @@ impl LoadedModule {
             )
         };
         if status == snolc_abi::STATUS_UNSUPPORTED {
-            return Err(LoadError::Unsupported);
+            return Poll::Ready(Err(LoadError::Unsupported));
         }
-        check_output(status, output, written, max_response)
+        if status == snolc_abi::STATUS_PENDING {
+            return Poll::Pending;
+        }
+        Poll::Ready(check_output(status, output, written, max_response))
     }
 
     pub fn shutdown(&mut self) -> Result<(), LoadError> {
