@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use snolc::config::Config;
 use snolc::loader::LoadedModule;
 use snolc::{Engine, Event, Host, Lifecycle};
@@ -112,8 +113,13 @@ fn native_noise_policy_local_opens_private_storage_and_session() {
         "mode = \"client\"\nserver_public_key_file = \"{}\"\n",
         public.display()
     );
-    let server_policy = policy_local_options(&directory.join("server-state/policy.redb"));
-    let client_policy = policy_local_options(&directory.join("client-state/policy.redb"));
+    let credential = "ab".repeat(32);
+    let credential_digest = format!("{:x}", Sha256::digest(hex_bytes(&credential)));
+    let server_policy = policy_local_options(&directory.join("server-state/policy.redb"), None);
+    let client_policy = policy_local_options(
+        &directory.join("client-state/policy.redb"),
+        Some(&credential),
+    );
     let server = build_side(
         "server-local",
         "server",
@@ -130,7 +136,7 @@ fn native_noise_policy_local_opens_private_storage_and_session() {
         ("protection_noise", client_protection.as_bytes()),
         ("policy_local", client_policy.as_bytes()),
     );
-    run_pair(server, client);
+    run_authenticated_pair(server, client, &credential_digest);
     assert!(directory.join("server-state/policy.redb").is_file());
     assert!(directory.join("client-state/policy.redb").is_file());
     fs::remove_dir_all(directory).unwrap();
@@ -159,6 +165,105 @@ fn run_pair(server: snolc::ValidatedConfig, client: snolc::ValidatedConfig) {
     server_handle.shutdown().unwrap();
     client_thread.join().unwrap().unwrap();
     server_thread.join().unwrap().unwrap();
+}
+
+fn run_authenticated_pair(
+    server: snolc::ValidatedConfig,
+    client: snolc::ValidatedConfig,
+    credential_digest: &str,
+) {
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+
+    let create = br#"
+method = "user.create"
+client_id = "native-test"
+seq = 1
+
+[user]
+status = "enabled"
+burst_bytes = 65507
+weight = 1
+group = "default"
+rule_profile = "default"
+
+[user.expiration]
+mode = "unlimited"
+[user.quota]
+mode = "limited"
+bytes = 1048576
+[user.upload_rate]
+mode = "unlimited"
+[user.download_rate]
+mode = "unlimited"
+[user.combined_rate]
+mode = "unlimited"
+[user.max_sessions]
+mode = "limited"
+count = 2
+[user.max_flows]
+mode = "limited"
+count = 16
+"#;
+    let response =
+        futures::executor::block_on(server_handle.control("policy-server-local", create.to_vec()))
+            .unwrap();
+    let response: toml::Value = toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+    let user_id = response["user_id"].as_str().unwrap();
+    let add = format!(
+        "method = \"credential.add\"\nclient_id = \"native-test\"\nseq = 2\nuser_id = \"{user_id}\"\ncredential_sha256 = \"{credential_digest}\"\n"
+    );
+    futures::executor::block_on(server_handle.control("policy-server-local", add.into_bytes()))
+        .unwrap();
+
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let request = format!("method = \"sessions.list\"\nuser_id = \"{user_id}\"\n");
+        let response = futures::executor::block_on(
+            server_handle.control("policy-server-local", request.into_bytes()),
+        )
+        .unwrap();
+        let response: toml::Value =
+            toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+        if response["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "policy authentication timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+}
+
+fn wait_running(handle: &snolc::EngineHandle) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && handle.snapshot().lifecycle != Lifecycle::Running {
+        assert_ne!(handle.snapshot().lifecycle, Lifecycle::Failed);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(handle.snapshot().lifecycle, Lifecycle::Running);
+}
+
+fn wait_sessions(server: &snolc::EngineHandle, client: &snolc::EngineHandle) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && (server.snapshot().sessions != 1 || client.snapshot().sessions != 1)
+    {
+        assert_ne!(server.snapshot().lifecycle, Lifecycle::Failed);
+        assert_ne!(client.snapshot().lifecycle, Lifecycle::Failed);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.snapshot().sessions, 1);
+    assert_eq!(client.snapshot().sessions, 1);
 }
 
 fn build_side(
@@ -218,12 +323,35 @@ fn build_side(
     Engine::validate(config, modules).unwrap()
 }
 
-fn policy_local_options(path: &Path) -> String {
+fn policy_local_options(path: &Path, credential: Option<&str>) -> String {
     let template = include_str!("../../../config/templates/policy-local-server.toml");
     let mut template: toml::Value = toml::from_str(template).unwrap();
     template["options"]["storage"]["path"] =
         toml::Value::String(path.to_string_lossy().into_owned());
+    if let Some(credential) = credential {
+        let client: toml::Value = toml::from_str(&format!(
+            "[client.credential]\nsource = \"toml\"\nvalue = \"{credential}\"\n"
+        ))
+        .unwrap();
+        template["options"]
+            .as_table_mut()
+            .unwrap()
+            .insert("client".into(), client["client"].clone());
+    }
     toml::to_string(&template["options"]).unwrap()
+}
+
+fn hex_bytes(input: &str) -> Vec<u8> {
+    let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
+    assert!(remainder.is_empty());
+    pairs
+        .iter()
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).unwrap();
+            let low = (pair[1] as char).to_digit(16).unwrap();
+            ((high << 4) | low) as u8
+        })
+        .collect()
 }
 
 fn load(instance: &str, library: &str, options: &[u8], source: &Path) -> LoadedModule {

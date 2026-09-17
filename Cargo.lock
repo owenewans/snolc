@@ -1016,6 +1016,7 @@ dependencies = [
  "futures",
  "libloading",
  "serde",
+ "sha2",
  "smoltcp",
  "snolc-abi",
  "snolc-sdk",
@@ -1109,6 +1110,7 @@ dependencies = [
  "snolc-sdk",
  "thiserror",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

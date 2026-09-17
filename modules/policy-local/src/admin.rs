@@ -54,6 +54,14 @@ impl Credential {
         CredentialDigest(self.digest())
     }
 
+    pub fn parse_hex(input: &str) -> Result<Self, AdminError> {
+        Ok(Self(decode_hex(input)?))
+    }
+
+    pub fn hex(&self) -> String {
+        encode_hex(&self.0)
+    }
+
     pub fn expose_once(mut self) -> [u8; 32] {
         let output = self.0;
         self.0.fill(0);

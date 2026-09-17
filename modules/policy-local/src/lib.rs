@@ -4,6 +4,7 @@ mod accounting;
 mod admin;
 mod config;
 mod frame;
+mod service;
 mod storage;
 
 pub use accounting::{QuotaAccount, QuotaError, TokenBucket};
@@ -23,10 +24,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use snolc_sdk::abi::{self, SnolByteIoV1, SnolBytes, SnolPolicyApiV1, SnolWakeHandle};
 use snolc_sdk::{ByteIo, ForeignByteIo, Pump, PumpError, PumpReport};
+use zeroize::Zeroize;
+
+use service::{ClientRequest, SessionChannel};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,8 +65,30 @@ struct State {
     storage: StorageWorker,
     admin: AdminState,
     pending_control: Option<PendingControl>,
-    sessions: HashMap<u64, ForeignByteIo>,
+    client_credential: Option<Credential>,
+    sessions: HashMap<u64, PolicySession>,
     flows: HashMap<u64, PolicyFlow<ForeignByteIo, ForeignByteIo>>,
+}
+
+struct PolicySession {
+    channel: SessionChannel<ForeignByteIo>,
+    role: PolicyRole,
+    auth: AuthState,
+    subscribed: bool,
+    last_status: Instant,
+}
+
+enum AuthState {
+    Waiting,
+    Credential {
+        digest: String,
+        reply: storage::ReadReply,
+    },
+    User {
+        user_id: String,
+        reply: storage::ReadReply,
+    },
+    Authenticated(String),
 }
 
 struct AdminState {
@@ -183,6 +210,18 @@ fn initialize(
             .restore(client_id.to_owned(), &receipt)
             .map_err(admin_status)?;
     }
+    let client_credential = options
+        .client
+        .as_ref()
+        .map(|client| client.credential.resolve())
+        .transpose()
+        .map_err(|_| abi::STATUS_INVALID)?
+        .map(|mut secret| {
+            let credential = Credential::parse_hex(&secret).map_err(admin_status);
+            secret.zeroize();
+            credential
+        })
+        .transpose()?;
     STATES.with(|states| {
         states.borrow_mut().insert(
             instance,
@@ -198,6 +237,7 @@ fn initialize(
                 },
                 storage,
                 pending_control: None,
+                client_credential,
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
             },
@@ -254,7 +294,34 @@ unsafe extern "C" fn attach_session(
             let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
-            state.sessions.insert(handle, stream);
+            let mut channel =
+                match SessionChannel::new(stream, state.options.max_control_frame_bytes) {
+                    Ok(channel) => channel,
+                    Err(_) => return abi::STATUS_RESOURCE,
+                };
+            if matches!(context.role, PolicyRole::Client) {
+                let Some(credential) = state.client_credential.as_ref() else {
+                    return abi::STATUS_DENIED;
+                };
+                let mut credential = credential.hex();
+                let mut request = format!("method = \"auth\"\ncredential = \"{credential}\"\n");
+                credential.zeroize();
+                let queued = channel.queue_secret(&request);
+                request.zeroize();
+                if queued.is_err() {
+                    return abi::STATUS_RESOURCE;
+                }
+            }
+            state.sessions.insert(
+                handle,
+                PolicySession {
+                    channel,
+                    role: context.role,
+                    auth: AuthState::Waiting,
+                    subscribed: false,
+                    last_status: Instant::now(),
+                },
+            );
             *output = handle;
             abi::STATUS_OK
         })
@@ -269,10 +336,19 @@ unsafe extern "C" fn admit_flow(
 ) -> u32 {
     snolc_sdk::catch_status(|| {
         if !INSTANCES.contains(instance) || session == 0 || metadata.length > 1024 {
-            abi::STATUS_INVALID
-        } else {
-            abi::STATUS_OK
+            return abi::STATUS_INVALID;
         }
+        STATES.with(|states| {
+            let states = states.borrow();
+            let Some(state) = states.get(&instance) else {
+                return abi::STATUS_INVALID;
+            };
+            match state.sessions.get(&session).map(|session| &session.auth) {
+                Some(AuthState::Authenticated(_)) => abi::STATUS_OK,
+                Some(_) => abi::STATUS_PENDING,
+                None => abi::STATUS_INVALID,
+            }
+        })
     })
 }
 
@@ -344,8 +420,254 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         for handle in finished {
             state.flows.remove(&handle);
         }
+        let handles: Vec<u64> = state.sessions.keys().copied().collect();
+        for handle in handles {
+            let Some(mut session) = state.sessions.remove(&handle) else {
+                continue;
+            };
+            if poll_policy_session(state, &mut session, &mut context).is_ok() {
+                state.sessions.insert(handle, session);
+            }
+        }
         abi::STATUS_PENDING
     })
+}
+
+fn poll_policy_session(
+    state: &mut State,
+    session: &mut PolicySession,
+    context: &mut Context<'_>,
+) -> Result<(), u32> {
+    let messages = match session.channel.poll(context) {
+        Poll::Ready(Ok(messages)) => messages,
+        Poll::Ready(Err(_)) => return Err(abi::STATUS_IO),
+        Poll::Pending => Vec::new(),
+    };
+    for message in messages {
+        match session.role {
+            PolicyRole::Server => handle_client_request(state, session, &message)?,
+            PolicyRole::Client => handle_server_status(session, &message)?,
+        }
+    }
+    advance_authentication(state, session)?;
+    if session.subscribed
+        && session.last_status.elapsed() >= Duration::from_millis(state.options.status_interval_ms)
+        && let AuthState::Authenticated(user_id) = &session.auth
+    {
+        let status = status_message(state, user_id, "ok")?;
+        session
+            .channel
+            .replace_snapshot(&status)
+            .map_err(|_| abi::STATUS_RESOURCE)?;
+        session.last_status = Instant::now();
+    }
+    Ok(())
+}
+
+fn handle_client_request(
+    state: &mut State,
+    session: &mut PolicySession,
+    input: &str,
+) -> Result<(), u32> {
+    match ClientRequest::parse(input).map_err(|_| abi::STATUS_DENIED)? {
+        ClientRequest::Auth { credential } => {
+            if !matches!(session.auth, AuthState::Waiting) {
+                return Err(abi::STATUS_DENIED);
+            }
+            let credential = Credential::parse_hex(&credential).map_err(admin_status)?;
+            let digest = credential.digest_id().hex();
+            let reply = state
+                .storage
+                .get(format!("credential/{digest}"))
+                .map_err(storage_status)?;
+            session.auth = AuthState::Credential { digest, reply };
+        }
+        ClientRequest::Status => {
+            let AuthState::Authenticated(user_id) = &session.auth else {
+                return Err(abi::STATUS_DENIED);
+            };
+            let status = status_message(state, user_id, "ok")?;
+            session
+                .channel
+                .queue_response(&status)
+                .map_err(|_| abi::STATUS_RESOURCE)?;
+        }
+        ClientRequest::Subscribe => {
+            let AuthState::Authenticated(user_id) = &session.auth else {
+                return Err(abi::STATUS_DENIED);
+            };
+            let status = status_message(state, user_id, "ok")?;
+            session
+                .channel
+                .replace_snapshot(&status)
+                .map_err(|_| abi::STATUS_RESOURCE)?;
+            session.subscribed = true;
+            session.last_status = Instant::now();
+        }
+        ClientRequest::DisconnectSelf => return Err(abi::STATUS_OK),
+    }
+    Ok(())
+}
+
+fn handle_server_status(session: &mut PolicySession, input: &str) -> Result<(), u32> {
+    let value: toml::Value = toml::from_str(input).map_err(|_| abi::STATUS_DENIED)?;
+    let status = value
+        .get("status")
+        .and_then(toml::Value::as_str)
+        .ok_or(abi::STATUS_DENIED)?;
+    match status {
+        "authenticated" | "ok" => {
+            let user_id = value
+                .get("user_id")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("remote")
+                .to_owned();
+            session.auth = AuthState::Authenticated(user_id);
+            Ok(())
+        }
+        _ => Err(abi::STATUS_DENIED),
+    }
+}
+
+fn advance_authentication(state: &mut State, session: &mut PolicySession) -> Result<(), u32> {
+    let auth = std::mem::replace(&mut session.auth, AuthState::Waiting);
+    match auth {
+        AuthState::Credential { digest, reply } => match reply.try_recv() {
+            Ok(Ok(Some(value))) => {
+                let credential: CredentialRecord =
+                    postcard::from_bytes(&value).map_err(|_| abi::STATUS_IO)?;
+                if credential.digest != digest || credential.revoked {
+                    queue_denied(session, "credential-revoked")?;
+                    return Ok(());
+                }
+                let user_id = credential.user_id;
+                let reply = state
+                    .storage
+                    .get(format!("user/{user_id}"))
+                    .map_err(storage_status)?;
+                session.auth = AuthState::User { user_id, reply };
+            }
+            Ok(Ok(None)) => queue_denied(session, "credential-unknown")?,
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => return Err(abi::STATUS_IO),
+            Err(TryRecvError::Empty) => {
+                session.auth = AuthState::Credential { digest, reply };
+            }
+        },
+        AuthState::User { user_id, reply } => match reply.try_recv() {
+            Ok(Ok(Some(value))) => {
+                let user = decode_user_record(&value).map_err(|_| abi::STATUS_IO)?;
+                if user.id != user_id || !user_available(&user) {
+                    queue_denied(session, "user-disabled")?;
+                    return Ok(());
+                }
+                if session_limit_reached(state, &user) {
+                    queue_denied(session, "session-limit")?;
+                    return Ok(());
+                }
+                state.admin.loaded_users.insert(user_id.clone());
+                state.admin.users.insert(user_id.clone(), user);
+                session.auth = AuthState::Authenticated(user_id.clone());
+                let status = status_message(state, &user_id, "authenticated")?;
+                session
+                    .channel
+                    .queue_response(&status)
+                    .map_err(|_| abi::STATUS_RESOURCE)?;
+            }
+            Ok(Ok(None)) => queue_denied(session, "user-unknown")?,
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => return Err(abi::STATUS_IO),
+            Err(TryRecvError::Empty) => {
+                session.auth = AuthState::User { user_id, reply };
+            }
+        },
+        auth => session.auth = auth,
+    }
+    Ok(())
+}
+
+fn queue_denied(session: &mut PolicySession, reason: &str) -> Result<(), u32> {
+    session
+        .channel
+        .queue_response(&format!("status = \"denied\"\nreason = \"{reason}\"\n"))
+        .map_err(|_| abi::STATUS_RESOURCE)
+}
+
+fn user_available(user: &UserRecord) -> bool {
+    if user.spec.status != UserStatus::Enabled {
+        return false;
+    }
+    if let Expiration::AtUtc { unix_seconds } = user.spec.expiration {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(u64::MAX);
+        if now >= unix_seconds {
+            return false;
+        }
+    }
+    !matches!(
+        user.spec.quota,
+        ByteLimit::Limited { bytes } if user.durable_charged_bytes >= bytes
+    )
+}
+
+fn session_limit_reached(state: &State, user: &UserRecord) -> bool {
+    let CountLimit::Limited { count } = user.spec.max_sessions else {
+        return false;
+    };
+    let active = state
+        .sessions
+        .values()
+        .filter(|session| matches!(&session.auth, AuthState::Authenticated(id) if id == &user.id))
+        .count();
+    active >= count as usize
+}
+
+fn status_message(state: &State, user_id: &str, status: &'static str) -> Result<String, u32> {
+    let user = state.admin.users.get(user_id).ok_or(abi::STATUS_INVALID)?;
+    toml::to_string(&PolicyStatus {
+        status,
+        server_id: &state.options.server_id,
+        user_id,
+        used_bytes: user.durable_charged_bytes,
+        limit_bytes: match user.spec.quota {
+            ByteLimit::Unlimited => None,
+            ByteLimit::Limited { bytes } => Some(bytes),
+        },
+        upload_bytes_per_second: rate_value(&user.spec.upload_rate),
+        download_bytes_per_second: rate_value(&user.spec.download_rate),
+        expires_at: match user.spec.expiration {
+            Expiration::Unlimited => None,
+            Expiration::AtUtc { unix_seconds } => Some(unix_seconds),
+        },
+        revision: user.revision,
+        reason: "ok",
+    })
+    .map_err(|_| abi::STATUS_INTERNAL)
+}
+
+fn rate_value(rate: &RateLimit) -> Option<u64> {
+    match rate {
+        RateLimit::Unlimited => None,
+        RateLimit::Limited { bytes_per_second } => Some(*bytes_per_second),
+    }
+}
+
+#[derive(Serialize)]
+struct PolicyStatus<'a> {
+    status: &'static str,
+    server_id: &'a str,
+    user_id: &'a str,
+    used_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upload_bytes_per_second: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_bytes_per_second: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    revision: u64,
+    reason: &'static str,
 }
 
 fn control_instance(instance: u64, request: &[u8]) -> Result<Vec<u8>, u32> {
@@ -534,11 +856,20 @@ fn read_admin_state(state: &State, request: ControlRequest) -> Result<Vec<u8>, u
             })
         }
         ControlRequest::SessionsList { user_id } => {
-            let sessions: Vec<u64> = if user_id.is_none() {
-                state.sessions.keys().copied().collect()
-            } else {
-                Vec::new()
-            };
+            let sessions = state
+                .sessions
+                .iter()
+                .filter_map(|(handle, session)| match &session.auth {
+                    AuthState::Authenticated(authenticated)
+                        if user_id
+                            .as_ref()
+                            .is_none_or(|requested| requested == authenticated) =>
+                    {
+                        Some(*handle)
+                    }
+                    _ => None,
+                })
+                .collect();
             encode_response(&SessionsResponse {
                 status: "ok",
                 sessions,
