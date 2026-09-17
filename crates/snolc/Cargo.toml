@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+libloading.workspace = true
 serde.workspace = true
 snolc-abi = { path = "../snolc-abi" }
 snolc-sdk = { path = "../snolc-sdk" }

@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod config;
+pub mod loader;
 pub mod module_config;
 pub mod wire;
 
