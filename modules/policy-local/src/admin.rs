@@ -124,7 +124,7 @@ pub struct UserSpec {
 impl UserSpec {
     pub fn validate(&self) -> Result<(), AdminError> {
         if self.weight == 0
-            || self.burst_bytes == 0
+            || self.burst_bytes < 65_507
             || self.group.is_empty()
             || self.group.len() > 64
             || self.rule_profile.is_empty()
