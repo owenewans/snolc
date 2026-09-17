@@ -566,6 +566,15 @@ name = "snolc-abi"
 version = "0.0.1"
 
 [[package]]
+name = "snolc-adapter-direct"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "snolc-sdk",
+ "toml",
+]
+
+[[package]]
 name = "snolc-adapter-http-connect"
 version = "0.0.1"
 dependencies = [
@@ -578,6 +587,16 @@ dependencies = [
 name = "snolc-adapter-socks5"
 version = "0.0.1"
 dependencies = [
+ "serde",
+ "snolc-sdk",
+ "toml",
+]
+
+[[package]]
+name = "snolc-adapter-tun"
+version = "0.0.1"
+dependencies = [
+ "libc",
  "serde",
  "snolc-sdk",
  "toml",
