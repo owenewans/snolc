@@ -12,6 +12,7 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+libc.workspace = true
 serde.workspace = true
 snolc-sdk = { path = "../../crates/snolc-sdk" }
 toml.workspace = true

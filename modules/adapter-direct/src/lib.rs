@@ -6,30 +6,36 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
 };
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use snolc_sdk::abi::{
     self, SnolAdapterApiV1, SnolByteIoV1, SnolBytes, SnolDatagramIoV1, SnolWakeHandle,
 };
 use snolc_sdk::{
-    ByteIo, DatagramIo, DatagramPump, DatagramRecv, ForeignByteIo, ForeignDatagramIo, Pump,
+    ByteIo, DatagramIo, DatagramPump, DatagramRecv, ForeignByteIo, ForeignDatagramIo, HostApi, Pump,
 };
 
 const MAX_UDP_PAYLOAD: usize = 65_507;
 
 pub trait SocketProtector: Send + Sync {
-    fn protect(&self, socket: &TcpStream) -> io::Result<()>;
+    fn protect(&self, socket: i64) -> io::Result<()>;
 }
 
 pub struct NoopProtector;
 
 impl SocketProtector for NoopProtector {
-    fn protect(&self, _socket: &TcpStream) -> io::Result<()> {
+    fn protect(&self, _socket: i64) -> io::Result<()> {
         Ok(())
     }
 }
@@ -129,11 +135,8 @@ pub fn connect_domain(
     }
     let mut last_error = None;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, timeout) {
-            Ok(stream) => {
-                protector.protect(&stream)?;
-                return Ok(stream);
-            }
+        match connect_tcp(address, timeout, |socket| protector.protect(socket)) {
+            Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
         }
     }
@@ -449,13 +452,14 @@ fn initialize(
     instance: u64,
     config: &[u8],
     _base: &[u8],
-    _host: *const abi::SnolHostApiV1,
+    host: *const abi::SnolHostApiV1,
 ) -> Result<(), u32> {
     let options = parse_options(config).map_err(|_| abi::STATUS_INVALID)?;
+    let host = unsafe { HostApi::from_raw(host) }?;
     let (sender, receiver) = sync_channel(options.max_pending_opens);
     let worker = thread::Builder::new()
         .name("snolc-direct".into())
-        .spawn(move || connect_worker(receiver))
+        .spawn(move || connect_worker(receiver, host))
         .map_err(|_| abi::STATUS_IO)?;
     STATES.with(|states| {
         states.borrow_mut().insert(
@@ -603,7 +607,7 @@ fn owned_destination(
     }
 }
 
-fn connect_worker(receiver: Receiver<ConnectRequest>) {
+fn connect_worker(receiver: Receiver<ConnectRequest>, host: HostApi) {
     while let Ok(request) = receiver.recv() {
         let result = connect_destination(
             request.kind,
@@ -611,6 +615,7 @@ fn connect_worker(receiver: Receiver<ConnectRequest>) {
             request.dns_mode,
             request.resolve_timeout,
             request.connect_timeout,
+            host,
         );
         let _ = request.response.send(result);
         request.wake.wake();
@@ -623,6 +628,7 @@ fn connect_destination(
     dns_mode: DnsMode,
     _resolve_timeout: Duration,
     connect_timeout: Duration,
+    host: HostApi,
 ) -> Result<Endpoint, DirectError> {
     let addresses = match destination {
         Destination::Ip(address) => vec![address],
@@ -642,10 +648,13 @@ fn connect_destination(
     let mut last_error = None;
     for address in addresses {
         let result = match kind {
-            abi::FLOW_TCP => {
-                TcpStream::connect_timeout(&address, connect_timeout).map(Endpoint::Tcp)
-            }
-            abi::FLOW_UDP => connect_udp(address).map(Endpoint::Udp),
+            abi::FLOW_TCP => connect_tcp(address, connect_timeout, |socket| {
+                host.protect_socket(socket).map_err(|_| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "socket protect failed")
+                })
+            })
+            .map(Endpoint::Tcp),
+            abi::FLOW_UDP => connect_udp(address, host).map(Endpoint::Udp),
             _ => return Err(DirectError::InvalidDestination),
         };
         match result {
@@ -656,14 +665,152 @@ fn connect_destination(
     Err(last_error.map_or(DirectError::NoAddress, DirectError::Io))
 }
 
-fn connect_udp(address: SocketAddr) -> io::Result<UdpSocket> {
+fn connect_udp(address: SocketAddr, host: HostApi) -> io::Result<UdpSocket> {
     let bind = match address {
         SocketAddr::V4(_) => "0.0.0.0:0",
         SocketAddr::V6(_) => "[::]:0",
     };
     let socket = UdpSocket::bind(bind)?;
+    host.protect_socket(raw_socket_udp(&socket)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "socket protect failed"))?;
     socket.connect(address)?;
     Ok(socket)
+}
+
+#[cfg(unix)]
+fn raw_socket_udp(socket: &UdpSocket) -> io::Result<i64> {
+    Ok(i64::from(socket.as_raw_fd()))
+}
+
+#[cfg(windows)]
+fn raw_socket_udp(socket: &UdpSocket) -> io::Result<i64> {
+    i64::try_from(socket.as_raw_socket())
+        .map_err(|_| io::Error::other("socket handle does not fit i64"))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn connect_tcp(
+    address: SocketAddr,
+    timeout: Duration,
+    protect: impl FnOnce(i64) -> io::Result<()>,
+) -> io::Result<TcpStream> {
+    let domain = match address {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    let raw = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_TCP,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { TcpStream::from_raw_fd(raw) };
+    protect(i64::from(raw))?;
+    let result = connect_raw(raw, address);
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error);
+        }
+        wait_connected(raw, timeout)?;
+    }
+    if let Some(error) = stream.take_error()? {
+        return Err(error);
+    }
+    Ok(stream)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn connect_raw(raw: RawFd, address: SocketAddr) -> libc::c_int {
+    match address {
+        SocketAddr::V4(address) => {
+            let [a, b, c, d] = address.ip().octets();
+            let address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: address.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([a, b, c, d]),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::connect(
+                    raw,
+                    (&raw const address).cast::<libc::sockaddr>(),
+                    size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(address) => {
+            let address = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: address.port().to_be(),
+                sin6_flowinfo: address.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: address.ip().octets(),
+                },
+                sin6_scope_id: address.scope_id(),
+            };
+            unsafe {
+                libc::connect(
+                    raw,
+                    (&raw const address).cast::<libc::sockaddr>(),
+                    size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn wait_connected(raw: RawFd, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "connect timeout overflow"))?;
+    let mut poll_fd = libc::pollfd {
+        fd: raw,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
+        }
+        let timeout_ms = remaining.as_millis().max(1);
+        let timeout_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn connect_tcp(
+    address: SocketAddr,
+    timeout: Duration,
+    protect: impl FnOnce(i64) -> io::Result<()>,
+) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&address, timeout)?;
+    #[cfg(unix)]
+    let raw = i64::from(stream.as_raw_fd());
+    #[cfg(windows)]
+    let raw = i64::try_from(stream.as_raw_socket())
+        .map_err(|_| io::Error::other("socket handle does not fit i64"))?;
+    protect(raw)?;
+    Ok(stream)
 }
 
 fn error_status(error: &DirectError) -> u32 {
@@ -891,10 +1038,41 @@ snolc_sdk::declare_stateful_module! {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::ffi::c_void;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::task::Waker;
 
     use super::*;
+
+    struct ProtectState {
+        allow: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    unsafe extern "C" fn protect(context: *mut c_void, _socket: i64) -> u32 {
+        let state = unsafe { &*(context as *const ProtectState) };
+        state.calls.fetch_add(1, Ordering::Relaxed);
+        if state.allow.load(Ordering::Relaxed) {
+            abi::STATUS_OK
+        } else {
+            abi::STATUS_DENIED
+        }
+    }
+
+    fn host_api(state: &ProtectState) -> abi::SnolHostApiV1 {
+        abi::SnolHostApiV1 {
+            struct_size: size_of::<abi::SnolHostApiV1>() as u32,
+            reserved: 0,
+            context: (state as *const ProtectState).cast_mut().cast(),
+            now_monotonic_nanos: None,
+            set_timer: None,
+            emit_event: None,
+            context_get: None,
+            context_set: None,
+            protect_socket: Some(protect),
+        }
+    }
 
     #[derive(Default)]
     struct MemoryIo {
@@ -977,7 +1155,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let accept = thread::spawn(move || listener.accept().unwrap().0);
         let (sender, receiver) = sync_channel(1);
-        let worker = thread::spawn(move || connect_worker(receiver));
+        let state = ProtectState {
+            allow: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        };
+        let raw_host = host_api(&state);
+        let host = unsafe { HostApi::from_raw(&raw_host) }.unwrap();
+        let worker = thread::spawn(move || connect_worker(receiver, host));
         let (response_tx, response_rx) = sync_channel(1);
         sender
             .try_send(ConnectRequest {
@@ -1002,6 +1186,7 @@ mod tests {
         drop(sender);
         worker.join().unwrap();
         drop(accept.join().unwrap());
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1012,6 +1197,11 @@ mod tests {
         let descriptor = unsafe { &*snolc_module_entry() };
         let config = b"dns_mode = \"reject-domains\"\nmax_pending_opens = 2\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n";
         let mut instance = 0;
+        let state = ProtectState {
+            allow: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        };
+        let raw_host = host_api(&state);
         assert_eq!(
             unsafe {
                 descriptor.create.unwrap()(
@@ -1023,7 +1213,7 @@ mod tests {
                         pointer: std::ptr::null(),
                         length: 0,
                     },
-                    std::ptr::null(),
+                    &raw_host,
                     &mut instance,
                 )
             },
@@ -1077,6 +1267,34 @@ mod tests {
         );
         unsafe { descriptor.destroy.unwrap()(instance) };
         drop(accept.join().unwrap());
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn protect_denial_prevents_direct_tcp_and_udp_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let error = connect_tcp(
+            listener.local_addr().unwrap(),
+            Duration::from_secs(1),
+            |_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+
+        let state = ProtectState {
+            allow: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        };
+        let raw_host = host_api(&state);
+        let host = unsafe { HostApi::from_raw(&raw_host) }.unwrap();
+        let error = connect_udp("127.0.0.1:9".parse().unwrap(), host).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

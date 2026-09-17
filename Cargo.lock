@@ -2062,6 +2062,7 @@ version = "0.0.1"
 name = "snolc-adapter-direct"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "serde",
  "snolc-sdk",
  "toml",
