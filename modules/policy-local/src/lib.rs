@@ -16,10 +16,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use serde::Deserialize;
-use snolc_sdk::ForeignByteIo;
 use snolc_sdk::abi::{self, SnolByteIoV1, SnolBytes, SnolPolicyApiV1, SnolWakeHandle};
+use snolc_sdk::{ByteIo, ForeignByteIo, Pump, PumpError, PumpReport};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,15 +42,48 @@ static SESSION_NEXT: AtomicU64 = AtomicU64::new(1);
 static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 
 struct State {
-    _options: Options,
+    options: Options,
     _storage: StorageWorker,
     sessions: HashMap<u64, ForeignByteIo>,
-    flows: HashMap<u64, FlowIo>,
+    flows: HashMap<u64, PolicyFlow<ForeignByteIo, ForeignByteIo>>,
 }
 
-struct FlowIo {
-    _stack: ForeignByteIo,
-    _mux: ForeignByteIo,
+struct PolicyFlow<S, M> {
+    stack: S,
+    mux: M,
+    upload: Pump,
+    download: Pump,
+}
+
+impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
+    fn new(stack: S, mux: M, buffer_bytes: usize) -> Result<Self, PumpError> {
+        Ok(Self {
+            stack,
+            mux,
+            upload: Pump::new(buffer_bytes)?,
+            download: Pump::new(buffer_bytes)?,
+        })
+    }
+
+    fn poll(
+        &mut self,
+        context: &mut Context<'_>,
+        max_work: usize,
+    ) -> Poll<Result<(PumpReport, PumpReport), PumpError>> {
+        let upload = self
+            .upload
+            .poll(context, &mut self.stack, &mut self.mux, max_work);
+        let download = self
+            .download
+            .poll(context, &mut self.mux, &mut self.stack, max_work);
+        match (upload, download) {
+            (Poll::Ready(Ok(upload)), Poll::Ready(Ok(download))) => {
+                Poll::Ready(Ok((upload, download)))
+            }
+            (Poll::Ready(Err(error)), _) | (_, Poll::Ready(Err(error))) => Poll::Ready(Err(error)),
+            _ => Poll::Pending,
+        }
+    }
 }
 
 thread_local! {
@@ -75,7 +109,7 @@ fn initialize(
         states.borrow_mut().insert(
             instance,
             State {
-                _options: options,
+                options,
                 _storage: storage,
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
@@ -186,28 +220,42 @@ unsafe extern "C" fn attach_flow(
                 Ok(mux) => mux,
                 Err(_) => return abi::STATUS_INVALID,
             };
+            let flow = match PolicyFlow::new(stack, mux, state.options.sniff_bytes) {
+                Ok(flow) => flow,
+                Err(_) => return abi::STATUS_RESOURCE,
+            };
             let handle = FLOW_NEXT.fetch_add(1, Ordering::Relaxed);
             if handle == 0 {
                 return abi::STATUS_RESOURCE;
             }
-            state.flows.insert(
-                handle,
-                FlowIo {
-                    _stack: stack,
-                    _mux: mux,
-                },
-            );
+            state.flows.insert(handle, flow);
             abi::STATUS_OK
         })
     })
 }
 
 fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
-    if STATES.with(|states| states.borrow().contains_key(&instance)) {
+    STATES.with(|states| {
+        let mut states = states.borrow_mut();
+        let Some(state) = states.get_mut(&instance) else {
+            return abi::STATUS_INVALID;
+        };
+        let mut context = Context::from_waker(Waker::noop());
+        let mut finished = Vec::new();
+        for (handle, flow) in &mut state.flows {
+            match flow.poll(&mut context, state.options.sniff_bytes) {
+                Poll::Ready(Ok((upload, download))) if upload.finished && download.finished => {
+                    finished.push(*handle);
+                }
+                Poll::Ready(Err(_)) => finished.push(*handle),
+                Poll::Ready(Ok(_)) | Poll::Pending => {}
+            }
+        }
+        for handle in finished {
+            state.flows.remove(&handle);
+        }
         abi::STATUS_PENDING
-    } else {
-        abi::STATUS_INVALID
-    }
+    })
 }
 
 fn shutdown_instance(instance: u64) -> u32 {
@@ -249,7 +297,53 @@ snolc_sdk::declare_stateful_module! {
 
 #[cfg(test)]
 mod module_tests {
+    use std::collections::VecDeque;
+    use std::io;
+
     use super::*;
+
+    #[derive(Default)]
+    struct MemoryIo {
+        input: VecDeque<u8>,
+        output: Vec<u8>,
+        shutdown: bool,
+    }
+
+    impl ByteIo for MemoryIo {
+        fn poll_read(
+            &mut self,
+            _context: &mut Context<'_>,
+            output: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let count = output.len().min(self.input.len());
+            for byte in &mut output[..count] {
+                *byte = self.input.pop_front().unwrap();
+            }
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_write(
+            &mut self,
+            _context: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.output.extend_from_slice(input);
+            Poll::Ready(Ok(input.len()))
+        }
+
+        fn poll_flush(&mut self, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown_write(&mut self, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdown = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn close(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn rejects_unprotected_session_context() {
@@ -258,5 +352,26 @@ mod module_tests {
         )
         .unwrap();
         assert!(!context.confidentiality);
+    }
+
+    #[test]
+    fn policy_flow_owns_both_transfer_directions() {
+        let stack = MemoryIo {
+            input: b"upload".iter().copied().collect(),
+            ..MemoryIo::default()
+        };
+        let mux = MemoryIo {
+            input: b"download".iter().copied().collect(),
+            ..MemoryIo::default()
+        };
+        let mut flow = PolicyFlow::new(stack, mux, 16).unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        while !flow.upload.is_finished() || !flow.download.is_finished() {
+            let _ = flow.poll(&mut context, 16);
+        }
+        assert_eq!(flow.mux.output, b"upload");
+        assert_eq!(flow.stack.output, b"download");
+        assert!(flow.mux.shutdown);
+        assert!(flow.stack.shutdown);
     }
 }
