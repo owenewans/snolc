@@ -1019,6 +1019,7 @@ dependencies = [
  "smoltcp",
  "snolc-abi",
  "snolc-sdk",
+ "snow",
  "thiserror",
  "toml",
  "yamux",

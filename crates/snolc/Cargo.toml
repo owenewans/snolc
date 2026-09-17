@@ -21,3 +21,6 @@ smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "pro
 thiserror.workspace = true
 toml.workspace = true
 yamux.workspace = true
+
+[dev-dependencies]
+snow.workspace = true

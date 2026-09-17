@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 use snolc::config::Config;
 use snolc::loader::LoadedModule;
 use snolc::{Engine, Event, Host, Lifecycle};
+use snow::{Builder, params::NoiseParams};
 
 struct QuietHost;
 
@@ -21,8 +23,71 @@ fn native_tcp_dummy_path_establishes_policy_session() {
     let endpoint = listener.local_addr().unwrap();
     drop(listener);
 
-    let server = build_side("server", endpoint, true);
-    let client = build_side("client", endpoint, false);
+    let server = build_side(
+        "server-dummy",
+        "server",
+        endpoint,
+        true,
+        "protection_dummy",
+        b"",
+    );
+    let client = build_side(
+        "client-dummy",
+        "client",
+        endpoint,
+        false,
+        "protection_dummy",
+        b"",
+    );
+    run_pair(server, client);
+}
+
+#[test]
+fn native_tcp_noise_path_establishes_authenticated_policy_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    drop(listener);
+    let params: NoiseParams = "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let keypair = Builder::new(params).generate_keypair().unwrap();
+    let directory = std::env::temp_dir().join(format!(
+        "snolc-native-noise-{}-{}",
+        std::process::id(),
+        endpoint.port()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let private = directory.join("server.key");
+    let public = directory.join("server.pub");
+    fs::write(&private, keypair.private).unwrap();
+    fs::write(&public, keypair.public).unwrap();
+    let server_options = format!(
+        "mode = \"server\"\nprivate_key_file = \"{}\"\n",
+        private.display()
+    );
+    let client_options = format!(
+        "mode = \"client\"\nserver_public_key_file = \"{}\"\n",
+        public.display()
+    );
+    let server = build_side(
+        "server-noise",
+        "server",
+        endpoint,
+        true,
+        "protection_noise",
+        server_options.as_bytes(),
+    );
+    let client = build_side(
+        "client-noise",
+        "client",
+        endpoint,
+        false,
+        "protection_noise",
+        client_options.as_bytes(),
+    );
+    run_pair(server, client);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn run_pair(server: snolc::ValidatedConfig, client: snolc::ValidatedConfig) {
     let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
     let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
 
@@ -47,8 +112,15 @@ fn native_tcp_dummy_path_establishes_policy_session() {
     server_thread.join().unwrap().unwrap();
 }
 
-fn build_side(role: &str, endpoint: std::net::SocketAddr, listen: bool) -> snolc::ValidatedConfig {
-    let root = PathBuf::from(format!("/tmp/snolc-native-session-{role}"));
+fn build_side(
+    identity: &str,
+    role: &str,
+    endpoint: std::net::SocketAddr,
+    listen: bool,
+    protection_library: &str,
+    protection_options: &[u8],
+) -> snolc::ValidatedConfig {
+    let root = PathBuf::from(format!("/tmp/snolc-native-session-{identity}"));
     let adapter_config = root.join("adapter.toml");
     let protection_config = root.join("protection.toml");
     let carrier_config = root.join("carrier.toml");
@@ -67,19 +139,19 @@ fn build_side(role: &str, endpoint: std::net::SocketAddr, listen: bool) -> snolc
     let carrier_mode = if listen { "listen" } else { "connect" };
     let modules = vec![
         load(
-            &format!("adapter-{role}"),
+            &format!("adapter-{identity}"),
             "adapter_direct",
             b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
             &adapter_config,
         ),
         load(
-            &format!("protection-{role}"),
-            "protection_dummy",
-            b"",
+            &format!("protection-{identity}"),
+            protection_library,
+            protection_options,
             &protection_config,
         ),
         load(
-            &format!("carrier-{role}"),
+            &format!("carrier-{identity}"),
             "carrier_tcp",
             format!(
                 "mode = \"{carrier_mode}\"\nendpoint_ip = \"{endpoint}\"\nmax_connections = 2\nnodelay = true\n"
@@ -88,7 +160,7 @@ fn build_side(role: &str, endpoint: std::net::SocketAddr, listen: bool) -> snolc
             &carrier_config,
         ),
         load(
-            &format!("policy-{role}"),
+            &format!("policy-{identity}"),
             "policy_dummy",
             b"pump_buffer_bytes = 4096\n",
             &policy_config,
