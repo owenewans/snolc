@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -61,6 +62,20 @@ pub enum ModuleClass {
 #[serde(deny_unknown_fields)]
 struct SubscriptionDocument {
     profiles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedClient {
+    pub main_path: PathBuf,
+    pub main_toml: String,
+    pub files: Vec<GeneratedFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedFile {
+    pub path: PathBuf,
+    pub contents: Vec<u8>,
+    pub secret: bool,
 }
 
 impl Profile {
@@ -185,6 +200,222 @@ pub fn parse_subscription(input: &[u8]) -> Result<Vec<Profile>, ProfileError> {
         .collect()
 }
 
+pub fn generate_client_config(
+    profile: &Profile,
+    root: &Path,
+) -> Result<GeneratedClient, ProfileError> {
+    profile.validate()?;
+    if !root.is_absolute() {
+        return Err(ProfileError::Path);
+    }
+    let config_directory = root.join("config");
+    let module_directory = config_directory.join("modules");
+    let secret_directory = root.join("secrets");
+    let state_directory = root.join("state");
+    let package_directory = root.join("packages");
+    let mut files = Vec::new();
+    let mut adapter_paths = Vec::new();
+    let mut protection_path = None;
+    let mut carrier_path = None;
+    let mut policy_path = None;
+    for module in &profile.modules {
+        let path = module_directory.join(format!("{}.toml", module.instance));
+        let mut options = module.options.clone();
+        let package_name = module.package.rsplit_once('@').unwrap().0;
+        match (module.class, package_name) {
+            (ModuleClass::Protection, "owenewans/protection-noise") => {
+                let pin_path = secret_directory.join("server-noise-key.hex");
+                options.insert("mode".into(), "client".into());
+                options.insert("server_public_key_file".into(), path_value(&pin_path)?);
+                files.push(GeneratedFile {
+                    path: pin_path,
+                    contents: format!("{}\n", profile.server_pin).into_bytes(),
+                    secret: true,
+                });
+            }
+            (ModuleClass::Carrier, "owenewans/carrier-tcp")
+            | (ModuleClass::Carrier, "owenewans/carrier-ssh") => {
+                options.insert("mode".into(), "connect".into());
+                options.insert("endpoint_ip".into(), profile.endpoint.clone().into());
+            }
+            (ModuleClass::Policy, "owenewans/policy-local") => {
+                options.insert("server_id".into(), profile.server_id.clone().into());
+                options.insert("credential_transport".into(), "protected".into());
+                let storage = options
+                    .entry("storage")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                let storage = storage.as_table_mut().ok_or(ProfileError::Value)?;
+                storage.insert(
+                    "path".into(),
+                    path_value(&state_directory.join("policy-client.redb"))?,
+                );
+                let mut credential = toml::Table::new();
+                credential.insert("source".into(), "toml".into());
+                credential.insert("value".into(), profile.credential.expose().into());
+                let mut client = toml::Table::new();
+                client.insert("credential".into(), toml::Value::Table(credential));
+                options.insert("client".into(), toml::Value::Table(client));
+            }
+            _ => {}
+        }
+        let module_toml = module_toml(module, options)?;
+        snolc::module_config::ModuleConfig::parse(&module_toml, &path)
+            .map_err(|error| ProfileError::Generated(error.to_string()))?;
+        files.push(GeneratedFile {
+            path: path.clone(),
+            contents: module_toml.into_bytes(),
+            secret: module.class == ModuleClass::Policy,
+        });
+        match module.class {
+            ModuleClass::Adapter => adapter_paths.push(path),
+            ModuleClass::Protection => protection_path = Some(path),
+            ModuleClass::Carrier => carrier_path = Some(path),
+            ModuleClass::Policy => policy_path = Some(path),
+        }
+    }
+    let main_path = config_directory.join("snolc.toml");
+    let main_toml = main_toml(
+        &package_directory,
+        &state_directory,
+        &adapter_paths,
+        protection_path.as_deref().ok_or(ProfileError::Value)?,
+        carrier_path.as_deref().ok_or(ProfileError::Value)?,
+        policy_path.as_deref().ok_or(ProfileError::Value)?,
+    )?;
+    snolc::config::Config::parse(&main_toml, &config_directory)
+        .map_err(|error| ProfileError::Generated(error.to_string()))?;
+    Ok(GeneratedClient {
+        main_path,
+        main_toml,
+        files,
+    })
+}
+
+fn module_toml(module: &ProfileModule, options: toml::Table) -> Result<String, ProfileError> {
+    let mut table = toml::Table::new();
+    table.insert("wire_version".into(), 1.into());
+    table.insert("instance".into(), module.instance.clone().into());
+    table.insert("package".into(), module.package.clone().into());
+    table.insert("role".into(), "client".into());
+    table.insert("options".into(), toml::Value::Table(options));
+    toml::to_string(&table).map_err(Into::into)
+}
+
+fn main_toml(
+    packages: &Path,
+    state: &Path,
+    adapters: &[PathBuf],
+    protection: &Path,
+    carrier: &Path,
+    policy: &Path,
+) -> Result<String, ProfileError> {
+    let mut root = toml::Table::new();
+    root.insert("wire_version".into(), 1.into());
+    root.insert(
+        "paths".into(),
+        table_value([
+            ("packages", path_value(packages)?),
+            ("state", path_value(state)?),
+        ]),
+    );
+    root.insert(
+        "engine".into(),
+        table_value([
+            ("max_sessions", 2.into()),
+            ("max_flows", 32.into()),
+            ("max_pending_sessions", 2.into()),
+            ("max_pending_opens", 8.into()),
+            ("max_managed_bytes", 33_554_432.into()),
+            ("max_commands", 64.into()),
+            ("max_events", 256.into()),
+            ("max_io_chunk", 16_384.into()),
+            ("max_ingress_packets_per_tick", 32.into()),
+            ("connect_timeout_ms", 15_000.into()),
+            ("handshake_timeout_ms", 15_000.into()),
+            ("shutdown_timeout_ms", 5_000.into()),
+        ]),
+    );
+    root.insert(
+        "stack".into(),
+        table_value([
+            ("ipv4", true.into()),
+            ("ipv6", true.into()),
+            ("mtu", 1_280.into()),
+            ("tcp_socket_rx_bytes", 16_384.into()),
+            ("tcp_socket_tx_bytes", 16_384.into()),
+            ("udp_socket_rx_bytes", 131_072.into()),
+            ("udp_socket_tx_bytes", 131_072.into()),
+            ("udp_metadata_slots", 8.into()),
+            ("packet_queue_bytes", 262_144.into()),
+            ("max_udp_payload_bytes", 65_507.into()),
+            ("reassembly_slots", 4.into()),
+            ("reassembly_timeout_ms", 15_000.into()),
+        ]),
+    );
+    root.insert(
+        "yamux".into(),
+        table_value([
+            ("max_streams_per_session", 17.into()),
+            ("receive_window_bytes", 4_456_448.into()),
+            ("split_send_size", 16_384.into()),
+            ("read_after_close", true.into()),
+        ]),
+    );
+    root.insert(
+        "logging".into(),
+        table_value([
+            ("mode", "file".into()),
+            ("source", "toml".into()),
+            (
+                "levels",
+                toml::Value::Array(vec!["warning".into(), "error".into(), "debug".into()]),
+            ),
+            ("file", path_value(&state.join("snolc.log"))?),
+            ("limit", "8mb".into()),
+            ("queue_bytes", 65_536.into()),
+            ("max_record_bytes", 2_048.into()),
+            ("flush_interval_ms", 1_000.into()),
+            ("on_io_error", "event".into()),
+        ]),
+    );
+    root.insert("control".into(), table_value([("mode", "off".into())]));
+    let mut tunnel = toml::Table::new();
+    tunnel.insert("name".into(), "main".into());
+    tunnel.insert("role".into(), "client".into());
+    tunnel.insert(
+        "adapters".into(),
+        toml::Value::Array(
+            adapters
+                .iter()
+                .map(|path| path_value(path))
+                .collect::<Result<_, _>>()?,
+        ),
+    );
+    tunnel.insert("protection".into(), path_value(protection)?);
+    tunnel.insert("carrier".into(), path_value(carrier)?);
+    tunnel.insert("policy".into(), path_value(policy)?);
+    root.insert(
+        "tunnels".into(),
+        toml::Value::Array(vec![toml::Value::Table(tunnel)]),
+    );
+    toml::to_string(&root).map_err(Into::into)
+}
+
+fn table_value<const N: usize>(entries: [(&str, toml::Value); N]) -> toml::Value {
+    toml::Value::Table(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+    )
+}
+
+fn path_value(path: &Path) -> Result<toml::Value, ProfileError> {
+    path.to_str()
+        .map(|path| path.to_owned().into())
+        .ok_or(ProfileError::Path)
+}
+
 fn contains_privileged_option(table: &toml::Table) -> bool {
     table.iter().any(|(key, value)| {
         let key = key.to_ascii_lowercase();
@@ -199,14 +430,17 @@ fn contains_privileged_option(table: &toml::Table) -> bool {
                 | "packages"
                 | "state"
                 | "log"
-        ) || match value {
-            toml::Value::Table(table) => contains_privileged_option(table),
-            toml::Value::Array(values) => values.iter().any(|value| match value {
+        ) || key.ends_with("_path")
+            || key.ends_with("_file")
+            || key.ends_with("_directory")
+            || match value {
                 toml::Value::Table(table) => contains_privileged_option(table),
+                toml::Value::Array(values) => values.iter().any(|value| match value {
+                    toml::Value::Table(table) => contains_privileged_option(table),
+                    _ => false,
+                }),
                 _ => false,
-            }),
-            _ => false,
-        }
+            }
     })
 }
 
@@ -262,6 +496,10 @@ pub enum ProfileError {
     Network(String),
     #[error("subscription I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("client path is invalid")]
+    Path,
+    #[error("generated configuration is invalid: {0}")]
+    Generated(String),
 }
 
 #[cfg(test)]
@@ -307,7 +545,7 @@ mod tests {
         let mut profile = profile();
         profile.modules[0]
             .options
-            .insert("path".into(), "/etc/passwd".into());
+            .insert("server_public_key_file".into(), "/etc/passwd".into());
         assert!(matches!(profile.validate(), Err(ProfileError::Value)));
         assert!(matches!(
             Profile::from_uri("https://profile/value"),
@@ -337,5 +575,26 @@ mod tests {
             parse_subscription(input.as_bytes()),
             Err(ProfileError::Subscription)
         ));
+    }
+
+    #[test]
+    fn generated_client_config_passes_runtime_parser_and_keeps_paths_local() {
+        let mut profile = profile();
+        profile.modules[1].package = "owenewans/protection-noise@0.0.1".into();
+        profile.modules[2].package = "owenewans/carrier-tcp@0.0.1".into();
+        profile.modules[3].package = "owenewans/policy-local@0.0.1".into();
+        let generated = generate_client_config(&profile, Path::new("/tmp/snolcNG-client")).unwrap();
+        assert!(!generated.main_toml.contains(profile.credential.expose()));
+        assert!(
+            generated
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("server-noise-key.hex") && file.secret)
+        );
+        assert!(generated.files.iter().any(|file| {
+            file.path.ends_with("policy.toml")
+                && file.secret
+                && String::from_utf8_lossy(&file.contents).contains(profile.credential.expose())
+        }));
     }
 }

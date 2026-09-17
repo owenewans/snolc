@@ -3984,6 +3984,7 @@ dependencies = [
  "base64 0.22.1",
  "reqwest",
  "serde",
+ "snolc",
  "thiserror",
  "toml",
 ]
