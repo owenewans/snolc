@@ -534,6 +534,8 @@ pub enum ControlRequest {
         apply: RuleApply,
         rules_toml: String,
     },
+    #[serde(rename = "maintenance.backup")]
+    MaintenanceBackup { destination: String },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -563,7 +565,9 @@ impl ControlRequest {
             | Self::QuotaNewPeriod { client_id, seq, .. }
             | Self::SessionsDisconnect { client_id, seq, .. }
             | Self::RulesReplace { client_id, seq, .. } => Some((client_id, *seq)),
-            Self::UsageGet { .. } | Self::SessionsList { .. } => None,
+            Self::UsageGet { .. } | Self::SessionsList { .. } | Self::MaintenanceBackup { .. } => {
+                None
+            }
         }
     }
 
@@ -617,6 +621,11 @@ impl ControlRequest {
                 Err(AdminError::Invalid)
             }
             Self::SessionsDisconnect { session_id: 0, .. } => Err(AdminError::Invalid),
+            Self::MaintenanceBackup { destination }
+                if destination.len() > 4096 || !std::path::Path::new(destination).is_absolute() =>
+            {
+                Err(AdminError::Invalid)
+            }
             _ => Ok(()),
         }
     }
@@ -912,6 +921,22 @@ count = 16
             .unwrap()
             .replace("weight = 1", "weight = 1\nunknown = true");
         assert!(ControlRequest::parse(unknown.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn maintenance_backup_requires_an_absolute_destination() {
+        assert!(
+            ControlRequest::parse(
+                b"method = \"maintenance.backup\"\ndestination = \"/tmp/policy.redb\"\n"
+            )
+            .is_ok()
+        );
+        assert!(
+            ControlRequest::parse(
+                b"method = \"maintenance.backup\"\ndestination = \"policy.redb\"\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use admin::{decode_user_record, encode_user_record};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::task::{Context, Poll, Waker};
@@ -73,6 +73,7 @@ static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 struct State {
     started: Instant,
     shutting_down: bool,
+    maintenance: bool,
     global_rate: Option<TokenBucket>,
     user_deficit: HashMap<String, u64>,
     user_cursor: usize,
@@ -180,6 +181,7 @@ struct AdminState {
 enum PendingControl {
     Write(PendingWrite),
     Read(PendingRead),
+    Backup(PendingBackup),
 }
 
 struct PendingWrite {
@@ -195,6 +197,12 @@ struct PendingRead {
     request: Vec<u8>,
     kind: ReadKind,
     reply: storage::ReadReply,
+}
+
+struct PendingBackup {
+    request: Vec<u8>,
+    destination: PathBuf,
+    reply: storage::WriteReply,
 }
 
 enum ReadKind {
@@ -573,6 +581,7 @@ fn initialize(
             State {
                 started,
                 shutting_down: false,
+                maintenance: false,
                 global_rate,
                 user_deficit: HashMap::new(),
                 user_cursor: 0,
@@ -702,6 +711,9 @@ unsafe extern "C" fn admit_flow(
             let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
+            if state.maintenance {
+                return abi::STATUS_PENDING;
+            }
             let (role, user_id) = match state.sessions.get(&session) {
                 Some(PolicySession {
                     role,
@@ -873,6 +885,9 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         let Some(state) = states.get_mut(&instance) else {
             return abi::STATUS_INVALID;
         };
+        if state.maintenance {
+            return abi::STATUS_PENDING;
+        }
         let mut context = Context::from_waker(Waker::noop());
         let now_utc = current_utc();
         for user in state.admin.users.values_mut() {
@@ -2033,6 +2048,7 @@ fn control_instance(instance: u64, request: &[u8]) -> Result<Vec<u8>, u32> {
             let pending_request = match &pending {
                 PendingControl::Write(pending) => &pending.request,
                 PendingControl::Read(pending) => &pending.request,
+                PendingControl::Backup(pending) => &pending.request,
             };
             if pending_request != request {
                 state.pending_control = Some(pending);
@@ -2067,6 +2083,23 @@ fn control_instance(instance: u64, request: &[u8]) -> Result<Vec<u8>, u32> {
                         return Err(abi::STATUS_PENDING);
                     }
                 },
+                PendingControl::Backup(pending) => match pending.reply.try_recv() {
+                    Ok(Ok(())) => {
+                        state.maintenance = false;
+                        return encode_response(&BackupResponse {
+                            status: "ok",
+                            destination: &pending.destination,
+                        });
+                    }
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        state.maintenance = false;
+                        return Err(abi::STATUS_IO);
+                    }
+                    Err(TryRecvError::Empty) => {
+                        state.pending_control = Some(PendingControl::Backup(pending));
+                        return Err(abi::STATUS_PENDING);
+                    }
+                },
             }
         }
 
@@ -2074,6 +2107,20 @@ fn control_instance(instance: u64, request: &[u8]) -> Result<Vec<u8>, u32> {
             return Err(abi::STATUS_RESOURCE);
         }
         let parsed = ControlRequest::parse(request).map_err(|_| abi::STATUS_INVALID)?;
+        if let ControlRequest::MaintenanceBackup { destination } = parsed {
+            let destination = PathBuf::from(destination);
+            let reply = state
+                .storage
+                .backup(destination.clone())
+                .map_err(storage_status)?;
+            state.maintenance = true;
+            state.pending_control = Some(PendingControl::Backup(PendingBackup {
+                request: request.to_vec(),
+                destination,
+                reply,
+            }));
+            return Err(abi::STATUS_PENDING);
+        }
         if let Some((key, kind)) = required_admin_read(state, &parsed) {
             let reply = state.storage.get(key).map_err(storage_status)?;
             state.pending_control = Some(PendingControl::Read(PendingRead {
@@ -2402,6 +2449,7 @@ fn prepare_admin_mutation(state: &State, request: ControlRequest) -> Result<Prep
         ControlRequest::UsageGet { .. } | ControlRequest::SessionsList { .. } => {
             return Err(abi::STATUS_INVALID);
         }
+        ControlRequest::MaintenanceBackup { .. } => return Err(abi::STATUS_INVALID),
     };
     let response = encode_response(&MutationResponse {
         status: "ok",
@@ -2615,6 +2663,12 @@ struct UsageResponse<'a> {
 struct SessionsResponse {
     status: &'static str,
     sessions: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct BackupResponse<'a> {
+    status: &'static str,
+    destination: &'a Path,
 }
 
 fn shutdown_instance(instance: u64) -> u32 {
@@ -3257,6 +3311,43 @@ count = 16
             22
         );
         drop(worker);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maintenance_control_creates_a_verified_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "snolc-policy-maintenance-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let database = root.join("state/policy.redb");
+        let backup = root.join("backup/policy.redb");
+        let template = include_str!("../../../config/templates/modules/policy.toml");
+        let mut template: toml::Value = toml::from_str(template).unwrap();
+        template["options"]["storage"]["path"] =
+            toml::Value::String(database.to_string_lossy().into_owned());
+        let options = toml::to_string(&template["options"]).unwrap();
+        let instance = 10_003;
+        initialize(instance, options.as_bytes(), b"/tmp", std::ptr::null()).unwrap();
+
+        let request = format!(
+            "method = \"maintenance.backup\"\ndestination = {:?}\n",
+            backup.to_string_lossy()
+        );
+        let response = drive_control(instance, request.as_bytes());
+        let response: toml::Value =
+            toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+        assert_eq!(response["status"].as_str(), Some("ok"));
+        assert_eq!(response["destination"].as_str(), backup.to_str());
+        assert!(backup.is_file());
+        let backup_worker = StorageWorker::open(backup, 4_194_304, 134_217_728, 2).unwrap();
+        drop(backup_worker);
+
+        drive_shutdown(instance);
         fs::remove_dir_all(root).unwrap();
     }
 
