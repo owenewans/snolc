@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use async_executor::LocalExecutor;
@@ -12,9 +13,10 @@ use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, StreamExt, select};
 use thiserror::Error;
 
-use crate::config::{Config, ControlConfig};
+use crate::config::{Config, ControlConfig, Role, YamuxConfig};
 use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
-use crate::loader::{LoadError, LoadedModule};
+use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
+use crate::mux::{MuxError, MuxSession};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
 const MODULE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -29,6 +31,40 @@ pub trait Host: Send + Sync + 'static {
 pub struct ValidatedConfig {
     config: Config,
     modules: Vec<LoadedModule>,
+    tunnels: Vec<TunnelBinding>,
+}
+
+#[derive(Clone)]
+struct TunnelBinding {
+    name: String,
+    role: Role,
+    carrier: usize,
+    protection: usize,
+    policy_family: String,
+    yamux: YamuxConfig,
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+}
+
+struct TunnelRuntime {
+    binding: TunnelBinding,
+    state: TunnelState,
+    deadline: Option<Instant>,
+}
+
+enum TunnelState {
+    Carrier,
+    Protection(Option<ModuleByteIo>),
+    Handshake(HandshakeFuture),
+    Established(Box<EstablishedSession>),
+    Failed,
+}
+
+type HandshakeFuture = Pin<Box<dyn Future<Output = Result<EstablishedSession, MuxError>>>>;
+
+struct EstablishedSession {
+    mux: MuxSession<ModuleByteIo>,
+    _policy_stream: yamux::Stream,
 }
 
 pub struct Engine {
@@ -101,7 +137,31 @@ impl Engine {
         if classes & required != required {
             return Err(EngineError::MissingModuleClass(required & !classes));
         }
-        Ok(ValidatedConfig { config, modules })
+        let mut tunnels = Vec::with_capacity(config.tunnels.len());
+        for tunnel in &config.tunnels {
+            for adapter in &tunnel.adapters {
+                find_module(&modules, adapter, snolc_abi::CLASS_ADAPTER)?;
+            }
+            let protection =
+                find_module(&modules, &tunnel.protection, snolc_abi::CLASS_PROTECTION)?;
+            let carrier = find_module(&modules, &tunnel.carrier, snolc_abi::CLASS_CARRIER)?;
+            let policy = find_module(&modules, &tunnel.policy, snolc_abi::CLASS_POLICY)?;
+            tunnels.push(TunnelBinding {
+                name: tunnel.name.clone(),
+                role: tunnel.role,
+                carrier,
+                protection,
+                policy_family: modules[policy].name().to_owned(),
+                yamux: config.yamux.clone(),
+                connect_timeout: Duration::from_millis(config.engine.connect_timeout_ms),
+                handshake_timeout: Duration::from_millis(config.engine.handshake_timeout_ms),
+            });
+        }
+        Ok(ValidatedConfig {
+            config,
+            modules,
+            tunnels,
+        })
     }
 
     pub fn build<H: Host>(
@@ -157,6 +217,13 @@ impl Engine {
                 return Err(error.into());
             }
         }
+        let mut tunnels: Vec<_> = self
+            .validated
+            .tunnels
+            .iter()
+            .cloned()
+            .map(TunnelRuntime::new)
+            .collect();
         self.emit(Event::Lifecycle(Lifecycle::Running));
 
         loop {
@@ -181,11 +248,14 @@ impl Engine {
                 },
                 _ = timer => {
                     self.poll_modules();
+                    self.poll_tunnels(&mut tunnels);
                     self.drain_module_events();
                 }
             }
         }
 
+        drop(tunnels);
+        self.snapshot.sessions.store(0, Ordering::Release);
         let mut errors = Vec::new();
         for module in self.validated.modules.iter_mut().rev() {
             if let Err(error) = module.shutdown() {
@@ -235,6 +305,32 @@ impl Engine {
         }
     }
 
+    fn poll_tunnels(&mut self, tunnels: &mut [TunnelRuntime]) {
+        let mut established = 0;
+        let mut closed = 0;
+        let mut failures = Vec::new();
+        for tunnel in tunnels {
+            match tunnel.poll(&self.validated.modules) {
+                Ok(new_session) => established += usize::from(new_session),
+                Err((message, was_established)) => {
+                    closed += usize::from(was_established);
+                    failures.push((tunnel.binding.name.clone(), message));
+                }
+            }
+        }
+        if established != 0 {
+            self.snapshot
+                .sessions
+                .fetch_add(established, Ordering::Relaxed);
+        }
+        if closed != 0 {
+            self.snapshot.sessions.fetch_sub(closed, Ordering::Relaxed);
+        }
+        for (instance, message) in failures {
+            self.emit(Event::ModuleError { instance, message });
+        }
+    }
+
     fn drain_module_events(&mut self) {
         let events: Vec<_> = self.bridge.events.borrow_mut().drain(..).collect();
         for payload in events {
@@ -268,6 +364,122 @@ impl Engine {
             context_get: Some(host_context_get),
             context_set: Some(host_context_set),
         }
+    }
+}
+
+fn find_module(
+    modules: &[LoadedModule],
+    source: &std::path::Path,
+    class: u32,
+) -> Result<usize, EngineError> {
+    let matches: Vec<_> = modules
+        .iter()
+        .enumerate()
+        .filter(|(_, module)| module.source_config() == source && module.class_mask() & class != 0)
+        .map(|(index, _)| index)
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        _ => Err(EngineError::ModuleBinding {
+            path: source.display().to_string(),
+            class,
+        }),
+    }
+}
+
+impl TunnelRuntime {
+    fn new(binding: TunnelBinding) -> Self {
+        let deadline = match binding.role {
+            Role::Client => Some(Instant::now() + binding.connect_timeout),
+            Role::Server => None,
+        };
+        Self {
+            binding,
+            state: TunnelState::Carrier,
+            deadline,
+        }
+    }
+
+    fn poll(&mut self, modules: &[LoadedModule]) -> Result<bool, (String, bool)> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.state = TunnelState::Failed;
+            self.deadline = None;
+            return Err(("tunnel establishment timed out".into(), false));
+        }
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        match &mut self.state {
+            TunnelState::Carrier => {
+                let carrier = &modules[self.binding.carrier];
+                let result = match self.binding.role {
+                    Role::Client => carrier.carrier_connect(&[], &mut context),
+                    Role::Server => carrier.carrier_accept(&mut context),
+                };
+                match result {
+                    Poll::Ready(Ok(io)) => {
+                        self.state = TunnelState::Protection(Some(io));
+                        self.deadline = Some(Instant::now() + self.binding.handshake_timeout);
+                    }
+                    Poll::Ready(Err(error)) => return self.fail(error.to_string(), false),
+                    Poll::Pending => {}
+                }
+            }
+            TunnelState::Protection(lower) => {
+                let role = match self.binding.role {
+                    Role::Client => b"role = \"client\"\n".as_slice(),
+                    Role::Server => b"role = \"server\"\n".as_slice(),
+                };
+                match modules[self.binding.protection].protection_wrap(lower, role, &mut context) {
+                    Poll::Ready(Ok(io)) => {
+                        let role = self.binding.role;
+                        let family = self.binding.policy_family.clone();
+                        let config = self.binding.yamux.clone();
+                        self.state = TunnelState::Handshake(Box::pin(async move {
+                            let mode = match role {
+                                Role::Client => yamux::Mode::Client,
+                                Role::Server => yamux::Mode::Server,
+                            };
+                            let mut mux = MuxSession::new(io, mode, &config);
+                            let policy_stream = match role {
+                                Role::Client => mux.open_policy(&family).await?,
+                                Role::Server => mux.accept_policy(&family).await?,
+                            };
+                            Ok(EstablishedSession {
+                                mux,
+                                _policy_stream: policy_stream,
+                            })
+                        }));
+                    }
+                    Poll::Ready(Err(error)) => return self.fail(error.to_string(), false),
+                    Poll::Pending => {}
+                }
+            }
+            TunnelState::Handshake(handshake) => match handshake.as_mut().poll(&mut context) {
+                Poll::Ready(Ok(session)) => {
+                    self.state = TunnelState::Established(Box::new(session));
+                    self.deadline = None;
+                    return Ok(true);
+                }
+                Poll::Ready(Err(error)) => return self.fail(error.to_string(), false),
+                Poll::Pending => {}
+            },
+            TunnelState::Established(session) => {
+                if let Poll::Ready(Err(error)) = session.mux.poll_drive(&mut context) {
+                    return self.fail(error.to_string(), true);
+                }
+            }
+            TunnelState::Failed => {}
+        }
+        Ok(false)
+    }
+
+    fn fail(&mut self, message: String, was_established: bool) -> Result<bool, (String, bool)> {
+        self.state = TunnelState::Failed;
+        self.deadline = None;
+        Err((message, was_established))
     }
 }
 
@@ -454,6 +666,8 @@ pub enum EngineError {
     DuplicateInstance(String),
     #[error("required module class mask {0:#x} is missing")]
     MissingModuleClass(u32),
+    #[error("module config {path} does not resolve exactly once for class {class:#x}")]
+    ModuleBinding { path: String, class: u32 },
     #[error("module instance {0} was not found")]
     InstanceNotFound(String),
     #[error("command queue is full or closed")]

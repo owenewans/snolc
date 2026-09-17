@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::task::Poll;
+use std::task::{Context, Poll};
 
 use futures::future::poll_fn;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -20,6 +21,7 @@ pub struct MuxSession<T> {
     policy_open: bool,
     user_streams: usize,
     max_user_streams: usize,
+    inbound: VecDeque<Stream>,
 }
 
 impl<T> MuxSession<T>
@@ -39,6 +41,7 @@ where
             policy_open: false,
             user_streams: 0,
             max_user_streams: config.max_streams_per_session - 1,
+            inbound: VecDeque::new(),
         }
     }
 
@@ -123,6 +126,22 @@ where
             .map_err(MuxError::Yamux)
     }
 
+    pub fn poll_drive(&mut self, context: &mut Context<'_>) -> Poll<Result<(), MuxError>> {
+        match self.connection.poll_next_inbound(context) {
+            Poll::Ready(Some(Ok(stream))) if self.role == Mode::Server => {
+                if self.inbound.len() >= self.max_user_streams {
+                    return Poll::Ready(Err(MuxError::StreamLimit));
+                }
+                self.inbound.push_back(stream);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Ok(_))) => Poll::Ready(Err(MuxError::Protocol)),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(MuxError::Yamux(error))),
+            Poll::Ready(None) => Poll::Ready(Err(MuxError::Closed)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
     async fn open_stream(&mut self) -> Result<Stream, MuxError> {
         poll_fn(|context| self.connection.poll_new_outbound(context))
             .await
@@ -130,6 +149,9 @@ where
     }
 
     async fn accept_stream(&mut self) -> Result<Stream, MuxError> {
+        if let Some(stream) = self.inbound.pop_front() {
+            return Ok(stream);
+        }
         poll_fn(|context| self.connection.poll_next_inbound(context))
             .await
             .ok_or(MuxError::Closed)?
