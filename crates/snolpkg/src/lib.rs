@@ -165,6 +165,15 @@ impl PublicationManifest {
         {
             return Err(PackageError::ManifestValue);
         }
+        if self.source.revision.len() != 40
+            || self
+                .source
+                .revision
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(PackageError::ManifestValue);
+        }
         validate_package_name(&self.name)?;
         validate_relative_path(&self.entry)?;
         if self.classes.is_empty() || self.artifacts.is_empty() {
@@ -364,6 +373,47 @@ pub fn load_publication(
         let repository = gix::open(path).map_err(|error| PackageError::Git(error.to_string()))?;
         read_publication(&repository, module_name)
     }
+}
+
+pub fn checkout_revision(
+    git: &str,
+    revision: &str,
+    destination: &Path,
+) -> Result<String, PackageError> {
+    if destination.exists() {
+        return Err(PackageError::CloneDirectory);
+    }
+    if !(git.starts_with("https://") || Path::new(git).is_absolute()) {
+        return Err(PackageError::GitSource);
+    }
+    if revision.len() != 40
+        || revision
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(PackageError::ManifestValue);
+    }
+    let prepare = gix::prepare_clone(git, destination)
+        .map_err(|error| PackageError::Git(error.to_string()))?;
+    let mut prepare = prepare
+        .with_revision(Some(revision))
+        .map_err(|error| PackageError::Git(error.to_string()))?;
+    let interrupt = AtomicBool::new(false);
+    let (mut checkout, _) = prepare
+        .fetch_then_checkout(gix::progress::Discard, &interrupt)
+        .map_err(|error| PackageError::Git(error.to_string()))?;
+    let (repository, _) = checkout
+        .main_worktree(gix::progress::Discard, &interrupt)
+        .map_err(|error| PackageError::Git(error.to_string()))?;
+    let actual = repository
+        .head_commit()
+        .map_err(|error| PackageError::Git(error.to_string()))?
+        .id()
+        .to_string();
+    if actual != revision {
+        return Err(PackageError::Revision);
+    }
+    Ok(actual)
 }
 
 pub fn install_binary(
@@ -776,6 +826,8 @@ pub enum PackageError {
     CloneDirectory,
     #[error("publication file is missing or invalid")]
     PublicationFile,
+    #[error("checked out revision does not match manifest")]
+    Revision,
     #[error("install options are invalid")]
     InstallOptions,
     #[error("target artifact is unavailable")]
@@ -826,7 +878,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "0123456789abcdef"
+revision = "0123456789abcdef0123456789abcdef01234567"
 
 [build]
 package = "snolc-carrier-tcp"
@@ -987,6 +1039,52 @@ trust = "local-development"
     }
 
     #[test]
+    fn checks_out_exact_commit_without_shell_git_in_product_path() {
+        let root = temporary_directory("git-checkout");
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        run_git(&repository, &["init", "-q"]);
+        fs::write(repository.join("value"), b"first").unwrap();
+        run_git(&repository, &["add", "value"]);
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=snolpkg test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "first",
+            ],
+        );
+        let first = git_output(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("value"), b"second").unwrap();
+        run_git(&repository, &["add", "value"]);
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=snolpkg test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "second",
+            ],
+        );
+        let checkout = root.join("checkout");
+        assert_eq!(
+            checkout_revision(repository.to_str().unwrap(), &first, &checkout).unwrap(),
+            first
+        );
+        assert_eq!(fs::read(checkout.join("value")).unwrap(), b"first");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn moves_verified_content_into_immutable_store_and_writes_lock() {
         let root = temporary_directory("install-store");
         let content = root.join("content");
@@ -1049,7 +1147,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "0123456789abcdef"
+revision = "0123456789abcdef0123456789abcdef01234567"
 
 [build]
 package = "snolc-test"
@@ -1159,6 +1257,16 @@ sha256 = "{}"
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    fn git_output(directory: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().into()
     }
 
     fn remove_readonly_tree(path: &Path) {
