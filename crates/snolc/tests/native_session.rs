@@ -229,6 +229,151 @@ fn native_socks_tcp_payload_crosses_stack_mux_and_direct_adapter() {
     server_thread.join().unwrap().unwrap();
 }
 
+#[test]
+fn native_policy_local_debits_before_forwarding_payload() {
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_endpoint = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        let (mut stream, _) = target.accept().unwrap();
+        let mut input = [0; 12];
+        stream.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"quota-upload");
+        stream.write_all(b"quota-down").unwrap();
+    });
+    let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_endpoint = socks_listener.local_addr().unwrap();
+    drop(socks_listener);
+    let directory = std::env::temp_dir().join(format!(
+        "snolc-native-metered-{}-{}",
+        std::process::id(),
+        carrier_endpoint.port()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let params: NoiseParams = "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let keypair = Builder::new(params).generate_keypair().unwrap();
+    let private = directory.join("server.key");
+    let public = directory.join("server.pub");
+    fs::write(&private, keypair.private).unwrap();
+    fs::write(&public, keypair.public).unwrap();
+    let server_protection = format!(
+        "mode = \"server\"\nprivate_key_file = \"{}\"\n",
+        private.display()
+    );
+    let client_protection = format!(
+        "mode = \"client\"\nserver_public_key_file = \"{}\"\n",
+        public.display()
+    );
+    let credential = "cd".repeat(32);
+    let credential_digest = format!("{:x}", Sha256::digest(hex_bytes(&credential)));
+    let server_policy = policy_local_options(&directory.join("server-state/policy.redb"), None);
+    let client_policy = policy_local_options(
+        &directory.join("client-state/policy.redb"),
+        Some(&credential),
+    );
+    let server = build_side(
+        "server-metered",
+        "server",
+        carrier_endpoint,
+        true,
+        ("protection_noise", server_protection.as_bytes()),
+        ("policy_local", server_policy.as_bytes()),
+    );
+    let socks_options = format!(
+        "listen = \"{socks_endpoint}\"\nmax_connections = 4\nmax_udp_associations = 2\nmax_request_bytes = 1024\nreject_fragments = true\n"
+    );
+    let client = build_side_with_adapter(
+        "client-metered",
+        "client",
+        carrier_endpoint,
+        false,
+        ("adapter_socks5", socks_options.as_bytes()),
+        ("protection_noise", client_protection.as_bytes()),
+        ("policy_local", client_policy.as_bytes()),
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let user_id = provision_user(&server_handle, "policy-server-metered", &credential_digest);
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+    wait_user_session(&server_handle, "policy-server-metered", &user_id);
+    wait_any_policy_session(&client_handle, "policy-client-metered");
+
+    let mut socks = TcpStream::connect(socks_endpoint).unwrap();
+    socks
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socks.write_all(&[5, 1, 0]).unwrap();
+    let mut greeting = [0; 2];
+    socks.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 0]);
+    let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+    request.extend_from_slice(&target_endpoint.port().to_be_bytes());
+    request.extend_from_slice(b"quota-upload");
+    socks.write_all(&request).unwrap();
+    let mut response = [0; 10];
+    socks.read_exact(&mut response).unwrap_or_else(|error| {
+        panic!(
+            "CONNECT response failed: {error}; server={:?}; client={:?}",
+            server_handle.snapshot(),
+            client_handle.snapshot()
+        )
+    });
+    assert_eq!(response[1], 0);
+    let mut reply = [0; 10];
+    socks.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"quota-down");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let request = format!("method = \"usage.get\"\nuser_id = \"{user_id}\"\n");
+        let response = futures::executor::block_on(
+            server_handle.control("policy-server-metered", request.into_bytes()),
+        )
+        .unwrap();
+        let usage: toml::Value = toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+        if usage["upload_bytes"].as_integer() == Some(12)
+            && usage["download_bytes"].as_integer() == Some(10)
+        {
+            assert_eq!(usage["used_bytes"].as_integer(), Some(1_048_576));
+            break;
+        }
+        assert!(Instant::now() < deadline, "quota accounting timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    socks.shutdown(Shutdown::Both).unwrap();
+    target_thread.join().unwrap();
+    while (client_handle.snapshot().flows != 0 || server_handle.snapshot().flows != 0)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(client_handle.snapshot().flows, 0);
+    assert_eq!(server_handle.snapshot().flows, 0);
+    loop {
+        let request = format!("method = \"usage.get\"\nuser_id = \"{user_id}\"\n");
+        let response = futures::executor::block_on(
+            server_handle.control("policy-server-metered", request.into_bytes()),
+        )
+        .unwrap();
+        let usage: toml::Value = toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+        if usage["used_bytes"].as_integer() == Some(22) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "quota refund timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn run_pair(server: snolc::ValidatedConfig, client: snolc::ValidatedConfig) {
     let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
     let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
@@ -263,7 +408,22 @@ fn run_authenticated_pair(
     let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
     let server_thread = thread::spawn(move || server_engine.run());
     wait_running(&server_handle);
+    let user_id = provision_user(&server_handle, "policy-server-local", credential_digest);
 
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+    wait_user_session(&server_handle, "policy-server-local", &user_id);
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+}
+
+fn provision_user(
+    server_handle: &snolc::EngineHandle,
+    policy_instance: &str,
+    credential_digest: &str,
+) -> String {
     let create = br#"
 method = "user.create"
 client_id = "native-test"
@@ -295,23 +455,23 @@ mode = "limited"
 count = 16
 "#;
     let response =
-        futures::executor::block_on(server_handle.control("policy-server-local", create.to_vec()))
+        futures::executor::block_on(server_handle.control(policy_instance, create.to_vec()))
             .unwrap();
     let response: toml::Value = toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
     let user_id = response["user_id"].as_str().unwrap();
     let add = format!(
         "method = \"credential.add\"\nclient_id = \"native-test\"\nseq = 2\nuser_id = \"{user_id}\"\ncredential_sha256 = \"{credential_digest}\"\n"
     );
-    futures::executor::block_on(server_handle.control("policy-server-local", add.into_bytes()))
-        .unwrap();
+    futures::executor::block_on(server_handle.control(policy_instance, add.into_bytes())).unwrap();
+    user_id.to_owned()
+}
 
-    let client_thread = thread::spawn(move || client_engine.run());
-    wait_sessions(&server_handle, &client_handle);
+fn wait_user_session(server_handle: &snolc::EngineHandle, policy_instance: &str, user_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let request = format!("method = \"sessions.list\"\nuser_id = \"{user_id}\"\n");
         let response = futures::executor::block_on(
-            server_handle.control("policy-server-local", request.into_bytes()),
+            server_handle.control(policy_instance, request.into_bytes()),
         )
         .unwrap();
         let response: toml::Value =
@@ -325,10 +485,26 @@ count = 16
         assert!(Instant::now() < deadline, "policy authentication timed out");
         thread::sleep(Duration::from_millis(10));
     }
-    client_handle.shutdown().unwrap();
-    server_handle.shutdown().unwrap();
-    client_thread.join().unwrap().unwrap();
-    server_thread.join().unwrap().unwrap();
+}
+
+fn wait_any_policy_session(handle: &snolc::EngineHandle, policy_instance: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = futures::executor::block_on(
+            handle.control(policy_instance, b"method = \"sessions.list\"\n".to_vec()),
+        )
+        .unwrap();
+        let response: toml::Value =
+            toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+        if response["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "client authentication timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_running(handle: &snolc::EngineHandle) {
