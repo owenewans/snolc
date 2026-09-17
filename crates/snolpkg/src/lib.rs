@@ -1,11 +1,37 @@
 use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
+use tar::Archive;
 use thiserror::Error;
 
 pub const MAX_MANIFEST_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractLimits {
+    pub max_files: usize,
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+}
+
+impl ExtractLimits {
+    pub fn validate(self) -> Result<(), PackageError> {
+        if self.max_files == 0 || self.max_total_bytes == 0 || self.max_file_bytes == 0 {
+            return Err(PackageError::ExtractLimit);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractReport {
+    pub files: usize,
+    pub total_bytes: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -219,6 +245,65 @@ pub fn validate_relative_path(path: &Path) -> Result<(), PackageError> {
     Ok(())
 }
 
+pub fn extract_tar_gz<R: Read>(
+    input: R,
+    staging: &Path,
+    limits: ExtractLimits,
+) -> Result<ExtractReport, PackageError> {
+    limits.validate()?;
+    fs::create_dir_all(staging)?;
+    if fs::read_dir(staging)?.next().is_some() {
+        return Err(PackageError::StagingNotEmpty);
+    }
+    let mut archive = Archive::new(GzDecoder::new(input));
+    let mut paths = BTreeSet::new();
+    let mut files = 0usize;
+    let mut total_bytes = 0u64;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        validate_relative_path(&path)?;
+        if !paths.insert(path.clone()) {
+            return Err(PackageError::DuplicatePath);
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            fs::create_dir_all(staging.join(path))?;
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(PackageError::ArchiveType);
+        }
+        let mode = entry.header().mode()?;
+        if mode & 0o6000 != 0 {
+            return Err(PackageError::ArchiveMode);
+        }
+        let size = entry.header().size()?;
+        files = files.checked_add(1).ok_or(PackageError::ExtractLimit)?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or(PackageError::ExtractLimit)?;
+        if files > limits.max_files
+            || size > limits.max_file_bytes
+            || total_bytes > limits.max_total_bytes
+        {
+            return Err(PackageError::ExtractLimit);
+        }
+        let destination = staging.join(path);
+        let parent = destination.parent().ok_or(PackageError::Path)?;
+        fs::create_dir_all(parent)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        let written = io::copy(&mut entry, &mut output)?;
+        if written != size {
+            return Err(PackageError::ArchiveSize);
+        }
+    }
+    Ok(ExtractReport { files, total_bytes })
+}
+
 pub fn decode_hex(input: &str) -> Result<Vec<u8>, PackageError> {
     if !input.len().is_multiple_of(2) || !input.is_ascii() {
         return Err(PackageError::Hex);
@@ -293,11 +378,31 @@ pub enum PackageError {
     Hex,
     #[error("relative path is invalid")]
     Path,
+    #[error("extraction limit is invalid or exhausted")]
+    ExtractLimit,
+    #[error("staging directory is not empty")]
+    StagingNotEmpty,
+    #[error("archive path is duplicated")]
+    DuplicatePath,
+    #[error("archive entry type is forbidden")]
+    ArchiveType,
+    #[error("archive entry mode is forbidden")]
+    ArchiveMode,
+    #[error("archive entry size is inconsistent")]
+    ArchiveSize,
+    #[error("I/O failed: {0}")]
+    Io(#[from] io::Error),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use ed25519_dalek::{Signer, SigningKey};
+    use flate2::{Compression, write::GzEncoder};
+    use tar::{Builder, EntryType, Header};
 
     use super::*;
 
@@ -369,5 +474,111 @@ trust = "local-development"
         assert!(Sources::parse(sources).is_ok());
         let invalid = sources.replace("/tmp/modules", "https://example.invalid/modules");
         assert!(Sources::parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn extracts_regular_files_with_bounded_accounting() {
+        let archive = archive_with(|builder| {
+            append_file(builder, "lib/module.so", b"module", 0o755);
+            append_file(builder, "NOTICE", b"license", 0o644);
+        });
+        let staging = temporary_directory("extract-ok");
+        let report = extract_tar_gz(
+            Cursor::new(archive),
+            &staging,
+            ExtractLimits {
+                max_files: 2,
+                max_total_bytes: 13,
+                max_file_bytes: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.files, 2);
+        assert_eq!(report.total_bytes, 13);
+        assert_eq!(fs::read(staging.join("lib/module.so")).unwrap(), b"module");
+        fs::remove_dir_all(staging).unwrap();
+    }
+
+    #[test]
+    fn rejects_links_duplicates_modes_and_size_limits() {
+        let duplicate = archive_with(|builder| {
+            append_file(builder, "same", b"one", 0o644);
+            append_file(builder, "same", b"two", 0o644);
+        });
+        let staging = temporary_directory("extract-duplicate");
+        assert!(matches!(
+            extract_tar_gz(Cursor::new(duplicate), &staging, limits()),
+            Err(PackageError::DuplicatePath)
+        ));
+        fs::remove_dir_all(staging).unwrap();
+
+        let link = archive_with(|builder| {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            builder.append_link(&mut header, "link", "target").unwrap();
+        });
+        let staging = temporary_directory("extract-link");
+        assert!(matches!(
+            extract_tar_gz(Cursor::new(link), &staging, limits()),
+            Err(PackageError::ArchiveType)
+        ));
+        fs::remove_dir_all(staging).unwrap();
+
+        let setuid = archive_with(|builder| append_file(builder, "file", b"x", 0o4755));
+        let staging = temporary_directory("extract-mode");
+        assert!(matches!(
+            extract_tar_gz(Cursor::new(setuid), &staging, limits()),
+            Err(PackageError::ArchiveMode)
+        ));
+        fs::remove_dir_all(staging).unwrap();
+
+        let oversized = archive_with(|builder| append_file(builder, "file", b"12345", 0o644));
+        let staging = temporary_directory("extract-limit");
+        let mut limits = limits();
+        limits.max_file_bytes = 4;
+        assert!(matches!(
+            extract_tar_gz(Cursor::new(oversized), &staging, limits),
+            Err(PackageError::ExtractLimit)
+        ));
+        fs::remove_dir_all(staging).unwrap();
+    }
+
+    fn archive_with(build: impl FnOnce(&mut Builder<GzEncoder<Vec<u8>>>)) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = Builder::new(encoder);
+        build(&mut builder);
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn append_file<W: io::Write>(builder: &mut Builder<W>, path: &str, bytes: &[u8], mode: u32) {
+        let mut header = Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, path, bytes).unwrap();
+    }
+
+    fn limits() -> ExtractLimits {
+        ExtractLimits {
+            max_files: 8,
+            max_total_bytes: 1024,
+            max_file_bytes: 1024,
+        }
+    }
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "snolpkg-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
     }
 }
