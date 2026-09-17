@@ -17,6 +17,7 @@ pub struct LoadedModule {
     descriptor: NonNull<SnolModuleDescriptor>,
     library: Library,
     path: PathBuf,
+    instance_name: String,
     name: String,
     class_mask: u32,
     config: Vec<u8>,
@@ -28,7 +29,12 @@ pub struct LoadedModule {
 unsafe impl Send for LoadedModule {}
 
 impl LoadedModule {
-    pub fn load(path: &Path, config: Vec<u8>, base_directory: &Path) -> Result<Self, LoadError> {
+    pub fn load(
+        instance_name: String,
+        path: &Path,
+        config: Vec<u8>,
+        base_directory: &Path,
+    ) -> Result<Self, LoadError> {
         // loading trusted native code can execute library initializers.
         let library = unsafe { Library::new(path) }.map_err(LoadError::Open)?;
         // the entry symbol and descriptor remain valid while library is owned.
@@ -45,6 +51,7 @@ impl LoadedModule {
             descriptor,
             library,
             path: path.to_path_buf(),
+            instance_name,
             name,
             class_mask,
             config,
@@ -57,6 +64,10 @@ impl LoadedModule {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn instance_name(&self) -> &str {
+        &self.instance_name
     }
 
     pub fn class_mask(&self) -> u32 {

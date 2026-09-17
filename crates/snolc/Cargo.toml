@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-executor.workspace = true
+async-io.workspace = true
+futures.workspace = true
 libloading.workspace = true
 serde.workspace = true
 snolc-abi = { path = "../snolc-abi" }
