@@ -31,10 +31,18 @@ use snolc_sdk::{ByteIo, ForeignByteIo, Pump, PumpError, PumpReport};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChannelSecurity {
+    role: PolicyRole,
     confidentiality: bool,
     integrity: bool,
     peer_authenticated: bool,
     peer_identity: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PolicyRole {
+    Client,
+    Server,
 }
 
 fn validate_module(config: &[u8], base: &[u8]) -> Result<(), String> {
@@ -222,6 +230,9 @@ unsafe extern "C" fn attach_session(
             None => return abi::STATUS_DENIED,
         };
         if !context.confidentiality || !context.integrity {
+            return abi::STATUS_DENIED;
+        }
+        if matches!(context.role, PolicyRole::Client) && !context.peer_authenticated {
             return abi::STATUS_DENIED;
         }
         if context.peer_authenticated && context.peer_identity.as_deref() == Some("") {
@@ -924,7 +935,7 @@ mod module_tests {
     #[test]
     fn rejects_unprotected_session_context() {
         let context: ChannelSecurity = toml::from_str(
-            "confidentiality = false\nintegrity = true\npeer_authenticated = true\npeer_identity = \"server\"\n",
+            "role = \"client\"\nconfidentiality = false\nintegrity = true\npeer_authenticated = true\npeer_identity = \"server\"\n",
         )
         .unwrap();
         assert!(!context.confidentiality);

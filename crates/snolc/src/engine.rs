@@ -627,7 +627,11 @@ fn channel_security_context(module: &LoadedModule, role: Role) -> Result<Vec<u8>
         .and_then(toml::Value::as_bool)
         .ok_or(EngineError::ModuleDescription)?;
     let mut context = format!(
-        "confidentiality = {confidentiality}\nintegrity = {integrity}\npeer_authenticated = {peer_authenticated}\n"
+        "role = \"{}\"\nconfidentiality = {confidentiality}\nintegrity = {integrity}\npeer_authenticated = {peer_authenticated}\n",
+        match role {
+            Role::Client => "client",
+            Role::Server => "server",
+        }
     );
     if peer_authenticated {
         context.push_str("peer_identity = \"protection-peer\"\n");
