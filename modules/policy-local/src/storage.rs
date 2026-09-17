@@ -13,6 +13,8 @@ use thiserror::Error;
 const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("policy");
 pub type ReadReply = Receiver<Result<Option<Vec<u8>>, StorageError>>;
 pub type WriteReply = Receiver<Result<(), StorageError>>;
+type ScanResult = Result<Vec<(String, Vec<u8>)>, StorageError>;
+pub type ScanReply = Receiver<ScanResult>;
 
 enum Command {
     Get {
@@ -31,6 +33,11 @@ enum Command {
     Apply {
         changes: Vec<(String, Option<Vec<u8>>)>,
         response: SyncSender<Result<(), StorageError>>,
+    },
+    Scan {
+        prefix: String,
+        limit: usize,
+        response: SyncSender<ScanResult>,
     },
     Stop,
 }
@@ -124,6 +131,20 @@ impl StorageWorker {
         Ok(receiver)
     }
 
+    pub fn scan(&self, prefix: String, limit: usize) -> Result<ScanReply, StorageError> {
+        validate_prefix(&prefix)?;
+        if limit == 0 {
+            return Err(StorageError::Invalid);
+        }
+        let (sender, receiver) = sync_channel(1);
+        self.send(Command::Scan {
+            prefix,
+            limit,
+            response: sender,
+        })?;
+        Ok(receiver)
+    }
+
     fn send(&self, command: Command) -> Result<(), StorageError> {
         self.sender.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => StorageError::QueueFull,
@@ -161,6 +182,13 @@ fn run(database: Database, receiver: Receiver<Command>) {
             Command::Apply { changes, response } => {
                 let result = apply_values(&database, &changes);
                 let _ = response.send(result);
+            }
+            Command::Scan {
+                prefix,
+                limit,
+                response,
+            } => {
+                let _ = response.send(scan_values(&database, &prefix, limit));
             }
             Command::Stop => break,
         }
@@ -221,6 +249,26 @@ fn apply_values(
     transaction.commit().map_err(commit_error)
 }
 
+fn scan_values(
+    database: &Database,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+    let transaction = database.begin_read().map_err(transaction_error)?;
+    let table = transaction.open_table(KV).map_err(table_error)?;
+    let end = prefix_end(prefix)?;
+    let entries = table.range(prefix..end.as_str()).map_err(storage_error)?;
+    let mut output = Vec::new();
+    for entry in entries {
+        if output.len() == limit {
+            return Err(StorageError::Limit);
+        }
+        let (key, value) = entry.map_err(storage_error)?;
+        output.push((key.value().to_owned(), value.value().to_vec()));
+    }
+    Ok(output)
+}
+
 fn validate_key(key: &str) -> Result<(), StorageError> {
     if key.is_empty()
         || key.len() > 512
@@ -231,6 +279,22 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
         return Err(StorageError::Invalid);
     }
     Ok(())
+}
+
+fn validate_prefix(prefix: &str) -> Result<(), StorageError> {
+    if ["meta/", "user/", "credential/", "client/"].contains(&prefix) {
+        Ok(())
+    } else {
+        Err(StorageError::Invalid)
+    }
+}
+
+fn prefix_end(prefix: &str) -> Result<String, StorageError> {
+    validate_prefix(prefix)?;
+    let mut bytes = prefix.as_bytes().to_vec();
+    let last = bytes.last_mut().ok_or(StorageError::Invalid)?;
+    *last = last.checked_add(1).ok_or(StorageError::Invalid)?;
+    String::from_utf8(bytes).map_err(|_| StorageError::Invalid)
 }
 
 fn prepare_path(path: &Path) -> Result<(), StorageError> {
@@ -627,6 +691,36 @@ mod tests {
         );
         assert_eq!(backend.len().unwrap(), 8);
         drop(backend);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn scans_one_namespace_with_a_hard_limit() {
+        let path = path();
+        let worker = StorageWorker::open(path.clone(), 1_048_576, 16_777_216, 4).unwrap();
+        worker
+            .apply(vec![
+                ("client/a".into(), Some(b"one".to_vec())),
+                ("client/b".into(), Some(b"two".to_vec())),
+                ("user/a".into(), Some(b"ignored".to_vec())),
+            ])
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        let entries = worker
+            .scan("client/".into(), 2)
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|(key, _)| key.starts_with("client/")));
+        assert!(matches!(
+            worker.scan("client/".into(), 1).unwrap().recv().unwrap(),
+            Err(StorageError::Limit)
+        ));
+        drop(worker);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
