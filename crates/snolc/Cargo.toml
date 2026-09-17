@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 async-executor.workspace = true
 async-io.workspace = true
+crossbeam-queue.workspace = true
 futures.workspace = true
 libloading.workspace = true
 serde.workspace = true

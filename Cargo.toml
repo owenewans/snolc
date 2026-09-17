@@ -26,6 +26,7 @@ repository = "https://github.com/owenewans/snolc"
 [workspace.dependencies]
 async-executor = "=1.14.0"
 async-io = "=2.6.0"
+crossbeam-queue = "=0.3.12"
 ed25519-dalek = "=3.0.0"
 flate2 = "=1.1.2"
 futures = "=0.3.34"
