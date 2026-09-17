@@ -5226,10 +5226,7 @@ name = "snolc-cli"
 version = "0.0.1"
 dependencies = [
  "ctrlc",
- "serde",
- "sha2 0.10.9",
  "snolc",
- "toml",
 ]
 
 [[package]]

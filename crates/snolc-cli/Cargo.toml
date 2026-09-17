@@ -14,7 +14,4 @@ path = "src/main.rs"
 
 [dependencies]
 ctrlc.workspace = true
-serde.workspace = true
-sha2.workspace = true
 snolc = { path = "../snolc" }
-toml.workspace = true
