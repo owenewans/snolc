@@ -112,7 +112,13 @@ struct PolicySession {
     auth: AuthState,
     subscribed: bool,
     last_status: Instant,
-    pending_flows: VecDeque<String>,
+    credential_digest: Option<String>,
+    pending_flows: VecDeque<FlowIdentity>,
+}
+
+struct FlowIdentity {
+    user_id: String,
+    credential_digest: Option<String>,
 }
 
 enum AuthState {
@@ -177,7 +183,9 @@ struct PreparedAdmin {
 }
 
 struct PolicyFlow<S, M> {
+    session: u64,
     user_id: Option<String>,
+    credential_digest: Option<String>,
     stack: S,
     mux: M,
     upload: Pump,
@@ -189,10 +197,14 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
         stack: S,
         mux: M,
         buffer_bytes: usize,
+        session: u64,
         user_id: Option<String>,
+        credential_digest: Option<String>,
     ) -> Result<Self, PumpError> {
         Ok(Self {
+            session,
             user_id,
+            credential_digest,
             stack,
             mux,
             upload: Pump::new(buffer_bytes)?,
@@ -398,6 +410,7 @@ unsafe extern "C" fn attach_session(
                     auth: AuthState::Waiting,
                     subscribed: false,
                     last_status: Instant::now(),
+                    credential_digest: None,
                     pending_flows: VecDeque::new(),
                 },
             );
@@ -450,7 +463,10 @@ unsafe extern "C" fn admit_flow(
             let Some(session) = state.sessions.get_mut(&session) else {
                 return abi::STATUS_INVALID;
             };
-            session.pending_flows.push_back(user_id);
+            session.pending_flows.push_back(FlowIdentity {
+                user_id,
+                credential_digest: session.credential_digest.clone(),
+            });
             abi::STATUS_OK
         })
     })
@@ -479,10 +495,10 @@ unsafe extern "C" fn attach_flow(
             let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
-            let user_id = match state.sessions.get_mut(&session) {
+            let identity = match state.sessions.get_mut(&session) {
                 Some(session) if matches!(session.role, PolicyRole::Server) => {
                     match session.pending_flows.pop_front() {
-                        Some(user_id) => Some(user_id),
+                        Some(identity) => Some(identity),
                         None => return abi::STATUS_DENIED,
                     }
                 }
@@ -497,7 +513,14 @@ unsafe extern "C" fn attach_flow(
                 Ok(mux) => mux,
                 Err(_) => return abi::STATUS_INVALID,
             };
-            let flow = match PolicyFlow::new(stack, mux, state.options.sniff_bytes, user_id) {
+            let flow = match PolicyFlow::new(
+                stack,
+                mux,
+                state.options.sniff_bytes,
+                session,
+                identity.as_ref().map(|identity| identity.user_id.clone()),
+                identity.and_then(|identity| identity.credential_digest),
+            ) {
                 Ok(flow) => flow,
                 Err(_) => return abi::STATUS_RESOURCE,
             };
@@ -674,6 +697,10 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
                 state.sessions.insert(handle, session);
             }
         }
+        let sessions = &state.sessions;
+        state
+            .flows
+            .retain(|_, flow| sessions.contains_key(&flow.session));
         abi::STATUS_PENDING
     })
 }
@@ -1096,6 +1123,7 @@ fn handle_client_request(
             }
             let credential = Credential::parse_hex(&credential).map_err(admin_status)?;
             let digest = credential.digest_id().hex();
+            session.credential_digest = Some(digest.clone());
             let reply = state
                 .storage
                 .get(format!("credential/{digest}"))
@@ -1258,7 +1286,7 @@ fn flow_limit_reached(state: &State, user: &UserRecord) -> bool {
             session
                 .pending_flows
                 .iter()
-                .filter(|id| id.as_str() == user.id)
+                .filter(|identity| identity.user_id == user.id)
                 .count()
         })
         .sum::<usize>();
@@ -1855,6 +1883,14 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
             _ => Some(id.clone()),
         })
         .collect();
+    let revoked_credentials: HashSet<String> = mutation
+        .credentials
+        .iter()
+        .filter_map(|(digest, credential)| match credential {
+            Some(credential) if !credential.revoked => None,
+            _ => Some(digest.clone()),
+        })
+        .collect();
     for (id, user) in mutation.users {
         match user {
             Some(user) => {
@@ -1908,6 +1944,20 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
         });
         state.sessions.retain(|_, session| {
             !matches!(&session.auth, AuthState::Authenticated(id) if stopped_users.contains(id))
+        });
+    }
+    if !revoked_credentials.is_empty() {
+        state.flows.retain(|_, flow| {
+            !flow
+                .credential_digest
+                .as_ref()
+                .is_some_and(|digest| revoked_credentials.contains(digest))
+        });
+        state.sessions.retain(|_, session| {
+            !session
+                .credential_digest
+                .as_ref()
+                .is_some_and(|digest| revoked_credentials.contains(digest))
         });
     }
 }
@@ -2076,7 +2126,7 @@ mod module_tests {
             input: b"download".iter().copied().collect(),
             ..MemoryIo::default()
         };
-        let mut flow = PolicyFlow::new(stack, mux, 16, None).unwrap();
+        let mut flow = PolicyFlow::new(stack, mux, 16, 1, None, None).unwrap();
         let mut context = Context::from_waker(Waker::noop());
         while !flow.upload.is_finished() || !flow.download.is_finished() {
             let _ = flow.poll(&mut context, 16, 16, 16);
@@ -2106,7 +2156,8 @@ mod module_tests {
             ..MemoryIo::default()
         };
         let mux = MemoryIo::default();
-        let mut flow = PolicyFlow::new(stack, mux, 100, Some("user".into())).unwrap();
+        let mut flow =
+            PolicyFlow::new(stack, mux, 100, 1, Some("user".into()), Some("key".into())).unwrap();
         let grant = take_rate_grant(&mut traffic, 100, 0).unwrap();
         let mut context = Context::from_waker(Waker::noop());
         let Poll::Ready(Ok((stack_to_mux, mux_to_stack))) = flow.poll(
