@@ -279,7 +279,11 @@ impl Config {
         else {
             return Ok(());
         };
-        if *queue_bytes == 0 || *max_record_bytes == 0 || *flush_interval_ms == 0 {
+        if *queue_bytes == 0
+            || *max_record_bytes == 0
+            || *queue_bytes < *max_record_bytes
+            || *flush_interval_ms == 0
+        {
             return Err(ConfigError::Invalid("logging limits must be nonzero"));
         }
         match source {

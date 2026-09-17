@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::ffi::c_void;
 use std::future::Future;
 use std::pin::Pin;
@@ -13,10 +14,13 @@ use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, StreamExt, select};
 use thiserror::Error;
 
-use crate::config::{Config, ControlConfig, Role, YamuxConfig};
+use crate::config::{
+    Config, ControlConfig, LogLevel, LogSource, LoggingConfig, Role, YamuxConfig, parse_size,
+};
 use crate::core_io::RegisteredIo;
 use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
+use crate::logging::{FileLogger, LogError};
 use crate::mux::{MuxError, MuxSession};
 use crate::stack::{SharedStackBridge, StackError};
 
@@ -100,6 +104,13 @@ pub struct Engine {
     events: mpsc::Sender<Event>,
     snapshot: Arc<AtomicSnapshot>,
     wake: Arc<WakeState>,
+    logger: Option<EngineLogger>,
+    log_errors: Arc<Mutex<VecDeque<String>>>,
+}
+
+struct EngineLogger {
+    file: FileLogger,
+    levels: HashSet<LogLevel>,
 }
 
 #[derive(Clone)]
@@ -202,6 +213,8 @@ impl Engine {
         validated: ValidatedConfig,
         host: H,
     ) -> Result<(Self, EngineHandle), EngineError> {
+        let log_errors = Arc::new(Mutex::new(VecDeque::new()));
+        let logger = configure_logging(&validated.config.logging, Arc::clone(&log_errors))?;
         let (command_tx, command_rx) = mpsc::channel(validated.config.engine.max_commands);
         let (event_tx, event_rx) = mpsc::channel(validated.config.engine.max_events);
         let snapshot = Arc::new(AtomicSnapshot {
@@ -231,6 +244,8 @@ impl Engine {
             wake: Arc::new(WakeState {
                 woken: AtomicBool::new(true),
             }),
+            logger,
+            log_errors,
         };
         Ok((engine, handle))
     }
@@ -291,6 +306,7 @@ impl Engine {
                     self.poll_modules();
                     self.poll_tunnels(&mut tunnels);
                     self.drain_module_events();
+                    self.drain_log_errors();
                 }
             }
         }
@@ -398,12 +414,35 @@ impl Engine {
         }
     }
 
+    fn drain_log_errors(&mut self) {
+        let errors: Vec<_> = match self.log_errors.lock() {
+            Ok(mut errors) => errors.drain(..).collect(),
+            Err(_) => return,
+        };
+        for message in errors {
+            self.emit_unlogged(Event::ModuleError {
+                instance: "logging".into(),
+                message,
+            });
+        }
+    }
+
     fn emit(&mut self, event: Event) {
         if let Event::Lifecycle(lifecycle) = event {
             self.snapshot
                 .lifecycle
                 .store(lifecycle as u8, Ordering::Release);
         }
+        if let Some(logger) = &self.logger {
+            let level = event_level(&event);
+            if logger.levels.contains(&level) {
+                logger.file.write(&format!("{event:?}"));
+            }
+        }
+        self.emit_unlogged(event);
+    }
+
+    fn emit_unlogged(&mut self, event: Event) {
         self.host.engine_event(&event);
         if self.events.try_send(event).is_err() {
             self.snapshot.lost_events.fetch_add(1, Ordering::Relaxed);
@@ -421,6 +460,82 @@ impl Engine {
             context_get: Some(host_context_get),
             context_set: Some(host_context_set),
         }
+    }
+}
+
+fn configure_logging(
+    config: &LoggingConfig,
+    errors: Arc<Mutex<VecDeque<String>>>,
+) -> Result<Option<EngineLogger>, EngineError> {
+    let LoggingConfig::File {
+        source,
+        levels,
+        file,
+        limit,
+        logs,
+        queue_bytes,
+        max_record_bytes,
+        flush_interval_ms,
+        ..
+    } = config
+    else {
+        return Ok(None);
+    };
+    let (levels, file, limit) = match source {
+        LogSource::Toml => (
+            levels.clone().ok_or(EngineError::LoggingEnvironment)?,
+            file.clone(),
+            parse_size(limit)?,
+        ),
+        LogSource::Env => {
+            let levels = env::var(logs.as_ref().ok_or(EngineError::LoggingEnvironment)?)
+                .map_err(|_| EngineError::LoggingEnvironment)?;
+            let file = env::var(file).map_err(|_| EngineError::LoggingEnvironment)?;
+            let limit = env::var(limit).map_err(|_| EngineError::LoggingEnvironment)?;
+            (parse_log_levels(&levels)?, file, parse_size(&limit)?)
+        }
+    };
+    let levels: HashSet<_> = levels.into_iter().collect();
+    let file = FileLogger::start(
+        file.into(),
+        limit,
+        *queue_bytes,
+        *max_record_bytes,
+        Duration::from_millis(*flush_interval_ms),
+        move |message| {
+            if let Ok(mut errors) = errors.lock() {
+                errors.push_back(message);
+            }
+        },
+    )?;
+    Ok(Some(EngineLogger { file, levels }))
+}
+
+fn parse_log_levels(input: &str) -> Result<Vec<LogLevel>, EngineError> {
+    let mut levels = Vec::new();
+    for level in input.split(',') {
+        let level = match level.trim().to_ascii_lowercase().as_str() {
+            "warning" => LogLevel::Warning,
+            "error" => LogLevel::Error,
+            "debug" => LogLevel::Debug,
+            _ => return Err(EngineError::LoggingEnvironment),
+        };
+        if levels.contains(&level) {
+            return Err(EngineError::LoggingEnvironment);
+        }
+        levels.push(level);
+    }
+    if levels.is_empty() {
+        return Err(EngineError::LoggingEnvironment);
+    }
+    Ok(levels)
+}
+
+fn event_level(event: &Event) -> LogLevel {
+    match event {
+        Event::ModuleError { .. } | Event::Lifecycle(Lifecycle::Failed) => LogLevel::Error,
+        Event::ResourceExhausted { .. } => LogLevel::Warning,
+        _ => LogLevel::Debug,
     }
 }
 
@@ -815,6 +930,10 @@ pub enum EngineError {
     ModuleDescription,
     #[error("engine resource arithmetic overflow")]
     ResourceOverflow,
+    #[error(transparent)]
+    Logging(#[from] LogError),
+    #[error("logging environment is missing or invalid")]
+    LoggingEnvironment,
     #[error("module instance {0} was not found")]
     InstanceNotFound(String),
     #[error("command queue is full or closed")]
@@ -842,5 +961,16 @@ mod tests {
         assert!(wake.woken.load(Ordering::Acquire));
         unsafe { handle.release.unwrap()(handle.context) };
         assert_eq!(Arc::strong_count(&wake), 1);
+    }
+
+    #[test]
+    fn environment_log_levels_are_strict_and_unique() {
+        assert_eq!(
+            parse_log_levels("warning,error,debug").unwrap(),
+            [LogLevel::Warning, LogLevel::Error, LogLevel::Debug]
+        );
+        assert!(parse_log_levels("debug,debug").is_err());
+        assert!(parse_log_levels("info").is_err());
+        assert!(parse_log_levels("").is_err());
     }
 }
