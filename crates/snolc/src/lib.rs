@@ -5,6 +5,7 @@ mod engine;
 pub mod events;
 pub mod loader;
 pub mod module_config;
+pub mod mux;
 pub mod stack;
 pub mod wire;
 
