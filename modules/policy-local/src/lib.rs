@@ -70,6 +70,7 @@ struct State {
     sessions: HashMap<u64, PolicySession>,
     flows: HashMap<u64, PolicyFlow<ForeignByteIo, ForeignByteIo>>,
     traffic: HashMap<String, UserTraffic>,
+    flow_cursor: HashMap<String, usize>,
 }
 
 struct UserTraffic {
@@ -298,6 +299,7 @@ fn initialize(
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
                 traffic: HashMap::new(),
+                flow_cursor: HashMap::new(),
             },
         );
     });
@@ -506,13 +508,15 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         let mut finished = Vec::new();
         let mut usage = Vec::new();
         let now_nanos = u64::try_from(state.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let active_users: HashSet<String> = state
-            .flows
-            .values()
-            .filter_map(|flow| flow.user_id.clone())
-            .collect();
+        let mut user_flows: HashMap<String, Vec<u64>> = HashMap::new();
+        for (handle, flow) in &state.flows {
+            if let Some(user_id) = &flow.user_id {
+                user_flows.entry(user_id.clone()).or_default().push(*handle);
+            }
+        }
         let mut grants = HashMap::new();
-        for user_id in active_users {
+        for (user_id, mut flows) in user_flows {
+            flows.sort_unstable();
             let Some(traffic) = state.traffic.get_mut(&user_id) else {
                 continue;
             };
@@ -520,14 +524,16 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
                 .unwrap_or(usize::MAX)
                 .min(state.options.sniff_bytes);
             if let Ok(grant) = take_rate_grant(traffic, budget, now_nanos) {
-                grants.insert(user_id, grant);
+                let cursor = state.flow_cursor.entry(user_id).or_default();
+                let flow = select_flow(cursor, &flows);
+                grants.insert(flow, grant);
             }
         }
         for (handle, flow) in &mut state.flows {
             let grant = flow
                 .user_id
                 .as_ref()
-                .and_then(|id| grants.remove(id))
+                .and_then(|_| grants.remove(handle))
                 .unwrap_or_else(|| {
                     if flow.user_id.is_none() {
                         let work = state.options.sniff_bytes as u64;
@@ -596,6 +602,12 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         }
         abi::STATUS_PENDING
     })
+}
+
+fn select_flow(cursor: &mut usize, flows: &[u64]) -> u64 {
+    let flow = flows[*cursor % flows.len()];
+    *cursor = cursor.wrapping_add(1);
+    flow
 }
 
 fn advance_quota(state: &mut State) -> HashSet<String> {
@@ -842,6 +854,7 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
     }
     for user_id in remove_traffic {
         state.traffic.remove(&user_id);
+        state.flow_cursor.remove(&user_id);
     }
     stopped
 }
@@ -1662,6 +1675,9 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
     }
     if !stopped_users.is_empty() {
         state.traffic.retain(|id, _| !stopped_users.contains(id));
+        state
+            .flow_cursor
+            .retain(|id, _| !stopped_users.contains(id));
         state.flows.retain(|_, flow| {
             !flow
                 .user_id
@@ -1897,6 +1913,16 @@ mod module_tests {
                 .stack_to_mux,
             10
         );
+    }
+
+    #[test]
+    fn active_flows_rotate_within_one_user() {
+        let mut cursor = 0;
+        let flows = [3, 7, 11];
+        assert_eq!(select_flow(&mut cursor, &flows), 3);
+        assert_eq!(select_flow(&mut cursor, &flows), 7);
+        assert_eq!(select_flow(&mut cursor, &flows), 11);
+        assert_eq!(select_flow(&mut cursor, &flows), 3);
     }
 
     #[test]
