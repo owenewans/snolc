@@ -312,7 +312,7 @@ fn decode_hex(input: &str) -> Result<[u8; 32], String> {
 unsafe extern "C" fn describe(output: SnolBytesMut, written: *mut usize) -> u32 {
     snolc_sdk::catch_status(|| unsafe {
         snolc_sdk::module::write_output(
-            b"name = \"protection-noise\"\nroles = [\"client\", \"server\"]\npattern = \"Noise_NK_25519_ChaChaPoly_BLAKE2s\"\nconfidentiality = true\nintegrity = true\n",
+            b"name = \"protection-noise\"\nroles = [\"client\", \"server\"]\npattern = \"Noise_NK_25519_ChaChaPoly_BLAKE2s\"\nconfidentiality = true\nintegrity = true\nserver_authenticated = true\nclient_authenticated = false\n",
             output,
             written,
         )

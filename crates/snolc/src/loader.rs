@@ -280,6 +280,45 @@ impl LoadedModule {
         }
     }
 
+    pub(crate) fn policy_attach_session(
+        &self,
+        policy_stream: u64,
+        policy_stream_io: *const SnolByteIoV1,
+        context_bytes: &[u8],
+        context: &mut Context<'_>,
+    ) -> Poll<Result<u64, LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let policy = match unsafe { self.descriptor().policy.as_ref() } {
+            Some(policy) => policy,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_POLICY))),
+        };
+        let attach = match policy.attach_session {
+            Some(attach) => attach,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let mut session = 0;
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe {
+            attach(
+                instance,
+                policy_stream,
+                policy_stream_io,
+                bytes(context_bytes),
+                wake.handle(),
+                &mut session,
+            )
+        };
+        match status {
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            snolc_abi::STATUS_OK if session == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
+            snolc_abi::STATUS_OK => Poll::Ready(Ok(session)),
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
+        }
+    }
+
     fn finish_byte_io(
         &self,
         status: u32,

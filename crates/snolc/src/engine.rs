@@ -14,6 +14,7 @@ use futures::{FutureExt, StreamExt, select};
 use thiserror::Error;
 
 use crate::config::{Config, ControlConfig, Role, YamuxConfig};
+use crate::core_io::RegisteredIo;
 use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::mux::{MuxError, MuxSession};
@@ -40,7 +41,10 @@ struct TunnelBinding {
     role: Role,
     carrier: usize,
     protection: usize,
+    policy: usize,
     policy_family: String,
+    policy_context: Vec<u8>,
+    core_io_limit: usize,
     yamux: YamuxConfig,
     connect_timeout: Duration,
     handshake_timeout: Duration,
@@ -56,15 +60,35 @@ enum TunnelState {
     Carrier,
     Protection(Option<ModuleByteIo>),
     Handshake(HandshakeFuture),
+    PolicyAttach(Box<PolicyAttachState>),
     Established(Box<EstablishedSession>),
     Failed,
 }
 
-type HandshakeFuture = Pin<Box<dyn Future<Output = Result<EstablishedSession, MuxError>>>>;
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TunnelUpdate {
+    None,
+    CarrierReady,
+    Protected,
+    PolicyOpen,
+    Established,
+}
+
+type HandshakeFuture = Pin<Box<dyn Future<Output = Result<PendingPolicySession, MuxError>>>>;
+
+struct PendingPolicySession {
+    mux: MuxSession<ModuleByteIo>,
+    policy_stream: yamux::Stream,
+}
+
+struct PolicyAttachState {
+    mux: Option<MuxSession<ModuleByteIo>>,
+    stream: Option<RegisteredIo>,
+}
 
 struct EstablishedSession {
     mux: MuxSession<ModuleByteIo>,
-    _policy_stream: yamux::Stream,
+    _policy_session: u64,
 }
 
 pub struct Engine {
@@ -146,12 +170,21 @@ impl Engine {
                 find_module(&modules, &tunnel.protection, snolc_abi::CLASS_PROTECTION)?;
             let carrier = find_module(&modules, &tunnel.carrier, snolc_abi::CLASS_CARRIER)?;
             let policy = find_module(&modules, &tunnel.policy, snolc_abi::CLASS_POLICY)?;
+            let policy_context = channel_security_context(&modules[protection], tunnel.role)?;
+            let core_io_limit = config
+                .engine
+                .max_sessions
+                .checked_add(config.engine.max_flows)
+                .ok_or(EngineError::ResourceOverflow)?;
             tunnels.push(TunnelBinding {
                 name: tunnel.name.clone(),
                 role: tunnel.role,
                 carrier,
                 protection,
+                policy,
                 policy_family: modules[policy].name().to_owned(),
+                policy_context,
+                core_io_limit,
                 yamux: config.yamux.clone(),
                 connect_timeout: Duration::from_millis(config.engine.connect_timeout_ms),
                 handshake_timeout: Duration::from_millis(config.engine.handshake_timeout_ms),
@@ -309,9 +342,22 @@ impl Engine {
         let mut established = 0;
         let mut closed = 0;
         let mut failures = Vec::new();
+        let mut transitions = Vec::new();
         for tunnel in tunnels {
             match tunnel.poll(&self.validated.modules) {
-                Ok(new_session) => established += usize::from(new_session),
+                Ok(update) => {
+                    established += usize::from(update == TunnelUpdate::Established);
+                    let state = match update {
+                        TunnelUpdate::None => None,
+                        TunnelUpdate::CarrierReady => Some("carrier-ready"),
+                        TunnelUpdate::Protected => Some("protected"),
+                        TunnelUpdate::PolicyOpen => Some("policy-open"),
+                        TunnelUpdate::Established => Some("established"),
+                    };
+                    if let Some(state) = state {
+                        transitions.push((tunnel.binding.name.clone(), state));
+                    }
+                }
                 Err((message, was_established)) => {
                     closed += usize::from(was_established);
                     failures.push((tunnel.binding.name.clone(), message));
@@ -325,6 +371,9 @@ impl Engine {
         }
         if closed != 0 {
             self.snapshot.sessions.fetch_sub(closed, Ordering::Relaxed);
+        }
+        for (name, state) in transitions {
+            self.emit(Event::Tunnel { name, state });
         }
         for (instance, message) in failures {
             self.emit(Event::ModuleError { instance, message });
@@ -387,6 +436,37 @@ fn find_module(
     }
 }
 
+fn channel_security_context(module: &LoadedModule, role: Role) -> Result<Vec<u8>, EngineError> {
+    let description = module.describe()?;
+    let description =
+        std::str::from_utf8(&description).map_err(|_| EngineError::ModuleDescription)?;
+    let description: toml::Value =
+        toml::from_str(description).map_err(|_| EngineError::ModuleDescription)?;
+    let confidentiality = description
+        .get("confidentiality")
+        .and_then(toml::Value::as_bool)
+        .ok_or(EngineError::ModuleDescription)?;
+    let integrity = description
+        .get("integrity")
+        .and_then(toml::Value::as_bool)
+        .ok_or(EngineError::ModuleDescription)?;
+    let authentication = match role {
+        Role::Client => "server_authenticated",
+        Role::Server => "client_authenticated",
+    };
+    let peer_authenticated = description
+        .get(authentication)
+        .and_then(toml::Value::as_bool)
+        .ok_or(EngineError::ModuleDescription)?;
+    let mut context = format!(
+        "confidentiality = {confidentiality}\nintegrity = {integrity}\npeer_authenticated = {peer_authenticated}\n"
+    );
+    if peer_authenticated {
+        context.push_str("peer_identity = \"protection-peer\"\n");
+    }
+    Ok(context.into_bytes())
+}
+
 impl TunnelRuntime {
     fn new(binding: TunnelBinding) -> Self {
         let deadline = match binding.role {
@@ -400,14 +480,25 @@ impl TunnelRuntime {
         }
     }
 
-    fn poll(&mut self, modules: &[LoadedModule]) -> Result<bool, (String, bool)> {
+    fn poll(&mut self, modules: &[LoadedModule]) -> Result<TunnelUpdate, (String, bool)> {
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
+            let stage = match &self.state {
+                TunnelState::Carrier => "carrier",
+                TunnelState::Protection(_) => "protection",
+                TunnelState::Handshake(_) => "yamux policy handshake",
+                TunnelState::PolicyAttach(_) => "policy attach",
+                TunnelState::Established(_) => "established",
+                TunnelState::Failed => "failed",
+            };
             self.state = TunnelState::Failed;
             self.deadline = None;
-            return Err(("tunnel establishment timed out".into(), false));
+            return Err((
+                format!("tunnel establishment timed out during {stage}"),
+                false,
+            ));
         }
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -422,6 +513,7 @@ impl TunnelRuntime {
                     Poll::Ready(Ok(io)) => {
                         self.state = TunnelState::Protection(Some(io));
                         self.deadline = Some(Instant::now() + self.binding.handshake_timeout);
+                        return Ok(TunnelUpdate::CarrierReady);
                     }
                     Poll::Ready(Err(error)) => return self.fail(error.to_string(), false),
                     Poll::Pending => {}
@@ -447,11 +539,9 @@ impl TunnelRuntime {
                                 Role::Client => mux.open_policy(&family).await?,
                                 Role::Server => mux.accept_policy(&family).await?,
                             };
-                            Ok(EstablishedSession {
-                                mux,
-                                _policy_stream: policy_stream,
-                            })
+                            Ok(PendingPolicySession { mux, policy_stream })
                         }));
+                        return Ok(TunnelUpdate::Protected);
                     }
                     Poll::Ready(Err(error)) => return self.fail(error.to_string(), false),
                     Poll::Pending => {}
@@ -459,13 +549,52 @@ impl TunnelRuntime {
             }
             TunnelState::Handshake(handshake) => match handshake.as_mut().poll(&mut context) {
                 Poll::Ready(Ok(session)) => {
-                    self.state = TunnelState::Established(Box::new(session));
-                    self.deadline = None;
-                    return Ok(true);
+                    let stream = match RegisteredIo::register(
+                        session.policy_stream,
+                        self.binding.core_io_limit,
+                    ) {
+                        Ok(stream) => stream,
+                        Err(error) => return self.fail(error.to_string(), false),
+                    };
+                    self.state = TunnelState::PolicyAttach(Box::new(PolicyAttachState {
+                        mux: Some(session.mux),
+                        stream: Some(stream),
+                    }));
+                    return Ok(TunnelUpdate::PolicyOpen);
                 }
                 Poll::Ready(Err(error)) => return self.fail(error.to_string(), false),
                 Poll::Pending => {}
             },
+            TunnelState::PolicyAttach(state) => {
+                let (stream, io) = match state.stream.as_ref() {
+                    Some(stream) => stream.raw_parts(),
+                    None => return self.fail("policy stream is unavailable".into(), false),
+                };
+                match modules[self.binding.policy].policy_attach_session(
+                    stream,
+                    io,
+                    &self.binding.policy_context,
+                    &mut context,
+                ) {
+                    Poll::Ready(Ok(policy_session)) => {
+                        if let Some(stream) = state.stream.take() {
+                            stream.transfer();
+                        }
+                        let mux = match state.mux.take() {
+                            Some(mux) => mux,
+                            None => return self.fail("yamux session is unavailable".into(), false),
+                        };
+                        self.state = TunnelState::Established(Box::new(EstablishedSession {
+                            mux,
+                            _policy_session: policy_session,
+                        }));
+                        self.deadline = None;
+                        return Ok(TunnelUpdate::Established);
+                    }
+                    Poll::Ready(Err(error)) => return self.fail(error.to_string(), false),
+                    Poll::Pending => {}
+                }
+            }
             TunnelState::Established(session) => {
                 if let Poll::Ready(Err(error)) = session.mux.poll_drive(&mut context) {
                     return self.fail(error.to_string(), true);
@@ -473,10 +602,14 @@ impl TunnelRuntime {
             }
             TunnelState::Failed => {}
         }
-        Ok(false)
+        Ok(TunnelUpdate::None)
     }
 
-    fn fail(&mut self, message: String, was_established: bool) -> Result<bool, (String, bool)> {
+    fn fail(
+        &mut self,
+        message: String,
+        was_established: bool,
+    ) -> Result<TunnelUpdate, (String, bool)> {
         self.state = TunnelState::Failed;
         self.deadline = None;
         Err((message, was_established))
@@ -668,6 +801,10 @@ pub enum EngineError {
     MissingModuleClass(u32),
     #[error("module config {path} does not resolve exactly once for class {class:#x}")]
     ModuleBinding { path: String, class: u32 },
+    #[error("module description is missing required security capabilities")]
+    ModuleDescription,
+    #[error("engine resource arithmetic overflow")]
+    ResourceOverflow,
     #[error("module instance {0} was not found")]
     InstanceNotFound(String),
     #[error("command queue is full or closed")]

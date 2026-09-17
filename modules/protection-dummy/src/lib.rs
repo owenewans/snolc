@@ -170,7 +170,7 @@ static PROTECTION: SnolProtectionApiV1 = SnolProtectionApiV1 {
 
 snolc_sdk::declare_module! {
     name: "protection-dummy",
-    description: "name = \"protection-dummy\"\nroles = [\"client\", \"server\"]\nconfidentiality = false\nintegrity = false\n",
+    description: "name = \"protection-dummy\"\nroles = [\"client\", \"server\"]\nconfidentiality = false\nintegrity = false\nserver_authenticated = false\nclient_authenticated = false\n",
     class_mask: abi::CLASS_PROTECTION,
     validate: validate_config,
     byte_io: &BYTE_IO,

@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod config;
+mod core_io;
 mod engine;
 pub mod events;
 pub mod loader;

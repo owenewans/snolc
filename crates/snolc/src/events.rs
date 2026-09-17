@@ -29,6 +29,7 @@ pub enum Event {
     Lifecycle(Lifecycle),
     Module { instance: String, payload: Vec<u8> },
     ModuleError { instance: String, message: String },
+    Tunnel { name: String, state: &'static str },
     ResourceExhausted { resource: &'static str },
 }
 
