@@ -168,6 +168,142 @@ pub struct CredentialRecord {
     pub revision: u64,
 }
 
+#[derive(Deserialize, Serialize)]
+struct StoredUserRecord {
+    id: String,
+    status: UserStatus,
+    expiration: StoredExpiration,
+    quota: StoredByteLimit,
+    upload_rate: StoredRateLimit,
+    download_rate: StoredRateLimit,
+    combined_rate: StoredRateLimit,
+    burst_bytes: u64,
+    max_sessions: StoredCountLimit,
+    max_flows: StoredCountLimit,
+    weight: u32,
+    group: String,
+    rule_profile: String,
+    revision: u64,
+    durable_charged_bytes: u64,
+    upload_bytes: u64,
+    download_bytes: u64,
+    max_observed_utc: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+enum StoredExpiration {
+    Unlimited,
+    AtUtc(u64),
+}
+
+#[derive(Deserialize, Serialize)]
+enum StoredByteLimit {
+    Unlimited,
+    Limited(u64),
+}
+
+#[derive(Deserialize, Serialize)]
+enum StoredRateLimit {
+    Unlimited,
+    Limited(u64),
+}
+
+#[derive(Deserialize, Serialize)]
+enum StoredCountLimit {
+    Unlimited,
+    Limited(u32),
+}
+
+pub(crate) fn encode_user_record(user: &UserRecord) -> Result<Vec<u8>, AdminError> {
+    let stored = StoredUserRecord {
+        id: user.id.clone(),
+        status: user.spec.status,
+        expiration: match user.spec.expiration {
+            Expiration::Unlimited => StoredExpiration::Unlimited,
+            Expiration::AtUtc { unix_seconds } => StoredExpiration::AtUtc(unix_seconds),
+        },
+        quota: match user.spec.quota {
+            ByteLimit::Unlimited => StoredByteLimit::Unlimited,
+            ByteLimit::Limited { bytes } => StoredByteLimit::Limited(bytes),
+        },
+        upload_rate: stored_rate(&user.spec.upload_rate),
+        download_rate: stored_rate(&user.spec.download_rate),
+        combined_rate: stored_rate(&user.spec.combined_rate),
+        burst_bytes: user.spec.burst_bytes,
+        max_sessions: stored_count(&user.spec.max_sessions),
+        max_flows: stored_count(&user.spec.max_flows),
+        weight: user.spec.weight,
+        group: user.spec.group.clone(),
+        rule_profile: user.spec.rule_profile.clone(),
+        revision: user.revision,
+        durable_charged_bytes: user.durable_charged_bytes,
+        upload_bytes: user.upload_bytes,
+        download_bytes: user.download_bytes,
+        max_observed_utc: user.max_observed_utc,
+    };
+    postcard::to_allocvec(&stored).map_err(|_| AdminError::Encode)
+}
+
+pub(crate) fn decode_user_record(input: &[u8]) -> Result<UserRecord, AdminError> {
+    let stored: StoredUserRecord = postcard::from_bytes(input).map_err(|_| AdminError::Encode)?;
+    Ok(UserRecord {
+        id: stored.id,
+        spec: UserSpec {
+            status: stored.status,
+            expiration: match stored.expiration {
+                StoredExpiration::Unlimited => Expiration::Unlimited,
+                StoredExpiration::AtUtc(unix_seconds) => Expiration::AtUtc { unix_seconds },
+            },
+            quota: match stored.quota {
+                StoredByteLimit::Unlimited => ByteLimit::Unlimited,
+                StoredByteLimit::Limited(bytes) => ByteLimit::Limited { bytes },
+            },
+            upload_rate: runtime_rate(stored.upload_rate),
+            download_rate: runtime_rate(stored.download_rate),
+            combined_rate: runtime_rate(stored.combined_rate),
+            burst_bytes: stored.burst_bytes,
+            max_sessions: runtime_count(stored.max_sessions),
+            max_flows: runtime_count(stored.max_flows),
+            weight: stored.weight,
+            group: stored.group,
+            rule_profile: stored.rule_profile,
+        },
+        revision: stored.revision,
+        durable_charged_bytes: stored.durable_charged_bytes,
+        upload_bytes: stored.upload_bytes,
+        download_bytes: stored.download_bytes,
+        max_observed_utc: stored.max_observed_utc,
+    })
+}
+
+fn stored_rate(rate: &RateLimit) -> StoredRateLimit {
+    match rate {
+        RateLimit::Unlimited => StoredRateLimit::Unlimited,
+        RateLimit::Limited { bytes_per_second } => StoredRateLimit::Limited(*bytes_per_second),
+    }
+}
+
+fn runtime_rate(rate: StoredRateLimit) -> RateLimit {
+    match rate {
+        StoredRateLimit::Unlimited => RateLimit::Unlimited,
+        StoredRateLimit::Limited(bytes_per_second) => RateLimit::Limited { bytes_per_second },
+    }
+}
+
+fn stored_count(limit: &CountLimit) -> StoredCountLimit {
+    match limit {
+        CountLimit::Unlimited => StoredCountLimit::Unlimited,
+        CountLimit::Limited { count } => StoredCountLimit::Limited(*count),
+    }
+}
+
+fn runtime_count(limit: StoredCountLimit) -> CountLimit {
+    match limit {
+        StoredCountLimit::Unlimited => CountLimit::Unlimited,
+        StoredCountLimit::Limited(count) => CountLimit::Limited { count },
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "method", deny_unknown_fields)]
 pub enum ControlRequest {

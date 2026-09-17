@@ -16,8 +16,9 @@ pub use config::Options;
 pub use frame::{FrameDecoder, FrameError, encode_frame};
 pub use storage::{StorageError, StorageWorker};
 
+use admin::{decode_user_record, encode_user_record};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -58,17 +59,35 @@ struct State {
 struct AdminState {
     sequencer: AdminSequencer,
     users: HashMap<String, UserRecord>,
+    loaded_users: HashSet<String>,
     credentials: HashMap<String, CredentialRecord>,
+    loaded_credentials: HashSet<String>,
     rules: HashMap<String, String>,
 }
 
-struct PendingControl {
+enum PendingControl {
+    Write(PendingWrite),
+    Read(PendingRead),
+}
+
+struct PendingWrite {
     request: Vec<u8>,
     client_id: String,
     receipt: Vec<u8>,
     response: Vec<u8>,
     mutation: AdminMutation,
     reply: storage::WriteReply,
+}
+
+struct PendingRead {
+    request: Vec<u8>,
+    kind: ReadKind,
+    reply: storage::ReadReply,
+}
+
+enum ReadKind {
+    User(String),
+    Credential(String),
 }
 
 #[derive(Default)]
@@ -164,7 +183,9 @@ fn initialize(
                 admin: AdminState {
                     sequencer,
                     users: HashMap::new(),
+                    loaded_users: HashSet::new(),
                     credentials: HashMap::new(),
+                    loaded_credentials: HashSet::new(),
                     rules: HashMap::new(),
                 },
                 storage,
@@ -320,32 +341,60 @@ fn control_instance(instance: u64, request: &[u8]) -> Result<Vec<u8>, u32> {
     STATES.with(|states| {
         let mut states = states.borrow_mut();
         let state = states.get_mut(&instance).ok_or(abi::STATUS_INVALID)?;
-        if let Some(pending) = state.pending_control.as_mut() {
-            if pending.request != request {
+        if let Some(pending) = state.pending_control.take() {
+            let pending_request = match &pending {
+                PendingControl::Write(pending) => &pending.request,
+                PendingControl::Read(pending) => &pending.request,
+            };
+            if pending_request != request {
+                state.pending_control = Some(pending);
                 return Err(abi::STATUS_PENDING);
             }
-            match pending.reply.try_recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                    state.pending_control = None;
-                    return Err(abi::STATUS_IO);
-                }
-                Err(TryRecvError::Empty) => return Err(abi::STATUS_PENDING),
+            match pending {
+                PendingControl::Write(pending) => match pending.reply.try_recv() {
+                    Ok(Ok(())) => {
+                        state
+                            .admin
+                            .sequencer
+                            .apply_commit(pending.client_id, &pending.receipt)
+                            .map_err(|_| abi::STATUS_INTERNAL)?;
+                        apply_admin_mutation(state, pending.mutation);
+                        return Ok(pending.response);
+                    }
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        return Err(abi::STATUS_IO);
+                    }
+                    Err(TryRecvError::Empty) => {
+                        state.pending_control = Some(PendingControl::Write(pending));
+                        return Err(abi::STATUS_PENDING);
+                    }
+                },
+                PendingControl::Read(pending) => match pending.reply.try_recv() {
+                    Ok(Ok(value)) => finish_admin_read(state, pending.kind, value)?,
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        return Err(abi::STATUS_IO);
+                    }
+                    Err(TryRecvError::Empty) => {
+                        state.pending_control = Some(PendingControl::Read(pending));
+                        return Err(abi::STATUS_PENDING);
+                    }
+                },
             }
-            let pending = state.pending_control.take().ok_or(abi::STATUS_INTERNAL)?;
-            state
-                .admin
-                .sequencer
-                .apply_commit(pending.client_id, &pending.receipt)
-                .map_err(|_| abi::STATUS_INTERNAL)?;
-            apply_admin_mutation(state, pending.mutation);
-            return Ok(pending.response);
         }
 
         if request.len() > state.options.max_control_frame_bytes {
             return Err(abi::STATUS_RESOURCE);
         }
         let parsed = ControlRequest::parse(request).map_err(|_| abi::STATUS_INVALID)?;
+        if let Some((key, kind)) = required_admin_read(state, &parsed) {
+            let reply = state.storage.get(key).map_err(storage_status)?;
+            state.pending_control = Some(PendingControl::Read(PendingRead {
+                request: request.to_vec(),
+                kind,
+                reply,
+            }));
+            return Err(abi::STATUS_PENDING);
+        }
         if parsed.sequence().is_none() {
             return read_admin_state(state, parsed);
         }
@@ -372,16 +421,88 @@ fn control_instance(instance: u64, request: &[u8]) -> Result<Vec<u8>, u32> {
             .map_err(admin_status)?;
         changes.push((format!("client/{client_id}"), Some(receipt.clone())));
         let reply = state.storage.apply(changes).map_err(storage_status)?;
-        state.pending_control = Some(PendingControl {
+        state.pending_control = Some(PendingControl::Write(PendingWrite {
             request: request.to_vec(),
             client_id,
             receipt,
             response,
             mutation,
             reply,
-        });
+        }));
         Err(abi::STATUS_PENDING)
     })
+}
+
+fn required_admin_read(state: &State, request: &ControlRequest) -> Option<(String, ReadKind)> {
+    let user_id = match request {
+        ControlRequest::UserUpdate { user_id, .. }
+        | ControlRequest::UserDisable { user_id, .. }
+        | ControlRequest::UserDelete { user_id, .. }
+        | ControlRequest::CredentialAdd { user_id, .. }
+        | ControlRequest::QuotaAdd { user_id, .. }
+        | ControlRequest::QuotaNewPeriod { user_id, .. }
+        | ControlRequest::UsageGet { user_id } => Some(user_id),
+        ControlRequest::SessionsList {
+            user_id: Some(user_id),
+        } => Some(user_id),
+        _ => None,
+    };
+    if let Some(user_id) = user_id
+        && !state.admin.loaded_users.contains(user_id)
+    {
+        return Some((format!("user/{user_id}"), ReadKind::User(user_id.clone())));
+    }
+    let digest = match request {
+        ControlRequest::CredentialAdd {
+            credential_sha256, ..
+        }
+        | ControlRequest::CredentialRevoke {
+            credential_sha256, ..
+        } => Some(credential_sha256),
+        _ => None,
+    };
+    if let Some(digest) = digest
+        && !state.admin.loaded_credentials.contains(digest)
+    {
+        return Some((
+            format!("credential/{digest}"),
+            ReadKind::Credential(digest.clone()),
+        ));
+    }
+    None
+}
+
+fn finish_admin_read(state: &mut State, kind: ReadKind, value: Option<Vec<u8>>) -> Result<(), u32> {
+    match kind {
+        ReadKind::User(id) => {
+            state.admin.loaded_users.insert(id.clone());
+            if let Some(value) = value {
+                let user = decode_user_record(&value).map_err(|_| abi::STATUS_IO)?;
+                if user.id != id {
+                    return Err(abi::STATUS_IO);
+                }
+                if state.admin.users.len() >= state.options.max_cached_users
+                    && let Some(evicted) = state.admin.users.keys().next().cloned()
+                {
+                    state.admin.users.remove(&evicted);
+                    state.admin.loaded_users.remove(&evicted);
+                }
+                state.admin.users.insert(id, user);
+            }
+        }
+        ReadKind::Credential(digest) => {
+            state.admin.loaded_credentials.insert(digest.clone());
+            if let Some(value) = value {
+                let credential: CredentialRecord =
+                    postcard::from_bytes(&value).map_err(|_| abi::STATUS_IO)?;
+                if credential.digest != digest {
+                    return Err(abi::STATUS_IO);
+                }
+                state.admin.credentials.insert(digest, credential);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_admin_state(state: &State, request: ControlRequest) -> Result<Vec<u8>, u32> {
@@ -421,9 +542,6 @@ fn prepare_admin_mutation(state: &State, request: ControlRequest) -> Result<Prep
     let mut changes = Vec::new();
     let (response, revision) = match request {
         ControlRequest::UserCreate { user, .. } => {
-            if state.admin.users.len() >= state.options.max_cached_users {
-                return Err(abi::STATUS_RESOURCE);
-            }
             let id = UserId::generate().map_err(admin_status)?.hex();
             let record = UserRecord {
                 id: id.clone(),
@@ -612,7 +730,7 @@ fn put_user(
 ) -> Result<(), u32> {
     changes.push((
         format!("user/{}", user.id),
-        Some(postcard::to_allocvec(&user).map_err(|_| abi::STATUS_INTERNAL)?),
+        Some(encode_user_record(&user).map_err(admin_status)?),
     ));
     mutation.users.push((user.id.clone(), Some(user)));
     Ok(())
@@ -622,20 +740,31 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
     for (id, user) in mutation.users {
         match user {
             Some(user) => {
+                if !state.admin.users.contains_key(&id)
+                    && state.admin.users.len() >= state.options.max_cached_users
+                    && let Some(evicted) = state.admin.users.keys().next().cloned()
+                {
+                    state.admin.users.remove(&evicted);
+                    state.admin.loaded_users.remove(&evicted);
+                }
+                state.admin.loaded_users.insert(id.clone());
                 state.admin.users.insert(id, user);
             }
             None => {
                 state.admin.users.remove(&id);
+                state.admin.loaded_users.insert(id);
             }
         }
     }
     for (digest, credential) in mutation.credentials {
         match credential {
             Some(credential) => {
+                state.admin.loaded_credentials.insert(digest.clone());
                 state.admin.credentials.insert(digest, credential);
             }
             None => {
                 state.admin.credentials.remove(&digest);
+                state.admin.loaded_credentials.insert(digest);
             }
         }
     }
@@ -898,6 +1027,10 @@ count = 16
         shutdown_instance(instance);
         initialize(instance, options.as_bytes(), b"/tmp", std::ptr::null()).unwrap();
         assert_eq!(drive_control(instance, create), response);
+        let restored_usage = drive_control(instance, usage_request(user_id).as_bytes());
+        let restored_usage: toml::Value =
+            toml::from_str(std::str::from_utf8(&restored_usage).unwrap()).unwrap();
+        assert_eq!(restored_usage["limit_bytes"].as_integer(), Some(1_000_000));
         shutdown_instance(instance);
         fs::remove_dir_all(root).unwrap();
     }
@@ -911,5 +1044,9 @@ count = 16
                 result => panic!("control failed: {result:?}"),
             }
         }
+    }
+
+    fn usage_request(user_id: &str) -> String {
+        format!("method = \"usage.get\"\nuser_id = \"{user_id}\"\n")
     }
 }
