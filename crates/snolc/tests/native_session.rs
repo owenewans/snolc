@@ -228,10 +228,13 @@ fn native_tun_udp_path_preserves_datagrams() {
     let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
     let echo_endpoint = echo.local_addr().unwrap();
     let echo_thread = thread::spawn(move || {
-        let mut input = [0; 4];
-        let (length, peer) = echo.recv_from(&mut input).unwrap();
-        assert_eq!(&input[..length], b"ping");
-        echo.send_to(b"pong", peer).unwrap();
+        let mut input = vec![0; 65_507];
+        for expected in [0, 1, 65_507] {
+            let (length, peer) = echo.recv_from(&mut input).unwrap();
+            assert_eq!(length, expected);
+            assert!(input[..length].iter().all(|byte| *byte == expected as u8));
+            echo.send_to(&input[..length], peer).unwrap();
+        }
     });
     let (module_tun, client_tun) = UnixDatagram::pair().unwrap();
     client_tun.set_nonblocking(true).unwrap();
@@ -296,36 +299,39 @@ fn native_tun_udp_path_preserves_datagrams() {
         IpAddress::Ipv4(Ipv4Address::new(a, b, c, d)),
         echo_endpoint.port(),
     );
-    sockets
-        .get_mut::<smoltcp::socket::udp::Socket>(socket)
-        .send_slice(b"ping", destination)
-        .unwrap();
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(5);
-    let mut output = [0; 4];
-    loop {
-        let now = SmolInstant::from_millis(started.elapsed().as_millis() as i64);
-        interface.poll_maintenance(now);
-        for _ in 0..32 {
-            if matches!(
-                interface.poll_ingress_single(now, &mut device, &mut sockets),
-                PollIngressSingleResult::None
-            ) {
+    for length in [0, 1, 65_507] {
+        let payload = vec![length as u8; length];
+        sockets
+            .get_mut::<smoltcp::socket::udp::Socket>(socket)
+            .send_slice(&payload, destination)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = vec![0; 65_507];
+        loop {
+            let now = SmolInstant::from_millis(started.elapsed().as_millis() as i64);
+            interface.poll_maintenance(now);
+            for _ in 0..32 {
+                if matches!(
+                    interface.poll_ingress_single(now, &mut device, &mut sockets),
+                    PollIngressSingleResult::None
+                ) {
+                    break;
+                }
+            }
+            let _ = interface.poll_egress(now, &mut device, &mut sockets);
+            let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(socket);
+            if socket.can_recv() {
+                let (received, peer) = socket.recv_slice(&mut output).unwrap();
+                assert_eq!(received, length);
+                assert_eq!(peer.endpoint, destination);
+                assert_eq!(&output[..received], payload);
                 break;
             }
+            assert!(Instant::now() < deadline, "TUN UDP exchange timed out");
+            thread::sleep(Duration::from_millis(1));
         }
-        let _ = interface.poll_egress(now, &mut device, &mut sockets);
-        let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(socket);
-        if socket.can_recv() {
-            let (length, peer) = socket.recv_slice(&mut output).unwrap();
-            assert_eq!(length, 4);
-            assert_eq!(peer.endpoint, destination);
-            break;
-        }
-        assert!(Instant::now() < deadline, "TUN UDP exchange timed out");
-        thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(&output, b"pong");
     client_handle.shutdown().unwrap();
     server_handle.shutdown().unwrap();
     client_thread.join().unwrap().unwrap();

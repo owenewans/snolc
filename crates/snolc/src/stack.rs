@@ -12,7 +12,7 @@ use smoltcp::iface::{
 };
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
     Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
@@ -863,6 +863,7 @@ impl StackBridge {
             }
         });
         interface.set_any_ip(true);
+        interface.set_reassembly_timeout(Duration::from_millis(config.reassembly_timeout_ms));
         if config.ipv4 {
             interface
                 .routes_mut()

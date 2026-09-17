@@ -157,6 +157,9 @@ impl Config {
         if self.stack.max_udp_payload_bytes != crate::wire::MAX_UDP_PAYLOAD {
             return Err(ConfigError::Invalid("max UDP payload must be 65507"));
         }
+        if self.stack.reassembly_slots != 4 {
+            return Err(ConfigError::Invalid("reassembly slots must be 4"));
+        }
         let capacities = [
             self.engine.max_sessions,
             self.engine.max_flows,
@@ -454,5 +457,14 @@ mod tests {
         assert!(parse_size("NaNmb").is_err());
         assert!(parse_size("-1mb").is_err());
         assert!(parse_size("18446744073709551615gb").is_err());
+    }
+
+    #[test]
+    fn rejects_reassembly_slots_that_do_not_match_smoltcp() {
+        let invalid = TEMPLATE.replace("reassembly_slots = 4", "reassembly_slots = 3");
+        assert!(matches!(
+            Config::parse(&invalid, Path::new("/etc/snolc")),
+            Err(ConfigError::Invalid("reassembly slots must be 4"))
+        ));
     }
 }
