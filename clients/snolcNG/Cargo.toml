@@ -11,31 +11,46 @@ repository.workspace = true
 [lib]
 crate-type = ["lib", "cdylib"]
 
+[features]
+default = ["gui"]
+gui = [
+  "dep:egui",
+  "dep:egui-winit",
+  "dep:egui_glow",
+  "dep:glow",
+  "dep:glutin",
+  "dep:glutin-winit",
+  "dep:jni",
+  "dep:libc",
+  "dep:winit",
+]
+
 [dependencies]
 base64.workspace = true
-egui.workspace = true
-egui_glow.workspace = true
-glow.workspace = true
-glutin.workspace = true
-glutin-winit.workspace = true
-libc.workspace = true
+egui = { workspace = true, optional = true }
+egui_glow = { workspace = true, optional = true }
+glow = { workspace = true, optional = true }
+glutin = { workspace = true, optional = true }
+glutin-winit = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
 snolc = { path = "../../crates/snolc" }
 thiserror.workspace = true
 toml.workspace = true
-winit.workspace = true
+winit = { workspace = true, optional = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
-winit = { workspace = true, features = ["wayland", "wayland-dlopen", "x11"] }
+egui-winit = { workspace = true, optional = true, features = ["clipboard", "links", "wayland", "x11"] }
+winit = { workspace = true, optional = true, features = ["wayland", "wayland-dlopen", "x11"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-egui-winit = { workspace = true, features = ["android-native-activity"] }
-jni.workspace = true
-winit = { workspace = true, features = ["android-native-activity"] }
+egui-winit = { workspace = true, optional = true, features = ["android-native-activity"] }
+jni = { workspace = true, optional = true }
+winit = { workspace = true, optional = true, features = ["android-native-activity"] }
 
 [[bin]]
 name = "snolcNG"
 path = "src/main.rs"
+required-features = ["gui"]

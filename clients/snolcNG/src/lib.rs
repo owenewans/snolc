@@ -12,10 +12,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 mod android;
+#[cfg(feature = "gui")]
 pub mod native_ui;
 pub mod runtime;
+#[cfg(feature = "gui")]
 pub mod ui;
 
 pub const MAX_PROFILE_BYTES: usize = 65_536;
