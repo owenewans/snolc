@@ -8,7 +8,7 @@ mod pump;
 
 pub use handles::{HandleError, HandleTable, TypedHandle};
 pub use io::{ByteIo, DatagramIo, DatagramRecv};
-pub use module_io::{ForeignByteIo, ForeignIoError};
+pub use module_io::{ForeignByteIo, ForeignDatagramIo, ForeignIoError};
 pub use pump::{Pump, PumpError, PumpReport};
 pub use snolc_abi as abi;
 

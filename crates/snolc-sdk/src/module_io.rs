@@ -4,8 +4,11 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use crate::ByteIo;
-use crate::abi::{self, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolIoResult, SnolWakeHandle};
+use crate::{ByteIo, DatagramIo, DatagramRecv};
+use crate::abi::{
+    self, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolDatagramIoV1, SnolIoResult,
+    SnolWakeHandle,
+};
 
 pub struct ForeignByteIo {
     handle: u64,
@@ -115,6 +118,132 @@ impl Drop for ForeignByteIo {
     }
 }
 
+pub struct ForeignDatagramIo {
+    handle: u64,
+    table: NonNull<SnolDatagramIoV1>,
+    closed: bool,
+    not_send: PhantomData<Rc<()>>,
+}
+
+impl ForeignDatagramIo {
+    /// # Safety
+    ///
+    /// `table` must remain valid until this object is dropped, and `handle` must
+    /// belong to that table.
+    pub unsafe fn from_raw(
+        handle: u64,
+        table: *const SnolDatagramIoV1,
+    ) -> Result<Self, ForeignIoError> {
+        let table = NonNull::new(table.cast_mut()).ok_or(ForeignIoError::Table)?;
+        let value = unsafe { table.as_ref() };
+        if handle == 0
+            || value.struct_size < size_of::<SnolDatagramIoV1>() as u32
+            || value.reserved != 0
+            || value.recv_datagram.is_none()
+            || value.send_datagram.is_none()
+            || value.close.is_none()
+        {
+            return Err(ForeignIoError::Table);
+        }
+        Ok(Self {
+            handle,
+            table,
+            closed: false,
+            not_send: PhantomData,
+        })
+    }
+
+    fn table(&self) -> &SnolDatagramIoV1 {
+        unsafe { self.table.as_ref() }
+    }
+}
+
+impl DatagramIo for ForeignDatagramIo {
+    fn poll_recv_datagram(
+        &mut self,
+        _context: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<DatagramRecv>> {
+        let recv = self.table().recv_datagram.expect("validated table");
+        let result = unsafe {
+            recv(
+                self.handle,
+                SnolBytesMut {
+                    pointer: output.as_mut_ptr(),
+                    length: output.len(),
+                },
+                no_wake(),
+            )
+        };
+        match result.tag {
+            abi::IO_PROGRESS if result.code == abi::STATUS_OK && result.count <= output.len() => {
+                Poll::Ready(Ok(DatagramRecv::Datagram(result.count)))
+            }
+            abi::IO_BUFFER_TOO_SMALL if result.code == abi::STATUS_OK => {
+                Poll::Ready(Ok(DatagramRecv::BufferTooSmall(result.count)))
+            }
+            abi::IO_PENDING if result.code == abi::STATUS_OK && result.count == 0 => Poll::Pending,
+            abi::IO_EOF if result.code == abi::STATUS_OK && result.count == 0 => {
+                Poll::Ready(Ok(DatagramRecv::Closed))
+            }
+            abi::IO_ERROR if result.count == 0 => Poll::Ready(Err(status_error(result.code))),
+            _ => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "foreign module returned an invalid datagram result",
+            ))),
+        }
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        _context: &mut Context<'_>,
+        datagram: &[u8],
+    ) -> Poll<io::Result<()>> {
+        let send = self.table().send_datagram.expect("validated table");
+        let result = unsafe {
+            send(
+                self.handle,
+                SnolBytes {
+                    pointer: datagram.as_ptr(),
+                    length: datagram.len(),
+                },
+                no_wake(),
+            )
+        };
+        match result.tag {
+            abi::IO_PROGRESS if result.code == abi::STATUS_OK && result.count == datagram.len() => {
+                Poll::Ready(Ok(()))
+            }
+            abi::IO_PENDING if result.code == abi::STATUS_OK && result.count == 0 => Poll::Pending,
+            abi::IO_ERROR if result.count == 0 => Poll::Ready(Err(status_error(result.code))),
+            _ => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "foreign module returned an invalid datagram result",
+            ))),
+        }
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let close = self.table().close.expect("validated table");
+        let status = unsafe { close(self.handle) };
+        self.closed = true;
+        if status == abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(status_error(status))
+        }
+    }
+}
+
+impl Drop for ForeignDatagramIo {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 fn no_wake() -> SnolWakeHandle {
     SnolWakeHandle {
         context: std::ptr::null_mut(),
@@ -204,6 +333,26 @@ mod tests {
         close: Some(close),
     };
 
+    unsafe extern "C" fn recv_datagram(
+        _: u64,
+        output: SnolBytesMut,
+        _: SnolWakeHandle,
+    ) -> SnolIoResult {
+        if output.length < 3 {
+            return SnolIoResult::buffer_too_small(3);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(b"udp".as_ptr(), output.pointer, 3) };
+        SnolIoResult::progress(3)
+    }
+
+    static DATAGRAM_TABLE: SnolDatagramIoV1 = SnolDatagramIoV1 {
+        struct_size: size_of::<SnolDatagramIoV1>() as u32,
+        reserved: 0,
+        recv_datagram: Some(recv_datagram),
+        send_datagram: Some(write),
+        close: Some(close),
+    };
+
     #[test]
     fn delegates_and_closes_owned_handle() {
         CLOSED.store(false, Ordering::Release);
@@ -220,6 +369,30 @@ mod tests {
             Poll::Ready(Ok(3))
         ));
         drop(io);
+        assert!(CLOSED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn datagram_wrapper_preserves_atomic_boundaries() {
+        CLOSED.store(false, Ordering::Release);
+        let mut io = unsafe { ForeignDatagramIo::from_raw(1, &DATAGRAM_TABLE) }.unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        let mut small = [0; 2];
+        assert!(matches!(
+            io.poll_recv_datagram(&mut context, &mut small),
+            Poll::Ready(Ok(DatagramRecv::BufferTooSmall(3)))
+        ));
+        let mut output = [0; 3];
+        assert!(matches!(
+            io.poll_recv_datagram(&mut context, &mut output),
+            Poll::Ready(Ok(DatagramRecv::Datagram(3)))
+        ));
+        assert_eq!(&output, b"udp");
+        assert!(matches!(
+            io.poll_send_datagram(&mut context, b"reply"),
+            Poll::Ready(Ok(()))
+        ));
+        io.close().unwrap();
         assert!(CLOSED.load(Ordering::Acquire));
     }
 }
