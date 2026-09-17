@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{BackendError, Database, Durability, ReadableDatabase, StorageBackend, TableDefinition};
 use thiserror::Error;
@@ -39,6 +40,10 @@ enum Command {
         limit: usize,
         response: SyncSender<ScanResult>,
     },
+    Backup {
+        destination: PathBuf,
+        response: SyncSender<Result<(), StorageError>>,
+    },
     Stop {
         response: SyncSender<()>,
     },
@@ -61,24 +66,11 @@ impl StorageWorker {
             return Err(StorageError::Invalid);
         }
         prepare_path(&path)?;
-        let backend = LockedFileBackend::open(&path, max_database_bytes)?;
-        let mut builder = Database::builder();
-        builder.set_cache_size(cache_bytes);
-        let database = builder
-            .create_with_backend(backend)
-            .map_err(database_error)?;
-        {
-            let mut transaction = database.begin_write().map_err(transaction_error)?;
-            transaction
-                .set_durability(Durability::Immediate)
-                .map_err(|error| StorageError::Database(error.to_string()))?;
-            transaction.open_table(KV).map_err(table_error)?;
-            transaction.commit().map_err(commit_error)?;
-        }
+        let database = open_database(&path, cache_bytes, max_database_bytes)?;
         let (sender, receiver) = sync_channel(queue_capacity);
         let worker = thread::Builder::new()
             .name("snolc-policy-storage".into())
-            .spawn(move || run(database, receiver))?;
+            .spawn(move || run(database, receiver, path, cache_bytes, max_database_bytes))?;
         Ok(Self {
             sender,
             worker: Some(worker),
@@ -149,6 +141,18 @@ impl StorageWorker {
         Ok(receiver)
     }
 
+    pub fn backup(&self, destination: PathBuf) -> Result<WriteReply, StorageError> {
+        if !destination.is_absolute() {
+            return Err(StorageError::Invalid);
+        }
+        let (response, reply) = sync_channel(1);
+        self.send(Command::Backup {
+            destination,
+            response,
+        })?;
+        Ok(reply)
+    }
+
     pub fn start_shutdown(&mut self) -> Result<(), StorageError> {
         if self.stopping.is_some() {
             return Ok(());
@@ -205,26 +209,36 @@ impl Drop for StorageWorker {
     }
 }
 
-fn run(database: Database, receiver: Receiver<Command>) {
+fn run(
+    database: Database,
+    receiver: Receiver<Command>,
+    path: PathBuf,
+    cache_bytes: usize,
+    max_database_bytes: u64,
+) {
+    let mut database = Some(database);
     let mut stop = None;
     while let Ok(command) = receiver.recv() {
+        let Some(open) = database.as_ref() else {
+            break;
+        };
         match command {
             Command::Get { key, response } => {
-                let _ = response.send(get_value(&database, &key));
+                let _ = response.send(get_value(open, &key));
             }
             Command::Put {
                 key,
                 value,
                 response,
             } => {
-                let result = put_value(&database, &key, &value);
+                let result = put_value(open, &key, &value);
                 let _ = response.send(result);
             }
             Command::Delete { key, response } => {
-                let _ = response.send(delete_value(&database, &key));
+                let _ = response.send(delete_value(open, &key));
             }
             Command::Apply { changes, response } => {
-                let result = apply_values(&database, &changes);
+                let result = apply_values(open, &changes);
                 let _ = response.send(result);
             }
             Command::Scan {
@@ -232,7 +246,23 @@ fn run(database: Database, receiver: Receiver<Command>) {
                 limit,
                 response,
             } => {
-                let _ = response.send(scan_values(&database, &prefix, limit));
+                let _ = response.send(scan_values(open, &prefix, limit));
+            }
+            Command::Backup {
+                destination,
+                response,
+            } => {
+                drop(database.take());
+                let backup =
+                    backup_closed_database(&path, &destination, cache_bytes, max_database_bytes);
+                match open_database(&path, cache_bytes, max_database_bytes) {
+                    Ok(open) => database = Some(open),
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        break;
+                    }
+                }
+                let _ = response.send(backup);
             }
             Command::Stop { response } => {
                 stop = Some(response);
@@ -240,10 +270,134 @@ fn run(database: Database, receiver: Receiver<Command>) {
             }
         }
     }
-    drop(database);
+    drop(database.take());
     if let Some(response) = stop {
         let _ = response.send(());
     }
+}
+
+fn open_database(
+    path: &Path,
+    cache_bytes: usize,
+    max_database_bytes: u64,
+) -> Result<Database, StorageError> {
+    let backend = LockedFileBackend::open(path, max_database_bytes)?;
+    let mut builder = Database::builder();
+    builder.set_cache_size(cache_bytes);
+    let database = builder
+        .create_with_backend(backend)
+        .map_err(database_error)?;
+    let mut transaction = database.begin_write().map_err(transaction_error)?;
+    transaction
+        .set_durability(Durability::Immediate)
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    transaction.open_table(KV).map_err(table_error)?;
+    transaction.commit().map_err(commit_error)?;
+    Ok(database)
+}
+
+fn backup_closed_database(
+    source: &Path,
+    destination: &Path,
+    cache_bytes: usize,
+    max_database_bytes: u64,
+) -> Result<(), StorageError> {
+    if source == destination || destination.exists() {
+        return Err(StorageError::Invalid);
+    }
+    prepare_path(destination)?;
+    let temporary = destination.with_extension(format!(
+        "backup-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StorageError::Invalid)?
+            .as_nanos()
+    ));
+    let result = (|| {
+        copy_private_file(source, &temporary, max_database_bytes)?;
+        verify_database(&temporary, cache_bytes)?;
+        fs::rename(&temporary, destination)?;
+        sync_parent(destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub fn restore_stopped_database(
+    backup: &Path,
+    destination: &Path,
+    cache_bytes: usize,
+    max_database_bytes: u64,
+) -> Result<(), StorageError> {
+    if backup == destination || !backup.is_file() || !destination.is_absolute() {
+        return Err(StorageError::Invalid);
+    }
+    if fs::metadata(backup)?.len() > max_database_bytes {
+        return Err(StorageError::Limit);
+    }
+    verify_database(backup, cache_bytes)?;
+    prepare_path(destination)?;
+    let temporary = destination.with_extension(format!(
+        "restore-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StorageError::Invalid)?
+            .as_nanos()
+    ));
+    let result = (|| {
+        copy_private_file(backup, &temporary, max_database_bytes)?;
+        verify_database(&temporary, cache_bytes)?;
+        fs::rename(&temporary, destination)?;
+        sync_parent(destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn copy_private_file(
+    source: &Path,
+    destination: &Path,
+    max_bytes: u64,
+) -> Result<(), StorageError> {
+    let length = fs::metadata(source)?.len();
+    if length > max_bytes {
+        return Err(StorageError::Limit);
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(destination)?;
+    let mut input = File::open(source)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    Ok(())
+}
+
+fn verify_database(path: &Path, cache_bytes: usize) -> Result<(), StorageError> {
+    let mut builder = Database::builder();
+    builder.set_cache_size(cache_bytes);
+    let database = builder.open_read_only(path).map_err(database_error)?;
+    let transaction = database.begin_read().map_err(transaction_error)?;
+    transaction.open_table(KV).map_err(table_error)?;
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<(), StorageError> {
+    let parent = path.parent().ok_or(StorageError::Invalid)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn get_value(database: &Database, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
@@ -787,6 +941,83 @@ mod tests {
             worker.get("user/01".into()),
             Err(StorageError::Stopped)
         ));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn backup_closes_verifies_and_reopens_the_database() {
+        let path = path();
+        let backup = path.parent().unwrap().join("backup.redb");
+        let worker = StorageWorker::open(path.clone(), 1_048_576, 16_777_216, 4).unwrap();
+        worker
+            .put("user/01".into(), b"before".to_vec())
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        worker
+            .backup(backup.clone())
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        worker
+            .put("user/02".into(), b"after".to_vec())
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        drop(worker);
+
+        let backup_worker = StorageWorker::open(backup.clone(), 1_048_576, 16_777_216, 2).unwrap();
+        assert_eq!(
+            backup_worker
+                .get("user/01".into())
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap(),
+            Some(b"before".to_vec())
+        );
+        assert_eq!(
+            backup_worker
+                .get("user/02".into())
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        drop(backup_worker);
+
+        let restored = path.parent().unwrap().join("restored/policy.redb");
+        restore_stopped_database(&backup, &restored, 1_048_576, 16_777_216).unwrap();
+        let restored_worker = StorageWorker::open(restored, 1_048_576, 16_777_216, 2).unwrap();
+        assert_eq!(
+            restored_worker
+                .get("user/01".into())
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap(),
+            Some(b"before".to_vec())
+        );
+        drop(restored_worker);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_a_corrupt_backup() {
+        let path = path();
+        prepare_path(&path).unwrap();
+        let backup = path.parent().unwrap().join("corrupt.redb");
+        fs::write(&backup, b"not-redb").unwrap();
+        let restored = path.parent().unwrap().join("restored.redb");
+        assert!(matches!(
+            restore_stopped_database(&backup, &restored, 1_048_576, 16_777_216),
+            Err(StorageError::Database(_))
+        ));
+        assert!(!restored.exists());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

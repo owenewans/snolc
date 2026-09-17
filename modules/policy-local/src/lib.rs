@@ -16,7 +16,7 @@ pub use admin::{
 };
 pub use config::Options;
 pub use frame::{FrameDecoder, FrameError, encode_frame};
-pub use storage::{StorageError, StorageWorker};
+pub use storage::{StorageError, StorageWorker, restore_stopped_database};
 
 use admin::{decode_user_record, encode_user_record};
 use std::cell::RefCell;
