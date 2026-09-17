@@ -1,0 +1,67 @@
+name = "owenewans/protection-noise"
+authors = ["Owen Ewans"]
+license = "Unlicense"
+package_version = "0.0.1"
+wire_version = 1
+classes = ["protection"]
+family = "noise"
+roles = ["client", "server"]
+entry = "lib/libsnolc_protection_noise.so"
+toolchain = "1.98.1"
+dependencies = []
+
+[source]
+revision = "dc4432b62ced51953beb662d6879beec2128486d"
+
+[build]
+package = "snolc-protection-noise"
+
+[[templates]]
+role = "client"
+source = "config/templates/modules/noise-client.toml"
+
+[[templates]]
+role = "server"
+source = "config/templates/modules/noise.toml"
+
+[[platforms]]
+target = "x86_64-unknown-linux-gnu"
+roles = ["client", "server"]
+capabilities = ["noise-nk", "confidentiality", "integrity", "peer-authentication"]
+
+[[platforms]]
+target = "aarch64-linux-android"
+roles = ["client", "server"]
+capabilities = ["noise-nk", "confidentiality", "integrity", "peer-authentication"]
+
+[[platforms]]
+target = "armv7-linux-androideabi"
+roles = ["client", "server"]
+capabilities = ["noise-nk", "confidentiality", "integrity", "peer-authentication"]
+
+[[artifacts]]
+target = "x86_64-unknown-linux-gnu"
+minimum_isa = "x86-64"
+minimum_libc = "2.28"
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-noise-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
+byte_size = 397574
+sha256 = "4a296d5f19052eb43d529f893e1d58b20d5ebf742ade59826a8b17b8e3084609"
+build_output = "release/libsnolc_protection_noise.so"
+
+[[artifacts]]
+target = "aarch64-linux-android"
+minimum_isa = "armv8-a"
+minimum_android_api = 24
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-noise-0.0.1-aarch64-linux-android.tar.gz"
+byte_size = 367961
+sha256 = "85fed5799100f5163937a8a56160f2cbafa26aeef151b336760f238e23fa06f2"
+build_output = "aarch64-linux-android/release/libsnolc_protection_noise.so"
+
+[[artifacts]]
+target = "armv7-linux-androideabi"
+minimum_isa = "armv7-a"
+minimum_android_api = 24
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-noise-0.0.1-armv7-linux-androideabi.tar.gz"
+byte_size = 358504
+sha256 = "7057a3722602953d91f4ffcbb694faca3393ba3874a05a40a7171c3a5ad0d500"
+build_output = "armv7-linux-androideabi/release/libsnolc_protection_noise.so"

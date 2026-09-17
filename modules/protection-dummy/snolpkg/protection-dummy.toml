@@ -1,0 +1,67 @@
+name = "owenewans/protection-dummy"
+authors = ["Owen Ewans"]
+license = "Unlicense"
+package_version = "0.0.1"
+wire_version = 1
+classes = ["protection"]
+family = "dummy"
+roles = ["client", "server"]
+entry = "lib/libsnolc_protection_dummy.so"
+toolchain = "1.98.1"
+dependencies = []
+
+[source]
+revision = "dc4432b62ced51953beb662d6879beec2128486d"
+
+[build]
+package = "snolc-protection-dummy"
+
+[[templates]]
+role = "client"
+source = "config/templates/modules/protection-dummy.toml"
+
+[[templates]]
+role = "server"
+source = "config/templates/modules/protection-dummy-server.toml"
+
+[[platforms]]
+target = "x86_64-unknown-linux-gnu"
+roles = ["client", "server"]
+capabilities = ["byte-io"]
+
+[[platforms]]
+target = "aarch64-linux-android"
+roles = ["client", "server"]
+capabilities = ["byte-io"]
+
+[[platforms]]
+target = "armv7-linux-androideabi"
+roles = ["client", "server"]
+capabilities = ["byte-io"]
+
+[[artifacts]]
+target = "x86_64-unknown-linux-gnu"
+minimum_isa = "x86-64"
+minimum_libc = "2.28"
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-dummy-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
+byte_size = 235950
+sha256 = "0eb1b0b66cded7b1103dca7b583bb873b1bdb0340bbcdd8c319910c49323cb3a"
+build_output = "release/libsnolc_protection_dummy.so"
+
+[[artifacts]]
+target = "aarch64-linux-android"
+minimum_isa = "armv8-a"
+minimum_android_api = 24
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-dummy-0.0.1-aarch64-linux-android.tar.gz"
+byte_size = 233985
+sha256 = "40f40d00329d4d1a8bd4dcf70b173cdf616a335439e60c9371fd612757fd7ee3"
+build_output = "aarch64-linux-android/release/libsnolc_protection_dummy.so"
+
+[[artifacts]]
+target = "armv7-linux-androideabi"
+minimum_isa = "armv7-a"
+minimum_android_api = 24
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-dummy-0.0.1-armv7-linux-androideabi.tar.gz"
+byte_size = 208894
+sha256 = "75e372105828ab5bdbd3066bfa7ad11ac746abd3ec25d621e627c8fbb0e899ee"
+build_output = "armv7-linux-androideabi/release/libsnolc_protection_dummy.so"

@@ -1401,6 +1401,45 @@ build_output = "release/libsnolc_carrier_tcp.so"
     }
 
     #[test]
+    fn official_manifests_are_complete_and_signed() {
+        let sources =
+            Sources::parse(include_str!("../../../config/packages/sources.toml")).unwrap();
+        let source = sources
+            .find("https://github.com/owenewans/snolc.git")
+            .unwrap();
+        macro_rules! verify {
+            ($module:literal) => {{
+                let manifest = include_bytes!(concat!(
+                    "../../../modules/",
+                    $module,
+                    "/snolpkg/",
+                    $module,
+                    ".toml"
+                ));
+                let signature = include_bytes!(concat!(
+                    "../../../modules/",
+                    $module,
+                    "/snolpkg/",
+                    $module,
+                    ".toml.sig"
+                ));
+                PublicationManifest::parse(manifest).unwrap();
+                verify_manifest(manifest, signature, source).unwrap();
+            }};
+        }
+        verify!("adapter-tun");
+        verify!("adapter-socks5");
+        verify!("adapter-http-connect");
+        verify!("adapter-direct");
+        verify!("protection-dummy");
+        verify!("protection-noise");
+        verify!("carrier-tcp");
+        verify!("carrier-ssh");
+        verify!("policy-dummy");
+        verify!("policy-local");
+    }
+
+    #[test]
     fn verifies_signature_over_original_manifest_bytes() {
         let signing = SigningKey::from_bytes(&[7; 32]);
         let key = signing.verifying_key().to_bytes();

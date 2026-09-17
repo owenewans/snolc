@@ -1,0 +1,5 @@
+[[sources]]
+id = "owenewans"
+git = "https://github.com/owenewans/snolc.git"
+trust = "signed"
+public_key = "937ac7eff4f441f529fa283084dffd28d3e182b7ab5249178c381f69d16fdb9f"

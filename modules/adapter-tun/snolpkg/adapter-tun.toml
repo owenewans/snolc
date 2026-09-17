@@ -1,0 +1,63 @@
+name = "owenewans/adapter-tun"
+authors = ["Owen Ewans"]
+license = "Unlicense"
+package_version = "0.0.1"
+wire_version = 1
+classes = ["adapter"]
+family = "tun"
+roles = ["client"]
+entry = "lib/libsnolc_adapter_tun.so"
+toolchain = "1.98.1"
+dependencies = []
+
+[source]
+revision = "dc4432b62ced51953beb662d6879beec2128486d"
+
+[build]
+package = "snolc-adapter-tun"
+
+[[templates]]
+role = "client"
+source = "config/templates/modules/tun-linux.toml"
+
+[[platforms]]
+target = "x86_64-unknown-linux-gnu"
+roles = ["client"]
+capabilities = ["tun", "packet-port"]
+
+[[platforms]]
+target = "aarch64-linux-android"
+roles = ["client"]
+capabilities = ["tun", "packet-port"]
+
+[[platforms]]
+target = "armv7-linux-androideabi"
+roles = ["client"]
+capabilities = ["tun", "packet-port"]
+
+[[artifacts]]
+target = "x86_64-unknown-linux-gnu"
+minimum_isa = "x86-64"
+minimum_libc = "2.28"
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-tun-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
+byte_size = 292011
+sha256 = "ccbdf0da2d534d24b6c656a80cc1b0a2bf5de169f46b08f9cb0d045e648d83aa"
+build_output = "release/libsnolc_adapter_tun.so"
+
+[[artifacts]]
+target = "aarch64-linux-android"
+minimum_isa = "armv8-a"
+minimum_android_api = 24
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-tun-0.0.1-aarch64-linux-android.tar.gz"
+byte_size = 287324
+sha256 = "cf01aa831a59c348b8a74df190274963db8dad71b4652f52cdf2e1ecf1a00cc7"
+build_output = "aarch64-linux-android/release/libsnolc_adapter_tun.so"
+
+[[artifacts]]
+target = "armv7-linux-androideabi"
+minimum_isa = "armv7-a"
+minimum_android_api = 24
+url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-tun-0.0.1-armv7-linux-androideabi.tar.gz"
+byte_size = 258334
+sha256 = "53d38f7ea5dbd1a07a58cd72cb36ac251043f6c06b37f28e97ea9389e87b0e4a"
+build_output = "armv7-linux-androideabi/release/libsnolc_adapter_tun.so"
