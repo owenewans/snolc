@@ -8,6 +8,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod ui;
+
 pub const MAX_PROFILE_BYTES: usize = 65_536;
 pub const MAX_SUBSCRIPTION_BYTES: usize = 1_048_576;
 pub const MAX_SUBSCRIPTION_PROFILES: usize = 64;

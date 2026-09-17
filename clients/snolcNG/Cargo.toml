@@ -10,11 +10,18 @@ repository.workspace = true
 
 [dependencies]
 base64.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+egui_glow.workspace = true
+glow.workspace = true
+glutin.workspace = true
+glutin-winit.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 snolc = { path = "../../crates/snolc" }
 thiserror.workspace = true
 toml.workspace = true
+winit.workspace = true
 
 [[bin]]
 name = "snolcNG"
