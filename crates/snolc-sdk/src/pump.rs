@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 
 use thiserror::Error;
 
-use crate::ByteIo;
+use crate::{ByteIo, DatagramIo, DatagramRecv};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PumpReport {
@@ -18,6 +18,76 @@ pub struct Pump {
     end: usize,
     source_eof: bool,
     destination_shutdown: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DatagramPumpReport {
+    pub received: usize,
+    pub sent: usize,
+    pub finished: bool,
+}
+
+pub struct DatagramPump {
+    buffer: Vec<u8>,
+    pending: Option<usize>,
+    source_closed: bool,
+}
+
+impl DatagramPump {
+    pub fn new(max_datagram_bytes: usize) -> Result<Self, PumpError> {
+        if max_datagram_bytes == 0 {
+            return Err(PumpError::ZeroCapacity);
+        }
+        Ok(Self {
+            buffer: vec![0; max_datagram_bytes],
+            pending: None,
+            source_closed: false,
+        })
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.unwrap_or(0)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.source_closed && self.pending.is_none()
+    }
+
+    pub fn poll<S: DatagramIo + ?Sized, D: DatagramIo + ?Sized>(
+        &mut self,
+        context: &mut Context<'_>,
+        source: &mut S,
+        destination: &mut D,
+    ) -> Poll<Result<DatagramPumpReport, PumpError>> {
+        let mut report = DatagramPumpReport::default();
+        if self.pending.is_none() && !self.source_closed {
+            match source.poll_recv_datagram(context, &mut self.buffer) {
+                Poll::Ready(Ok(DatagramRecv::Datagram(length))) if length <= self.buffer.len() => {
+                    self.pending = Some(length);
+                    report.received = length;
+                }
+                Poll::Ready(Ok(DatagramRecv::BufferTooSmall(required))) => {
+                    return Poll::Ready(Err(PumpError::DatagramTooLarge(required)));
+                }
+                Poll::Ready(Ok(DatagramRecv::Closed)) => self.source_closed = true,
+                Poll::Ready(Ok(_)) => return Poll::Ready(Err(PumpError::InvalidDatagram)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(PumpError::Io(error))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if let Some(length) = self.pending {
+            match destination.poll_send_datagram(context, &self.buffer[..length]) {
+                Poll::Ready(Ok(())) => {
+                    self.pending = None;
+                    report.sent = length;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(PumpError::Io(error))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        report.finished = self.is_finished();
+        Poll::Ready(Ok(report))
+    }
 }
 
 impl Pump {
@@ -116,6 +186,10 @@ pub enum PumpError {
     Io(#[from] io::Error),
     #[error("writer returned zero for a nonempty buffer")]
     WriteZero,
+    #[error("datagram requires {0} bytes, exceeding the pump buffer")]
+    DatagramTooLarge(usize),
+    #[error("datagram I/O returned an invalid length")]
+    InvalidDatagram,
 }
 
 #[cfg(test)]
@@ -132,6 +206,48 @@ mod tests {
         max_write: usize,
         pending_write: bool,
         shutdown: bool,
+    }
+
+    #[derive(Default)]
+    struct MemoryDatagram {
+        input: VecDeque<Vec<u8>>,
+        output: Vec<Vec<u8>>,
+        pending_send: bool,
+    }
+
+    impl DatagramIo for MemoryDatagram {
+        fn poll_recv_datagram(
+            &mut self,
+            _context: &mut Context<'_>,
+            output: &mut [u8],
+        ) -> Poll<io::Result<DatagramRecv>> {
+            let Some(datagram) = self.input.front() else {
+                return Poll::Pending;
+            };
+            if output.len() < datagram.len() {
+                return Poll::Ready(Ok(DatagramRecv::BufferTooSmall(datagram.len())));
+            }
+            let datagram = self.input.pop_front().expect("front checked");
+            output[..datagram.len()].copy_from_slice(&datagram);
+            Poll::Ready(Ok(DatagramRecv::Datagram(datagram.len())))
+        }
+
+        fn poll_send_datagram(
+            &mut self,
+            _context: &mut Context<'_>,
+            datagram: &[u8],
+        ) -> Poll<io::Result<()>> {
+            if self.pending_send {
+                self.pending_send = false;
+                return Poll::Pending;
+            }
+            self.output.push(datagram.to_vec());
+            Poll::Ready(Ok(()))
+        }
+
+        fn close(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl ByteIo for MemoryIo {
@@ -232,5 +348,35 @@ mod tests {
             pump.poll(&mut context, &mut source, &mut destination, 1),
             Poll::Ready(Err(PumpError::WriteZero))
         ));
+    }
+
+    #[test]
+    fn datagram_pump_keeps_one_atomic_payload_under_backpressure() {
+        let payload = vec![5; 65_507];
+        let mut source = MemoryDatagram {
+            input: [Vec::new(), payload.clone()].into(),
+            ..MemoryDatagram::default()
+        };
+        let mut destination = MemoryDatagram {
+            pending_send: true,
+            ..MemoryDatagram::default()
+        };
+        let mut pump = DatagramPump::new(65_507).unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            pump.poll(&mut context, &mut source, &mut destination),
+            Poll::Pending
+        ));
+        assert_eq!(pump.pending_bytes(), 0);
+        assert!(matches!(
+            pump.poll(&mut context, &mut source, &mut destination),
+            Poll::Ready(Ok(DatagramPumpReport { sent: 0, .. }))
+        ));
+        assert_eq!(destination.output, [Vec::<u8>::new()]);
+        assert!(matches!(
+            pump.poll(&mut context, &mut source, &mut destination),
+            Poll::Ready(Ok(DatagramPumpReport { sent: 65_507, .. }))
+        ));
+        assert_eq!(destination.output[1], payload);
     }
 }
