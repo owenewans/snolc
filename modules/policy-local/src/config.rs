@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn normative_template_is_valid() {
-        let module = include_str!("../../../config/templates/policy-local-server.toml");
+        let module = include_str!("../../../config/templates/modules/policy.toml");
         let value: toml::Value = toml::from_str(module).unwrap();
         let options = toml::to_string(value.get("options").unwrap()).unwrap();
         let parsed = Options::parse(options.as_bytes(), Path::new("/etc/snolc/modules")).unwrap();
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn client_secret_is_explicit_and_redacted() {
-        let module = include_str!("../../../config/templates/policy-local-server.toml");
+        let module = include_str!("../../../config/templates/modules/policy.toml");
         let mut value: toml::Value = toml::from_str(module).unwrap();
         let client: toml::Value = toml::from_str(
             "[client.credential]\nsource = \"toml\"\nvalue = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",

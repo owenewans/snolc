@@ -1,0 +1,7 @@
+wire_version = 1
+instance = "policy-main"
+package = "owenewans/policy-dummy@0.0.1"
+role = "client"
+
+[options]
+pump_buffer_bytes = 16384

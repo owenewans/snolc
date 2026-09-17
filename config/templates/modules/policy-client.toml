@@ -1,7 +1,7 @@
 wire_version = 1
 instance = "policy-main"
 package = "owenewans/policy-local@0.0.1"
-role = "server"
+role = "client"
 
 [options]
 server_id = "node-1"
@@ -17,7 +17,7 @@ on_unknown_protocol = "allow"
 checkpoint_interval_ms = 5000
 
 [options.storage]
-path = "../../state/policy.redb"
+path = "../../../state/policy-client.redb"
 cache_bytes = 4194304
 max_database_bytes = 134217728
 queue_capacity = 64
@@ -30,3 +30,7 @@ mode = "unlimited"
 [options.rules]
 terminal = "allow"
 entries = []
+
+[options.client.credential]
+source = "env"
+name = "SNOLC_CREDENTIAL"

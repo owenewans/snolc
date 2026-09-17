@@ -1,0 +1,8 @@
+wire_version = 1
+instance = "noise-main"
+package = "owenewans/protection-noise@0.0.1"
+role = "server"
+
+[options]
+mode = "server"
+private_key_file = "../../keys/noise-private.hex"

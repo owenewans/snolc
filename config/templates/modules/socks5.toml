@@ -1,0 +1,11 @@
+wire_version = 1
+instance = "socks5-main"
+package = "owenewans/adapter-socks5@0.0.1"
+role = "client"
+
+[options]
+listen = "127.0.0.1:1080"
+max_connections = 16
+max_udp_associations = 8
+max_request_bytes = 1024
+reject_fragments = true

@@ -439,6 +439,11 @@ mod tests {
     #[test]
     fn low_memory_template_is_valid() {
         Config::parse(TEMPLATE, Path::new("/etc/snolc")).unwrap();
+        Config::parse(
+            include_str!("../../../config/templates/snolc-client-low-memory.toml"),
+            Path::new("/etc/snolc"),
+        )
+        .unwrap();
     }
 
     #[test]

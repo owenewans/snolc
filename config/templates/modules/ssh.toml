@@ -1,0 +1,18 @@
+wire_version = 1
+instance = "ssh-main"
+package = "owenewans/carrier-ssh@0.0.1"
+role = "server"
+
+[options]
+mode = "listen"
+endpoint_ip = "0.0.0.0:22"
+username = "snolc"
+host_key = "../../keys/ssh-host-private"
+max_connections = 2
+queue_chunks = 8
+chunk_bytes = 16384
+inactivity_timeout_ms = 30000
+
+[options.auth]
+mode = "ed25519"
+public_key = "../../keys/ssh-client-public"

@@ -132,9 +132,9 @@ mod tests {
     #[test]
     fn policy_template_is_valid() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/templates/policy-local-server.toml");
+            .join("../../config/templates/modules/policy.toml");
         let config = ModuleConfig::parse(
-            include_str!("../../../config/templates/policy-local-server.toml"),
+            include_str!("../../../config/templates/modules/policy.toml"),
             &path,
         )
         .unwrap();
@@ -144,6 +144,77 @@ mod tests {
                 .unwrap()
                 .contains("node-1")
         );
+    }
+
+    #[test]
+    fn official_module_templates_use_the_runtime_schema() {
+        for (name, input) in [
+            (
+                "direct.toml",
+                include_str!("../../../config/templates/modules/direct.toml"),
+            ),
+            (
+                "socks5.toml",
+                include_str!("../../../config/templates/modules/socks5.toml"),
+            ),
+            (
+                "http-connect.toml",
+                include_str!("../../../config/templates/modules/http-connect.toml"),
+            ),
+            (
+                "tun-linux.toml",
+                include_str!("../../../config/templates/modules/tun-linux.toml"),
+            ),
+            (
+                "tun-android.toml",
+                include_str!("../../../config/templates/modules/tun-android.toml"),
+            ),
+            (
+                "protection-dummy.toml",
+                include_str!("../../../config/templates/modules/protection-dummy.toml"),
+            ),
+            (
+                "noise.toml",
+                include_str!("../../../config/templates/modules/noise.toml"),
+            ),
+            (
+                "noise-client.toml",
+                include_str!("../../../config/templates/modules/noise-client.toml"),
+            ),
+            (
+                "tcp.toml",
+                include_str!("../../../config/templates/modules/tcp.toml"),
+            ),
+            (
+                "tcp-client.toml",
+                include_str!("../../../config/templates/modules/tcp-client.toml"),
+            ),
+            (
+                "ssh.toml",
+                include_str!("../../../config/templates/modules/ssh.toml"),
+            ),
+            (
+                "ssh-client.toml",
+                include_str!("../../../config/templates/modules/ssh-client.toml"),
+            ),
+            (
+                "policy-dummy.toml",
+                include_str!("../../../config/templates/modules/policy-dummy.toml"),
+            ),
+            (
+                "policy.toml",
+                include_str!("../../../config/templates/modules/policy.toml"),
+            ),
+            (
+                "policy-client.toml",
+                include_str!("../../../config/templates/modules/policy-client.toml"),
+            ),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config/templates/modules")
+                .join(name);
+            ModuleConfig::parse(input, &path).unwrap();
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use snolc::config::Config;
 use snolc::loader::LoadedModule;
+use snolc::module_config::ModuleConfig;
 use snolc::{Engine, Event, Host, Lifecycle, PlatformEvent};
 use snow::{Builder, params::NoiseParams};
 
@@ -26,6 +27,108 @@ struct QuietHost;
 
 impl Host for QuietHost {
     fn engine_event(&self, _event: &Event) {}
+}
+
+#[test]
+fn official_module_templates_pass_native_validation() {
+    let root = std::env::temp_dir().join(format!(
+        "snolc-module-templates-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let ssh_private = root.join("ssh-private");
+    let ssh_public = root.join("ssh-public");
+    let private = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    fs::write(
+        &ssh_private,
+        private.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    fs::write(&ssh_public, private.public_key().to_openssh().unwrap()).unwrap();
+    let noise_private = root.join("noise-private");
+    let noise_public = root.join("noise-public");
+    fs::write(&noise_private, [7; 32]).unwrap();
+    fs::write(&noise_public, [9; 32]).unwrap();
+    let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/templates/modules");
+    for (file, library) in [
+        ("direct.toml", "adapter_direct"),
+        ("socks5.toml", "adapter_socks5"),
+        ("http-connect.toml", "adapter_http_connect"),
+        ("tun-linux.toml", "adapter_tun"),
+        ("tun-android.toml", "adapter_tun"),
+        ("protection-dummy.toml", "protection_dummy"),
+        ("noise.toml", "protection_noise"),
+        ("noise-client.toml", "protection_noise"),
+        ("tcp.toml", "carrier_tcp"),
+        ("tcp-client.toml", "carrier_tcp"),
+        ("ssh.toml", "carrier_ssh"),
+        ("ssh-client.toml", "carrier_ssh"),
+        ("policy-dummy.toml", "policy_dummy"),
+        ("policy.toml", "policy_local"),
+        ("policy-client.toml", "policy_local"),
+    ] {
+        let path = templates.join(file);
+        let input = fs::read_to_string(&path).unwrap();
+        let mut config = ModuleConfig::parse(&input, &path).unwrap();
+        match file {
+            "noise.toml" => {
+                config.options.insert(
+                    "private_key_file".into(),
+                    noise_private.to_string_lossy().into_owned().into(),
+                );
+            }
+            "noise-client.toml" => {
+                config.options.insert(
+                    "server_public_key_file".into(),
+                    noise_public.to_string_lossy().into_owned().into(),
+                );
+            }
+            "ssh.toml" => {
+                config.options.insert(
+                    "host_key".into(),
+                    ssh_private.to_string_lossy().into_owned().into(),
+                );
+                config.options["auth"].as_table_mut().unwrap().insert(
+                    "public_key".into(),
+                    ssh_public.to_string_lossy().into_owned().into(),
+                );
+            }
+            "ssh-client.toml" => {
+                config.options.insert(
+                    "server_host_key".into(),
+                    ssh_public.to_string_lossy().into_owned().into(),
+                );
+                config.options["auth"].as_table_mut().unwrap().insert(
+                    "private_key".into(),
+                    ssh_private.to_string_lossy().into_owned().into(),
+                );
+            }
+            "policy-client.toml" => {
+                config.options["client"]["credential"] = toml::Value::Table(
+                    [
+                        ("source".into(), "toml".into()),
+                        ("value".into(), "00".repeat(32).into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+            }
+            _ => {}
+        }
+        LoadedModule::load(
+            format!("template-{file}"),
+            &module_library(library),
+            config.options_toml().unwrap(),
+            &config.base_directory,
+            &path,
+        )
+        .unwrap_or_else(|error| panic!("{file}: {error}"));
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1351,7 +1454,7 @@ fn build_side_with_modules(
 }
 
 fn policy_local_options(path: &Path, credential: Option<&str>) -> String {
-    let template = include_str!("../../../config/templates/policy-local-server.toml");
+    let template = include_str!("../../../config/templates/modules/policy.toml");
     let mut template: toml::Value = toml::from_str(template).unwrap();
     template["options"]["storage"]["path"] =
         toml::Value::String(path.to_string_lossy().into_owned());

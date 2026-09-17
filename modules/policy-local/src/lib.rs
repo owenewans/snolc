@@ -2921,7 +2921,7 @@ mod module_tests {
                 .as_nanos()
         ));
         let database = root.join("policy.redb");
-        let template = include_str!("../../../config/templates/policy-local-server.toml");
+        let template = include_str!("../../../config/templates/modules/policy.toml");
         let mut template: toml::Value = toml::from_str(template).unwrap();
         template["options"]["storage"]["path"] =
             toml::Value::String(database.to_string_lossy().into_owned());

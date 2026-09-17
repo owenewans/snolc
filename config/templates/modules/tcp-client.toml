@@ -1,0 +1,10 @@
+wire_version = 1
+instance = "tcp-main"
+package = "owenewans/carrier-tcp@0.0.1"
+role = "client"
+
+[options]
+mode = "connect"
+endpoint_ip = "203.0.113.1:443"
+max_connections = 2
+nodelay = true
