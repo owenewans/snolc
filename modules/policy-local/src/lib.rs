@@ -5,6 +5,7 @@ mod admin;
 mod config;
 mod frame;
 mod service;
+mod sniff;
 mod storage;
 
 pub use accounting::{QuotaAccount, QuotaError, TokenBucket};
@@ -20,6 +21,7 @@ pub use storage::{StorageError, StorageWorker};
 use admin::{decode_user_record, encode_user_record};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -31,12 +33,13 @@ use snolc_sdk::abi::{
     self, SnolByteIoV1, SnolBytes, SnolDatagramIoV1, SnolPolicyApiV1, SnolWakeHandle,
 };
 use snolc_sdk::{
-    ByteIo, DatagramIo, DatagramPump, DatagramPumpReport, ForeignByteIo, ForeignDatagramIo, Pump,
-    PumpError, PumpReport,
+    ByteIo, DatagramIo, DatagramPump, DatagramPumpReport, DatagramRecv, ForeignByteIo,
+    ForeignDatagramIo, Pump, PumpError, PumpReport,
 };
 use zeroize::Zeroize;
 
 use service::{ClientRequest, SessionChannel};
+use sniff::{Classification, Observed};
 
 const MAX_UDP_PAYLOAD: usize = 65_507;
 
@@ -127,6 +130,23 @@ struct PolicySession {
 struct FlowIdentity {
     user_id: String,
     credential_digest: Option<String>,
+    sniff: Option<SniffPolicy>,
+}
+
+#[derive(Clone)]
+struct SniffPolicy {
+    entries: Vec<config::RuleEntry>,
+    terminal: config::Action,
+    unknown: config::UnknownAction,
+    max_bytes: usize,
+    timeout: Duration,
+}
+
+struct TcpSniff {
+    policy: SniffPolicy,
+    prefix: Vec<u8>,
+    deadline: Instant,
+    allowed: bool,
 }
 
 enum AuthState {
@@ -198,6 +218,8 @@ struct PolicyFlow<S, M> {
     mux: M,
     upload: Pump,
     download: Pump,
+    sniff: Option<TcpSniff>,
+    prefix_offset: usize,
 }
 
 struct PolicyDatagramFlow<S, M> {
@@ -205,9 +227,61 @@ struct PolicyDatagramFlow<S, M> {
     user_id: Option<String>,
     credential_digest: Option<String>,
     stack: S,
-    mux: M,
+    mux: DatagramSniff<M>,
     upload: DatagramPump,
     download: DatagramPump,
+}
+
+struct DatagramSniff<M> {
+    inner: M,
+    policy: Option<SniffPolicy>,
+}
+
+impl<M> DatagramSniff<M> {
+    fn new(inner: M, policy: Option<SniffPolicy>) -> Self {
+        Self { inner, policy }
+    }
+}
+
+impl<M: DatagramIo> DatagramIo for DatagramSniff<M> {
+    fn poll_recv_datagram(
+        &mut self,
+        context: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<DatagramRecv>> {
+        match self.inner.poll_recv_datagram(context, output) {
+            Poll::Ready(Ok(DatagramRecv::Datagram(length))) if length <= output.len() => {
+                if let Some(policy) = &self.policy {
+                    let prefix = &output[..length.min(policy.max_bytes)];
+                    if !observed_allowed(policy, &sniff::classify_udp(prefix)) {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "observed protocol denied",
+                        )));
+                    }
+                    self.policy = None;
+                }
+                Poll::Ready(Ok(DatagramRecv::Datagram(length)))
+            }
+            Poll::Ready(Ok(DatagramRecv::Datagram(_))) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "datagram I/O returned an invalid length",
+            ))),
+            result => result,
+        }
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        context: &mut Context<'_>,
+        datagram: &[u8],
+    ) -> Poll<io::Result<()>> {
+        self.inner.poll_send_datagram(context, datagram)
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        self.inner.close()
+    }
 }
 
 impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
@@ -218,6 +292,7 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
         session: u64,
         user_id: Option<String>,
         credential_digest: Option<String>,
+        sniff: Option<SniffPolicy>,
     ) -> Result<Self, PumpError> {
         Ok(Self {
             session,
@@ -227,6 +302,13 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
             mux,
             upload: Pump::new(buffer_bytes)?,
             download: Pump::new(buffer_bytes)?,
+            sniff: sniff.map(|policy| TcpSniff {
+                prefix: Vec::with_capacity(policy.max_bytes),
+                deadline: Instant::now() + policy.timeout,
+                allowed: false,
+                policy,
+            }),
+            prefix_offset: 0,
         })
     }
 
@@ -237,6 +319,14 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
         max_mux_to_stack: usize,
         max_total: usize,
     ) -> Poll<Result<(PumpReport, PumpReport), PumpError>> {
+        let prefix = match self.poll_sniff(context, max_mux_to_stack.min(max_total)) {
+            Poll::Ready(Ok(report)) => report,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        };
+        if self.sniff.is_some() {
+            return Poll::Ready(Ok((PumpReport::default(), prefix)));
+        }
         let upload = self.upload.poll(
             context,
             &mut self.stack,
@@ -248,23 +338,111 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => PumpReport::default(),
         };
-        let remaining = max_total.saturating_sub(upload.written);
+        let remaining = max_total
+            .saturating_sub(upload.written)
+            .saturating_sub(prefix.written);
         let download = self.download.poll(
             context,
             &mut self.mux,
             &mut self.stack,
             max_mux_to_stack.min(remaining),
         );
-        let download = match download {
+        let mut download = match download {
             Poll::Ready(Ok(report)) => report,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => PumpReport::default(),
         };
+        download.read = download.read.saturating_add(prefix.read);
+        download.written = download.written.saturating_add(prefix.written);
         if upload == PumpReport::default() && download == PumpReport::default() {
             Poll::Pending
         } else {
             Poll::Ready(Ok((upload, download)))
         }
+    }
+
+    fn poll_sniff(
+        &mut self,
+        context: &mut Context<'_>,
+        max_write: usize,
+    ) -> Poll<Result<PumpReport, PumpError>> {
+        let Some(sniff) = &mut self.sniff else {
+            return Poll::Ready(Ok(PumpReport::default()));
+        };
+        if !sniff.allowed {
+            loop {
+                let complete = sniff.prefix.len() >= sniff.policy.max_bytes
+                    || Instant::now() >= sniff.deadline;
+                match sniff::classify_tcp(&sniff.prefix, complete) {
+                    Classification::Complete(observed) => {
+                        if !observed_allowed(&sniff.policy, &observed) {
+                            return Poll::Ready(Err(PumpError::Io(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "observed protocol denied",
+                            ))));
+                        }
+                        sniff.allowed = true;
+                        break;
+                    }
+                    Classification::NeedMore => {}
+                }
+                let remaining = sniff.policy.max_bytes.saturating_sub(sniff.prefix.len());
+                if remaining == 0 {
+                    continue;
+                }
+                let mut buffer = [0; 1024];
+                let length = remaining.min(buffer.len());
+                match self.mux.poll_read(context, &mut buffer[..length]) {
+                    Poll::Ready(Ok(0)) => {
+                        let observed = match sniff::classify_tcp(&sniff.prefix, true) {
+                            Classification::Complete(observed) => observed,
+                            Classification::NeedMore => Observed::Unknown,
+                        };
+                        if !observed_allowed(&sniff.policy, &observed) {
+                            return Poll::Ready(Err(PumpError::Io(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "observed protocol denied",
+                            ))));
+                        }
+                        sniff.allowed = true;
+                        break;
+                    }
+                    Poll::Ready(Ok(read)) => sniff.prefix.extend_from_slice(&buffer[..read]),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(PumpError::Io(error))),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+        if self.prefix_offset < sniff.prefix.len() {
+            if max_write == 0 {
+                return Poll::Pending;
+            }
+            let end = sniff.prefix.len().min(self.prefix_offset + max_write);
+            match self
+                .stack
+                .poll_write(context, &sniff.prefix[self.prefix_offset..end])
+            {
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(PumpError::WriteZero)),
+                Poll::Ready(Ok(written)) => {
+                    self.prefix_offset += written;
+                    let report = PumpReport {
+                        read: 0,
+                        written,
+                        finished: false,
+                    };
+                    if self.prefix_offset == sniff.prefix.len() {
+                        self.sniff = None;
+                        self.prefix_offset = 0;
+                    }
+                    return Poll::Ready(Ok(report));
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(PumpError::Io(error))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.sniff = None;
+        self.prefix_offset = 0;
+        Poll::Ready(Ok(PumpReport::default()))
     }
 }
 
@@ -275,13 +453,14 @@ impl<S: DatagramIo, M: DatagramIo> PolicyDatagramFlow<S, M> {
         session: u64,
         user_id: Option<String>,
         credential_digest: Option<String>,
+        sniff: Option<SniffPolicy>,
     ) -> Result<Self, PumpError> {
         Ok(Self {
             session,
             user_id,
             credential_digest,
             stack,
-            mux,
+            mux: DatagramSniff::new(mux, sniff),
             upload: DatagramPump::new(MAX_UDP_PAYLOAD)?,
             download: DatagramPump::new(MAX_UDP_PAYLOAD)?,
         })
@@ -530,18 +709,20 @@ unsafe extern "C" fn admit_flow(
             let Some(user) = state.admin.users.get(&user_id) else {
                 return abi::STATUS_DENIED;
             };
-            if !user_available(user)
-                || flow_limit_reached(state, user)
-                || !destination_allowed(state, user, &metadata)
-            {
+            if !user_available(user) || flow_limit_reached(state, user) {
                 return abi::STATUS_DENIED;
             }
+            let sniff = match destination_policy(state, user, &metadata) {
+                Ok(sniff) => sniff,
+                Err(()) => return abi::STATUS_DENIED,
+            };
             let Some(session) = state.sessions.get_mut(&session) else {
                 return abi::STATUS_INVALID;
             };
             session.pending_flows.push_back(FlowIdentity {
                 user_id,
                 credential_digest: session.credential_digest.clone(),
+                sniff,
             });
             abi::STATUS_OK
         })
@@ -595,7 +776,10 @@ unsafe extern "C" fn attach_flow(
                 state.options.sniff_bytes,
                 session,
                 identity.as_ref().map(|identity| identity.user_id.clone()),
-                identity.and_then(|identity| identity.credential_digest),
+                identity
+                    .as_ref()
+                    .and_then(|identity| identity.credential_digest.clone()),
+                identity.and_then(|identity| identity.sniff),
             ) {
                 Ok(flow) => flow,
                 Err(_) => return abi::STATUS_RESOURCE,
@@ -657,7 +841,10 @@ unsafe extern "C" fn attach_datagram_flow(
                 mux,
                 session,
                 identity.as_ref().map(|identity| identity.user_id.clone()),
-                identity.and_then(|identity| identity.credential_digest),
+                identity
+                    .as_ref()
+                    .and_then(|identity| identity.credential_digest.clone()),
+                identity.and_then(|identity| identity.sniff),
             ) {
                 Ok(flow) => flow,
                 Err(_) => return abi::STATUS_RESOURCE,
@@ -1538,17 +1725,17 @@ fn flow_limit_reached(state: &State, user: &UserRecord) -> bool {
     active.saturating_add(pending) >= count as usize
 }
 
-fn destination_allowed(
+fn destination_policy(
     state: &State,
     user: &UserRecord,
     metadata: &snolc_sdk::module::BorrowedFlowMetadata<'_>,
-) -> bool {
-    let dynamic = state
-        .admin
-        .rules
-        .get(&user.spec.rule_profile)
-        .and_then(|rules| toml::from_str::<config::Rules>(rules).ok());
+) -> Result<Option<SniffPolicy>, ()> {
+    let dynamic = match state.admin.rules.get(&user.spec.rule_profile) {
+        Some(rules) => Some(toml::from_str::<config::Rules>(rules).map_err(|_| ())?),
+        None => None,
+    };
     let rules = dynamic.as_ref().unwrap_or(&state.options.rules);
+    let mut observed = Vec::new();
     for entry in &rules.entries {
         if !matches!(
             entry.direction,
@@ -1558,23 +1745,84 @@ fn destination_allowed(
             .as_deref()
             .is_some_and(|group| group != user.spec.group)
             || entry.port.is_some_and(|port| port != metadata.port)
-            || !static_protocol(entry)
             || !address_rule_matches(entry, metadata)
         {
             continue;
         }
-        return entry.action == config::Action::Allow;
+        if rule_requires_observation(entry) {
+            observed.push(entry.clone());
+        } else if observed.is_empty() {
+            return match entry.action {
+                config::Action::Allow => Ok(None),
+                config::Action::Deny => Err(()),
+            };
+        } else {
+            observed.push(entry.clone());
+        }
     }
-    rules.terminal == config::Action::Allow
+    if observed.is_empty() {
+        return match rules.terminal {
+            config::Action::Allow => Ok(None),
+            config::Action::Deny => Err(()),
+        };
+    }
+    Ok(Some(SniffPolicy {
+        entries: observed,
+        terminal: rules.terminal,
+        unknown: state.options.on_unknown_protocol,
+        max_bytes: state.options.sniff_bytes,
+        timeout: Duration::from_millis(state.options.sniff_timeout_ms),
+    }))
 }
 
-fn static_protocol(entry: &config::RuleEntry) -> bool {
-    entry.tls_sni.is_none()
-        && entry.http_host.is_none()
-        && matches!(
-            entry.protocol,
-            config::ObservedProtocol::Any | config::ObservedProtocol::Unknown
-        )
+fn rule_requires_observation(entry: &config::RuleEntry) -> bool {
+    entry.tls_sni.is_some()
+        || entry.http_host.is_some()
+        || entry.protocol != config::ObservedProtocol::Any
+}
+
+fn observed_allowed(policy: &SniffPolicy, observed: &Observed) -> bool {
+    for entry in &policy.entries {
+        if matches!(observed, Observed::Unknown)
+            && entry.protocol != config::ObservedProtocol::Unknown
+        {
+            return entry.unavailable == config::Action::Allow;
+        }
+        if !observed_protocol_matches(entry.protocol, observed) {
+            continue;
+        }
+        if let Some(expected) = &entry.tls_sni {
+            match observed {
+                Observed::Tls { sni: Some(sni) } if sni.eq_ignore_ascii_case(expected) => {}
+                Observed::Tls { sni: Some(_) } => continue,
+                _ => return entry.unavailable == config::Action::Allow,
+            }
+        }
+        if let Some(expected) = &entry.http_host {
+            match observed {
+                Observed::Http { host: Some(host) } if host.eq_ignore_ascii_case(expected) => {}
+                Observed::Http { host: Some(_) } => continue,
+                _ => return entry.unavailable == config::Action::Allow,
+            }
+        }
+        return entry.action == config::Action::Allow;
+    }
+    if matches!(observed, Observed::Unknown) {
+        return matches!(policy.unknown, config::UnknownAction::Allow);
+    }
+    policy.terminal == config::Action::Allow
+}
+
+fn observed_protocol_matches(protocol: config::ObservedProtocol, observed: &Observed) -> bool {
+    matches!(
+        (protocol, observed),
+        (config::ObservedProtocol::Any, _)
+            | (config::ObservedProtocol::Tls, Observed::Tls { .. })
+            | (config::ObservedProtocol::Http, Observed::Http { .. })
+            | (config::ObservedProtocol::Ssh, Observed::Ssh)
+            | (config::ObservedProtocol::Quic, Observed::Quic)
+            | (config::ObservedProtocol::Unknown, Observed::Unknown)
+    )
 }
 
 fn address_rule_matches(
@@ -2365,6 +2613,50 @@ mod module_tests {
         }
     }
 
+    struct MemoryDatagram {
+        input: VecDeque<Vec<u8>>,
+    }
+
+    impl DatagramIo for MemoryDatagram {
+        fn poll_recv_datagram(
+            &mut self,
+            _context: &mut Context<'_>,
+            output: &mut [u8],
+        ) -> Poll<io::Result<DatagramRecv>> {
+            let Some(datagram) = self.input.front() else {
+                return Poll::Pending;
+            };
+            if output.len() < datagram.len() {
+                return Poll::Ready(Ok(DatagramRecv::BufferTooSmall(datagram.len())));
+            }
+            let datagram = self.input.pop_front().expect("front checked");
+            output[..datagram.len()].copy_from_slice(&datagram);
+            Poll::Ready(Ok(DatagramRecv::Datagram(datagram.len())))
+        }
+
+        fn poll_send_datagram(
+            &mut self,
+            _context: &mut Context<'_>,
+            _datagram: &[u8],
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn close(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sniff_policy(rule: &str) -> SniffPolicy {
+        SniffPolicy {
+            entries: vec![toml::from_str(rule).unwrap()],
+            terminal: config::Action::Allow,
+            unknown: config::UnknownAction::Allow,
+            max_bytes: 16_384,
+            timeout: Duration::from_secs(2),
+        }
+    }
+
     #[test]
     fn rejects_unprotected_session_context() {
         let context: ChannelSecurity = toml::from_str(
@@ -2384,7 +2676,7 @@ mod module_tests {
             input: b"download".iter().copied().collect(),
             ..MemoryIo::default()
         };
-        let mut flow = PolicyFlow::new(stack, mux, 16, 1, None, None).unwrap();
+        let mut flow = PolicyFlow::new(stack, mux, 16, 1, None, None, None).unwrap();
         let mut context = Context::from_waker(Waker::noop());
         while !flow.upload.is_finished() || !flow.download.is_finished() {
             let _ = flow.poll(&mut context, 16, 16, 16);
@@ -2414,8 +2706,16 @@ mod module_tests {
             ..MemoryIo::default()
         };
         let mux = MemoryIo::default();
-        let mut flow =
-            PolicyFlow::new(stack, mux, 100, 1, Some("user".into()), Some("key".into())).unwrap();
+        let mut flow = PolicyFlow::new(
+            stack,
+            mux,
+            100,
+            1,
+            Some("user".into()),
+            Some("key".into()),
+            None,
+        )
+        .unwrap();
         let grant = take_rate_grant(&mut traffic, 100, 0).unwrap();
         let mut context = Context::from_waker(Waker::noop());
         let Poll::Ready(Ok((stack_to_mux, mux_to_stack))) = flow.poll(
@@ -2444,6 +2744,63 @@ mod module_tests {
                 .stack_to_mux,
             10
         );
+    }
+
+    #[test]
+    fn tcp_sniff_denies_http_host_before_forwarding_prefix() {
+        let request = b"GET / HTTP/1.1\r\nHost: denied.example\r\n\r\n";
+        let stack = MemoryIo::default();
+        let mux = MemoryIo {
+            input: request.iter().copied().collect(),
+            ..MemoryIo::default()
+        };
+        let policy = sniff_policy(
+            "action = \"deny\"\ndirection = \"upload\"\nprotocol = \"http\"\nunavailable = \"deny\"\nhttp_host = \"denied.example\"\n",
+        );
+        let mut flow = PolicyFlow::new(stack, mux, 16_384, 1, None, None, Some(policy)).unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            flow.poll(&mut context, 16_384, 16_384, 16_384),
+            Poll::Ready(Err(PumpError::Io(error)))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(flow.stack.output.is_empty());
+    }
+
+    #[test]
+    fn tcp_sniff_forwards_allowed_prefix_once() {
+        let request = b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n";
+        let stack = MemoryIo::default();
+        let mux = MemoryIo {
+            input: request.iter().copied().collect(),
+            ..MemoryIo::default()
+        };
+        let policy = sniff_policy(
+            "action = \"allow\"\ndirection = \"upload\"\nprotocol = \"http\"\nunavailable = \"deny\"\nhttp_host = \"allowed.example\"\n",
+        );
+        let mut flow = PolicyFlow::new(stack, mux, 16_384, 1, None, None, Some(policy)).unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        for _ in 0..4 {
+            let _ = flow.poll(&mut context, 16_384, 16_384, 16_384);
+        }
+        assert_eq!(flow.stack.output, request);
+    }
+
+    #[test]
+    fn udp_sniff_denies_quic_without_forwarding_datagram() {
+        let inner = MemoryDatagram {
+            input: [vec![0xc0, 0, 0, 1]].into(),
+        };
+        let policy = sniff_policy(
+            "action = \"deny\"\ndirection = \"upload\"\nprotocol = \"quic\"\nunavailable = \"deny\"\n",
+        );
+        let mut sniff = DatagramSniff::new(inner, Some(policy));
+        let mut output = [0; 16];
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            sniff.poll_recv_datagram(&mut context, &mut output),
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
     }
 
     #[test]
