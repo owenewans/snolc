@@ -16,5 +16,6 @@ libloading.workspace = true
 serde.workspace = true
 snolc-abi = { path = "../snolc-abi" }
 snolc-sdk = { path = "../snolc-sdk" }
+smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "fragmentation-buffer-size-65536", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation"] }
 thiserror.workspace = true
 toml.workspace = true
