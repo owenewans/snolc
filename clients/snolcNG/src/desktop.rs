@@ -195,6 +195,7 @@ impl DesktopApp {
                 ClientEvent::Starting => {
                     self.state.connection = snolc_ng::ConnectionState::Connecting;
                 }
+                ClientEvent::Ready => {}
                 ClientEvent::Engine(snolc::Event::Lifecycle(Lifecycle::Running)) => {
                     self.state.connected();
                 }

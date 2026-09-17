@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::JoinHandle;
 
-use snolc::{Deployment, Engine, EngineHandle, Event, Host, Snapshot};
+use snolc::{Deployment, Engine, EngineHandle, Event, Host, PlatformEvent, Snapshot};
 use thiserror::Error;
 
 const EVENT_CAPACITY: usize = 256;
@@ -11,6 +11,7 @@ const EVENT_CAPACITY: usize = 256;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientEvent {
     Starting,
+    Ready,
     Engine(Event),
     Failed(String),
     Stopped,
@@ -27,6 +28,7 @@ enum RuntimeEvent {
 struct ClientHost {
     events: SyncSender<RuntimeEvent>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    protect_socket: Arc<dyn Fn(i64) -> bool + Send + Sync>,
 }
 
 impl ClientHost {
@@ -40,12 +42,17 @@ impl Host for ClientHost {
     fn engine_event(&self, event: &Event) {
         self.send(RuntimeEvent::Engine(event.clone()));
     }
+
+    fn protect_socket(&self, socket: i64) -> bool {
+        (self.protect_socket)(socket)
+    }
 }
 
 pub struct EngineRuntime {
     sender: SyncSender<RuntimeEvent>,
     receiver: Receiver<RuntimeEvent>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    protect_socket: Arc<dyn Fn(i64) -> bool + Send + Sync>,
     handle: Option<EngineHandle>,
     thread: Option<JoinHandle<()>>,
     active: bool,
@@ -54,11 +61,19 @@ pub struct EngineRuntime {
 
 impl EngineRuntime {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::with_socket_protector(wake, |_| !cfg!(target_os = "android"))
+    }
+
+    pub fn with_socket_protector(
+        wake: impl Fn() + Send + Sync + 'static,
+        protect_socket: impl Fn(i64) -> bool + Send + Sync + 'static,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(EVENT_CAPACITY);
         Self {
             sender,
             receiver,
             wake: Arc::new(wake),
+            protect_socket: Arc::new(protect_socket),
             handle: None,
             thread: None,
             active: false,
@@ -74,11 +89,12 @@ impl EngineRuntime {
         let config = absolute(config)?;
         let events = self.sender.clone();
         let wake = Arc::clone(&self.wake);
+        let protect_socket = Arc::clone(&self.protect_socket);
         self.active = true;
         self.thread = Some(
             std::thread::Builder::new()
                 .name("snolc-engine".into())
-                .spawn(move || run_engine(config, events, wake))?,
+                .spawn(move || run_engine(config, events, wake, protect_socket))?,
         );
         Ok(())
     }
@@ -92,6 +108,13 @@ impl EngineRuntime {
         Ok(())
     }
 
+    pub fn platform_event(&self, event: PlatformEvent) -> Result<(), RuntimeError> {
+        if let Some(handle) = &self.handle {
+            handle.request_platform_event(event)?;
+        }
+        Ok(())
+    }
+
     pub fn drain(&mut self) -> Vec<ClientEvent> {
         let mut output = Vec::new();
         loop {
@@ -99,6 +122,7 @@ impl EngineRuntime {
                 Ok(RuntimeEvent::Starting) => output.push(ClientEvent::Starting),
                 Ok(RuntimeEvent::Ready(handle)) => {
                     self.handle = Some(handle);
+                    output.push(ClientEvent::Ready);
                     if self.shutdown_pending {
                         self.shutdown_pending = false;
                         if let Some(handle) = &self.handle {
@@ -153,6 +177,7 @@ fn run_engine(
     config: PathBuf,
     events: SyncSender<RuntimeEvent>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    protect_socket: Arc<dyn Fn(i64) -> bool + Send + Sync>,
 ) {
     send(&events, &wake, RuntimeEvent::Starting);
     let result: Result<(), String> = (|| {
@@ -163,6 +188,7 @@ fn run_engine(
         let host = ClientHost {
             events: events.clone(),
             wake: Arc::clone(&wake),
+            protect_socket,
         };
         let (engine, handle) = Engine::build(validated, host).map_err(|error| error.to_string())?;
         send(&events, &wake, RuntimeEvent::Ready(handle));
