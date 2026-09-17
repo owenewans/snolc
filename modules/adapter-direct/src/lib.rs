@@ -642,8 +642,9 @@ fn connect_destination(
     let mut last_error = None;
     for address in addresses {
         let result = match kind {
-            abi::FLOW_TCP => TcpStream::connect_timeout(&address, connect_timeout)
-                .map(Endpoint::Tcp),
+            abi::FLOW_TCP => {
+                TcpStream::connect_timeout(&address, connect_timeout).map(Endpoint::Tcp)
+            }
             abi::FLOW_UDP => connect_udp(address).map(Endpoint::Udp),
             _ => return Err(DirectError::InvalidDestination),
         };
@@ -759,9 +760,8 @@ unsafe extern "C" fn attach_datagram(
                 state.ready.insert(flow, endpoint);
                 return abi::STATUS_INVALID;
             };
-            let stack = match unsafe {
-                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
-            } {
+            let stack = match unsafe { ForeignDatagramIo::from_raw(stack_socket, stack_socket_io) }
+            {
                 Ok(stack) => stack,
                 Err(_) => return abi::STATUS_INVALID,
             };

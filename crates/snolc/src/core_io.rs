@@ -101,8 +101,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DatagramIo for MuxDatagramIo<S> {
         loop {
             if self.read_prefix_len < self.read_prefix.len() {
                 let start = self.read_prefix_len;
-                match Pin::new(&mut self.stream)
-                    .poll_read(context, &mut self.read_prefix[start..])
+                match Pin::new(&mut self.stream).poll_read(context, &mut self.read_prefix[start..])
                 {
                     Poll::Ready(Ok(0)) if start == 0 => {
                         self.closed = true;
@@ -138,8 +137,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DatagramIo for MuxDatagramIo<S> {
             }
             while self.read_payload_len < self.read_payload.len() {
                 let start = self.read_payload_len;
-                match Pin::new(&mut self.stream)
-                    .poll_read(context, &mut self.read_payload[start..])
+                match Pin::new(&mut self.stream).poll_read(context, &mut self.read_payload[start..])
                 {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(io::Error::new(
@@ -153,9 +151,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DatagramIo for MuxDatagramIo<S> {
                 }
             }
             if output.len() < self.read_payload.len() {
-                return Poll::Ready(Ok(DatagramRecv::BufferTooSmall(
-                    self.read_payload.len(),
-                )));
+                return Poll::Ready(Ok(DatagramRecv::BufferTooSmall(self.read_payload.len())));
             }
             let length = self.read_payload.len();
             output[..length].copy_from_slice(&self.read_payload);
@@ -618,7 +614,9 @@ mod tests {
         ));
         assert!(matches!(
             io.poll_recv_datagram(&mut context, &mut [0; 1]),
-            Poll::Ready(Ok(DatagramRecv::BufferTooSmall(crate::wire::MAX_UDP_PAYLOAD)))
+            Poll::Ready(Ok(DatagramRecv::BufferTooSmall(
+                crate::wire::MAX_UDP_PAYLOAD
+            )))
         ));
         let mut output = vec![0; crate::wire::MAX_UDP_PAYLOAD];
         assert!(matches!(

@@ -79,8 +79,7 @@ struct State {
     client_credential: Option<Credential>,
     sessions: HashMap<u64, PolicySession>,
     flows: HashMap<u64, PolicyFlow<ForeignByteIo, ForeignByteIo>>,
-    datagram_flows:
-        HashMap<u64, PolicyDatagramFlow<ForeignDatagramIo, ForeignDatagramIo>>,
+    datagram_flows: HashMap<u64, PolicyDatagramFlow<ForeignDatagramIo, ForeignDatagramIo>>,
     traffic: HashMap<String, UserTraffic>,
     flow_cursor: HashMap<String, usize>,
 }
@@ -644,9 +643,8 @@ unsafe extern "C" fn attach_datagram_flow(
                 Some(_) => None,
                 None => return abi::STATUS_INVALID,
             };
-            let stack = match unsafe {
-                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
-            } {
+            let stack = match unsafe { ForeignDatagramIo::from_raw(stack_socket, stack_socket_io) }
+            {
                 Ok(stack) => stack,
                 Err(_) => return abi::STATUS_INVALID,
             };

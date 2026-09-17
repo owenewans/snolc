@@ -271,9 +271,8 @@ unsafe extern "C" fn attach_datagram_flow(
             if !state.sessions.contains_key(&session) {
                 return abi::STATUS_INVALID;
             }
-            let stack = match unsafe {
-                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
-            } {
+            let stack = match unsafe { ForeignDatagramIo::from_raw(stack_socket, stack_socket_io) }
+            {
                 Ok(stack) => stack,
                 Err(_) => return abi::STATUS_INVALID,
             };

@@ -364,9 +364,7 @@ fn native_socks_udp_preserves_datagram_boundaries() {
     let mut greeting = [0; 2];
     control.read_exact(&mut greeting).unwrap();
     assert_eq!(greeting, [5, 0]);
-    control
-        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
-        .unwrap();
+    control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
     let mut response = [0; 10];
     control.read_exact(&mut response).unwrap();
     assert_eq!(response[..4], [5, 0, 0, 1]);

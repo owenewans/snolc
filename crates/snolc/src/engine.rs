@@ -22,9 +22,7 @@ use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::logging::{FileLogger, LogError};
 use crate::mux::{MuxError, MuxSession};
-use crate::stack::{
-    FlowMetadata, SharedStackBridge, StackError, TcpStreamPort, UdpDatagramPort,
-};
+use crate::stack::{FlowMetadata, SharedStackBridge, StackError, TcpStreamPort, UdpDatagramPort};
 use crate::wire::{Destination, OpenRequest, OpenResponse, OpenStatus, StreamKind};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
@@ -1034,8 +1032,7 @@ impl EstablishedSession {
                             ClientPolicyPort::Tcp(policy_port) => {
                                 let policy_io =
                                     RegisteredIo::register(policy_port, binding.core_io_limit)?;
-                                let mux_io =
-                                    RegisteredIo::register(stream, binding.core_io_limit)?;
+                                let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
                                 let (policy_handle, policy_table) = policy_io.raw_parts();
                                 let (mux_handle, mux_table) = mux_io.raw_parts();
                                 unsafe {
@@ -1166,8 +1163,7 @@ impl EstablishedSession {
             pending.policy_port = Some(match pending.request.kind {
                 StreamKind::Tcp => {
                     let (adapter_port, policy_port) = stack.open_tcp(metadata)?;
-                    let adapter_io =
-                        RegisteredIo::register(adapter_port, binding.core_io_limit)?;
+                    let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
                     let (adapter_handle, adapter_table) = adapter_io.raw_parts();
                     unsafe {
                         modules[pending.adapter].adapter_attach_flow(
@@ -1334,8 +1330,7 @@ impl EstablishedSession {
             PendingPorts::Udp(adapter_port, policy_port) => {
                 let adapter_io =
                     RegisteredDatagramIo::register(adapter_port, binding.core_io_limit)?;
-                let policy_io =
-                    RegisteredDatagramIo::register(policy_port, binding.core_io_limit)?;
+                let policy_io = RegisteredDatagramIo::register(policy_port, binding.core_io_limit)?;
                 let mux_io = RegisteredDatagramIo::register(
                     MuxDatagramIo::new(stream),
                     binding.core_io_limit,

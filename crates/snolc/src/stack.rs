@@ -360,9 +360,7 @@ impl DatagramIo for UdpDatagramPort {
         };
         match result {
             Ok(DatagramRead::Empty) => self.pending(context),
-            Ok(DatagramRead::Datagram(length)) => {
-                Poll::Ready(Ok(DatagramRecv::Datagram(length)))
-            }
+            Ok(DatagramRead::Datagram(length)) => Poll::Ready(Ok(DatagramRecv::Datagram(length))),
             Ok(DatagramRead::BufferTooSmall(required)) => {
                 Poll::Ready(Ok(DatagramRecv::BufferTooSmall(required)))
             }

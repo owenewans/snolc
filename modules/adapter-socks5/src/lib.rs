@@ -629,19 +629,13 @@ unsafe extern "C" fn accept(
             poll_state(state);
             if let Some((handle, flow)) = state.flows.iter_mut().find(|(_, flow)| !flow.announced) {
                 flow.announced = true;
-                *metadata = flow_metadata(
-                    abi::FLOW_TCP,
-                    flow.address_type,
-                    &flow.address,
-                    flow.port,
-                );
+                *metadata =
+                    flow_metadata(abi::FLOW_TCP, flow.address_type, &flow.address, flow.port);
                 *output = *handle;
                 return abi::STATUS_OK;
             }
-            if let Some((handle, flow)) = state
-                .udp_flows
-                .iter_mut()
-                .find(|(_, flow)| !flow.announced)
+            if let Some((handle, flow)) =
+                state.udp_flows.iter_mut().find(|(_, flow)| !flow.announced)
             {
                 flow.announced = true;
                 *metadata = flow_metadata(
@@ -658,12 +652,7 @@ unsafe extern "C" fn accept(
     })
 }
 
-fn flow_metadata(
-    kind: u32,
-    address_type: u32,
-    address: &[u8],
-    port: u16,
-) -> SnolFlowMetadataV1 {
+fn flow_metadata(kind: u32, address_type: u32, address: &[u8], port: u16) -> SnolFlowMetadataV1 {
     SnolFlowMetadataV1 {
         struct_size: size_of::<SnolFlowMetadataV1>() as u32,
         kind,
@@ -733,9 +722,8 @@ unsafe extern "C" fn attach_datagram(
             if flow.stack.is_some() {
                 return abi::STATUS_INVALID;
             }
-            flow.stack = match unsafe {
-                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
-            } {
+            flow.stack = match unsafe { ForeignDatagramIo::from_raw(stack_socket, stack_socket_io) }
+            {
                 Ok(stack) => Some(stack),
                 Err(_) => return abi::STATUS_INVALID,
             };
@@ -852,7 +840,9 @@ fn poll_state(state: &mut State) {
                     state.flows.insert(handle, flow);
                 }
             }
-            Command::UdpAssociate if state.associations.len() < state.options.max_udp_associations => {
+            Command::UdpAssociate
+                if state.associations.len() < state.options.max_udp_associations =>
+            {
                 let listen: SocketAddr = match state.options.listen.parse() {
                     Ok(listen) => listen,
                     Err(_) => continue,
@@ -922,7 +912,10 @@ fn poll_udp_associations(state: &mut State, context: &mut Context<'_>) {
                 continue;
             }
         }
-        match association.socket.recv_from(&mut association.receive_buffer) {
+        match association
+            .socket
+            .recv_from(&mut association.receive_buffer)
+        {
             Ok((length, source)) => {
                 if association.client.is_some_and(|client| client != source) {
                     continue;

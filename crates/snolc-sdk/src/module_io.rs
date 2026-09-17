@@ -4,11 +4,10 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use crate::{ByteIo, DatagramIo, DatagramRecv};
 use crate::abi::{
-    self, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolDatagramIoV1, SnolIoResult,
-    SnolWakeHandle,
+    self, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolDatagramIoV1, SnolIoResult, SnolWakeHandle,
 };
+use crate::{ByteIo, DatagramIo, DatagramRecv};
 
 pub struct ForeignByteIo {
     handle: u64,

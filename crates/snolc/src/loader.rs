@@ -379,9 +379,7 @@ impl LoadedModule {
         let instance = self.instance.ok_or(LoadError::NotCreated)?;
         let adapter = unsafe { self.descriptor().adapter.as_ref() }
             .ok_or(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))?;
-        let attach = adapter
-            .attach_datagram
-            .ok_or(LoadError::MissingFunction)?;
+        let attach = adapter.attach_datagram.ok_or(LoadError::MissingFunction)?;
         let status = unsafe { attach(instance, flow, stack_handle, stack_io) };
         if status == snolc_abi::STATUS_OK {
             Ok(())
