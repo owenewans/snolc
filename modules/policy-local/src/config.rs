@@ -193,7 +193,24 @@ impl Options {
         {
             return Err(ConfigError::Invalid("global rate is inconsistent"));
         }
-        for entry in &self.rules.entries {
+        self.rules.validate()?;
+        if let Some(client) = &self.client {
+            let credential = client.credential.resolve()?;
+            if credential.len() != 64
+                || !credential
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(ConfigError::Secret);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Rules {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for entry in &self.entries {
             if entry.port == Some(0)
                 || entry.cidr.as_deref().is_some_and(|cidr| !valid_cidr(cidr))
                 || entry
@@ -212,18 +229,23 @@ impl Options {
                     .http_host
                     .as_deref()
                     .is_some_and(|domain| !valid_domain(domain))
+                || entry
+                    .user_group
+                    .as_deref()
+                    .is_some_and(|group| group.is_empty() || group.len() > 64)
+                || (entry.tls_sni.is_some()
+                    && !matches!(
+                        entry.protocol,
+                        ObservedProtocol::Tls | ObservedProtocol::Any
+                    ))
+                || (entry.http_host.is_some()
+                    && !matches!(
+                        entry.protocol,
+                        ObservedProtocol::Http | ObservedProtocol::Any
+                    ))
+                || (entry.tls_sni.is_some() && entry.http_host.is_some())
             {
                 return Err(ConfigError::Invalid("rule is invalid"));
-            }
-        }
-        if let Some(client) = &self.client {
-            let credential = client.credential.resolve()?;
-            if credential.len() != 64
-                || !credential
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            {
-                return Err(ConfigError::Secret);
             }
         }
         Ok(())
@@ -297,6 +319,15 @@ mod tests {
     fn rejects_unknown_and_missing_fields() {
         let input = b"server_id = \"node\"\ncredential_transport = \"protected\"\n";
         assert!(Options::parse(input, Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn rejects_incompatible_observed_rule_fields() {
+        let rules: Rules = toml::from_str(
+            "terminal = \"allow\"\n[[entries]]\naction = \"deny\"\ndirection = \"upload\"\nprotocol = \"http\"\nunavailable = \"deny\"\ntls_sni = \"example.com\"\n",
+        )
+        .unwrap();
+        assert!(rules.validate().is_err());
     }
 
     #[test]

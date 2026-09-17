@@ -2318,7 +2318,10 @@ fn prepare_admin_mutation(state: &State, request: ControlRequest) -> Result<Prep
             rules_toml,
             ..
         } => {
-            toml::from_str::<config::Rules>(&rules_toml).map_err(|_| abi::STATUS_INVALID)?;
+            toml::from_str::<config::Rules>(&rules_toml)
+                .map_err(|_| abi::STATUS_INVALID)?
+                .validate()
+                .map_err(|_| abi::STATUS_INVALID)?;
             changes.push((
                 format!("meta/rules/{profile}"),
                 Some(rules_toml.as_bytes().to_vec()),
