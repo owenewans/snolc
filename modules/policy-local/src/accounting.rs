@@ -171,6 +171,11 @@ impl TokenBucket {
         self.tokens = self.tokens.saturating_add(bytes).min(self.burst_bytes);
     }
 
+    pub fn available(&mut self, now_nanos: u64) -> Result<u64, QuotaError> {
+        self.refill(now_nanos)?;
+        Ok(self.tokens)
+    }
+
     fn refill(&mut self, now_nanos: u64) -> Result<(), QuotaError> {
         if now_nanos < self.last_nanos {
             return Err(QuotaError::Clock);
