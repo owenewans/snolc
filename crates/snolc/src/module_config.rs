@@ -174,6 +174,10 @@ mod tests {
                 include_str!("../../../config/templates/modules/protection-dummy.toml"),
             ),
             (
+                "protection-dummy-server.toml",
+                include_str!("../../../config/templates/modules/protection-dummy-server.toml"),
+            ),
+            (
                 "noise.toml",
                 include_str!("../../../config/templates/modules/noise.toml"),
             ),
@@ -200,6 +204,10 @@ mod tests {
             (
                 "policy-dummy.toml",
                 include_str!("../../../config/templates/modules/policy-dummy.toml"),
+            ),
+            (
+                "policy-dummy-server.toml",
+                include_str!("../../../config/templates/modules/policy-dummy-server.toml"),
             ),
             (
                 "policy.toml",
