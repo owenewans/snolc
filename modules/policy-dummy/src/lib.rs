@@ -77,10 +77,10 @@ impl<A: DatagramIo, M: DatagramIo> DummyDatagramFlow<A, M> {
     ) -> Poll<Result<(DatagramPumpReport, DatagramPumpReport), PumpError>> {
         let upload = self
             .upload
-            .poll(context, &mut self.stack, &mut self.mux);
+            .poll(context, &mut self.stack, &mut self.mux, MAX_UDP_PAYLOAD);
         let download = self
             .download
-            .poll(context, &mut self.mux, &mut self.stack);
+            .poll(context, &mut self.mux, &mut self.stack, MAX_UDP_PAYLOAD);
         match (upload, download) {
             (Poll::Ready(Ok(upload)), Poll::Ready(Ok(download))) => {
                 Poll::Ready(Ok((upload, download)))

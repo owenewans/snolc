@@ -385,11 +385,21 @@ impl<S: DatagramIo> DirectDatagramFlow<S> {
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<bool, DirectError>> {
         let upload = self
             .upload
-            .poll(context, &mut self.stack, &mut self.endpoint)
+            .poll(
+                context,
+                &mut self.stack,
+                &mut self.endpoint,
+                MAX_UDP_PAYLOAD,
+            )
             .map_err(|error| DirectError::Io(io::Error::other(error.to_string())));
         let download = self
             .download
-            .poll(context, &mut self.endpoint, &mut self.stack)
+            .poll(
+                context,
+                &mut self.endpoint,
+                &mut self.stack,
+                MAX_UDP_PAYLOAD,
+            )
             .map_err(|error| DirectError::Io(io::Error::other(error.to_string())));
         match (upload, download) {
             (Poll::Ready(Ok(upload)), Poll::Ready(Ok(download))) => {

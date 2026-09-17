@@ -58,7 +58,11 @@ impl DatagramPump {
         context: &mut Context<'_>,
         source: &mut S,
         destination: &mut D,
+        max_payload_bytes: usize,
     ) -> Poll<Result<DatagramPumpReport, PumpError>> {
+        if max_payload_bytes == 0 {
+            return Poll::Pending;
+        }
         let mut report = DatagramPumpReport::default();
         if self.pending.is_none() && !self.source_closed {
             match source.poll_recv_datagram(context, &mut self.buffer) {
@@ -76,6 +80,9 @@ impl DatagramPump {
             }
         }
         if let Some(length) = self.pending {
+            if length > max_payload_bytes {
+                return Poll::Ready(Ok(report));
+            }
             match destination.poll_send_datagram(context, &self.buffer[..length]) {
                 Poll::Ready(Ok(())) => {
                     self.pending = None;
@@ -364,17 +371,26 @@ mod tests {
         let mut pump = DatagramPump::new(65_507).unwrap();
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(
-            pump.poll(&mut context, &mut source, &mut destination),
+            pump.poll(&mut context, &mut source, &mut destination, 65_507),
             Poll::Pending
         ));
         assert_eq!(pump.pending_bytes(), 0);
         assert!(matches!(
-            pump.poll(&mut context, &mut source, &mut destination),
+            pump.poll(&mut context, &mut source, &mut destination, 65_507),
             Poll::Ready(Ok(DatagramPumpReport { sent: 0, .. }))
         ));
         assert_eq!(destination.output, [Vec::<u8>::new()]);
         assert!(matches!(
-            pump.poll(&mut context, &mut source, &mut destination),
+            pump.poll(&mut context, &mut source, &mut destination, 1),
+            Poll::Ready(Ok(DatagramPumpReport {
+                received: 65_507,
+                sent: 0,
+                ..
+            }))
+        ));
+        assert_eq!(pump.pending_bytes(), 65_507);
+        assert!(matches!(
+            pump.poll(&mut context, &mut source, &mut destination, 65_507),
             Poll::Ready(Ok(DatagramPumpReport { sent: 65_507, .. }))
         ));
         assert_eq!(destination.output[1], payload);
