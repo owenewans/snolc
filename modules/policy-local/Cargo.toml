@@ -1,0 +1,22 @@
+[package]
+name = "snolc-policy-local"
+description = "local user policy module for snolc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+getrandom.workspace = true
+postcard.workspace = true
+redb.workspace = true
+serde.workspace = true
+sha2.workspace = true
+snolc-sdk = { path = "../../crates/snolc-sdk" }
+thiserror.workspace = true
+toml.workspace = true

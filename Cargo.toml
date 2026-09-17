@@ -12,6 +12,7 @@ members = [
   "modules/policy-dummy",
   "modules/carrier-tcp",
   "modules/protection-noise",
+  "modules/policy-local",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ async-io = "=2.6.0"
 ed25519-dalek = "=3.0.0"
 flate2 = "=1.1.2"
 futures = "=0.3.34"
+getrandom = "=0.3.4"
 gix = { version = "=0.87.1", default-features = false }
 libloading = "=0.9.0"
 libc = "=0.2.189"
