@@ -16,6 +16,8 @@ use snolc_abi::{
 };
 use thiserror::Error;
 
+use crate::wire::{Destination, OpenRequest, StreamKind};
+
 const KNOWN_CLASSES: u32 = snolc_abi::CLASS_ADAPTER
     | snolc_abi::CLASS_PROTECTION
     | snolc_abi::CLASS_CARRIER
@@ -260,6 +262,86 @@ impl LoadedModule {
             snolc_abi::STATUS_PENDING => Poll::Pending,
             snolc_abi::STATUS_OK if flow == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
             snolc_abi::STATUS_OK => Poll::Ready(Ok(flow)),
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
+        }
+    }
+
+    pub(crate) fn adapter_accept(
+        &self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(u64, OpenRequest), LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let adapter = match unsafe { self.descriptor().adapter.as_ref() } {
+            Some(adapter) => adapter,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))),
+        };
+        let accept = match adapter.accept {
+            Some(accept) => accept,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let mut flow = 0;
+        let mut metadata = SnolFlowMetadataV1 {
+            struct_size: size_of::<SnolFlowMetadataV1>() as u32,
+            kind: 0,
+            address_type: 0,
+            reserved: 0,
+            address: SnolBytes {
+                pointer: std::ptr::null(),
+                length: 0,
+            },
+            port: 0,
+            reserved2: [0; 6],
+            metadata: SnolBytes {
+                pointer: std::ptr::null(),
+                length: 0,
+            },
+        };
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe { accept(instance, &mut metadata, wake.handle(), &mut flow) };
+        match status {
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            snolc_abi::STATUS_OK if flow == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
+            snolc_abi::STATUS_OK => {
+                let metadata = match unsafe { snolc_sdk::module::flow_metadata(&metadata) } {
+                    Ok(metadata) => metadata,
+                    Err(_) => return Poll::Ready(Err(LoadError::FlowMetadata)),
+                };
+                let destination = match metadata.address_type {
+                    snolc_abi::ADDRESS_IPV4 => Destination::Ipv4(
+                        <[u8; 4]>::try_from(metadata.address)
+                            .map(std::net::Ipv4Addr::from)
+                            .map_err(|_| LoadError::FlowMetadata)?,
+                    ),
+                    snolc_abi::ADDRESS_IPV6 => Destination::Ipv6(
+                        <[u8; 16]>::try_from(metadata.address)
+                            .map(std::net::Ipv6Addr::from)
+                            .map_err(|_| LoadError::FlowMetadata)?,
+                    ),
+                    snolc_abi::ADDRESS_DOMAIN => Destination::Domain(
+                        std::str::from_utf8(metadata.address)
+                            .map_err(|_| LoadError::FlowMetadata)?
+                            .to_owned(),
+                    ),
+                    _ => return Poll::Ready(Err(LoadError::FlowMetadata)),
+                };
+                let kind = match metadata.kind {
+                    snolc_abi::FLOW_TCP => StreamKind::Tcp,
+                    snolc_abi::FLOW_UDP => StreamKind::Udp,
+                    _ => return Poll::Ready(Err(LoadError::FlowMetadata)),
+                };
+                Poll::Ready(Ok((
+                    flow,
+                    OpenRequest {
+                        kind,
+                        destination,
+                        port: metadata.port,
+                        metadata: metadata.metadata.to_vec(),
+                    },
+                )))
+            }
             status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
         }
     }
@@ -915,6 +997,8 @@ pub enum LoadError {
     ModuleStatus(u32),
     #[error("module returned an invalid output length")]
     OutputLength,
+    #[error("module returned invalid flow metadata")]
+    FlowMetadata,
     #[error("module instance was already created")]
     AlreadyCreated,
     #[error("module instance is not created")]

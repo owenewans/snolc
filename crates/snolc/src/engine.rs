@@ -99,7 +99,9 @@ struct EstablishedSession {
     policy_session: u64,
     accepting: Option<AcceptFlowFuture>,
     responding: Option<RespondFlowFuture>,
+    opening: Option<OpenClientFuture>,
     pending: Option<PendingServerFlow>,
+    client_pending: Option<PendingClientFlow>,
     active: Vec<ActiveServerFlow>,
     next_operation: u64,
 }
@@ -125,6 +127,16 @@ type RespondFlowFuture = Pin<
         >,
     >,
 >;
+type OpenClientFuture = Pin<
+    Box<
+        dyn Future<
+            Output = (
+                MuxSession<ModuleByteIo>,
+                Result<(OpenResponse, yamux::Stream), MuxError>,
+            ),
+        >,
+    >,
+>;
 
 struct PendingServerFlow {
     request: OpenRequest,
@@ -143,6 +155,15 @@ struct ActiveServerFlow {
     adapter: usize,
     adapter_flow: u64,
     mux_handle: u64,
+}
+
+struct PendingClientFlow {
+    request: OpenRequest,
+    metadata: OwnedFlowMetadata,
+    adapter: usize,
+    adapter_flow: u64,
+    admitted: bool,
+    policy_port: Option<TcpStreamPort>,
 }
 
 struct OwnedFlowMetadata {
@@ -869,7 +890,9 @@ impl TunnelRuntime {
                             policy_session,
                             accepting: None,
                             responding: None,
+                            opening: None,
                             pending: None,
+                            client_pending: None,
                             active: Vec::new(),
                             next_operation: 1,
                         }));
@@ -917,6 +940,10 @@ impl EstablishedSession {
         context: &mut Context<'_>,
     ) -> Result<(), SessionFlowError> {
         self.reap_closed(modules);
+
+        if binding.role == Role::Client {
+            return self.poll_client(binding, modules, stack, context);
+        }
 
         if let Some(future) = &mut self.responding {
             if let Poll::Ready((mux, stream, result)) = future.as_mut().poll(context) {
@@ -967,17 +994,159 @@ impl EstablishedSession {
             return Ok(());
         }
 
-        if binding.role == Role::Server {
-            let mut mux = self.mux.take().ok_or(SessionFlowError::State)?;
-            self.accepting = Some(Box::pin(async move {
-                let result = mux.accept_flow().await;
-                (mux, result)
-            }));
-        } else if let Some(mux) = &mut self.mux
-            && let Poll::Ready(Err(error)) = mux.poll_drive(context)
-        {
-            return Err(error.into());
+        let mut mux = self.mux.take().ok_or(SessionFlowError::State)?;
+        self.accepting = Some(Box::pin(async move {
+            let result = mux.accept_flow().await;
+            (mux, result)
+        }));
+        Ok(())
+    }
+
+    fn poll_client(
+        &mut self,
+        binding: &TunnelBinding,
+        modules: &[LoadedModule],
+        stack: &SharedStackBridge,
+        context: &mut Context<'_>,
+    ) -> Result<(), SessionFlowError> {
+        if let Some(future) = &mut self.opening {
+            if let Poll::Ready((mux, result)) = future.as_mut().poll(context) {
+                self.opening = None;
+                self.mux = Some(mux);
+                let mut pending = self.client_pending.take().ok_or(SessionFlowError::State)?;
+                match result {
+                    Ok((response, stream)) if response.status == OpenStatus::Ok => {
+                        let policy_port =
+                            pending.policy_port.take().ok_or(SessionFlowError::State)?;
+                        let policy_io = RegisteredIo::register(policy_port, binding.core_io_limit)?;
+                        let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+                        let (policy_handle, policy_table) = policy_io.raw_parts();
+                        let (mux_handle, mux_table) = mux_io.raw_parts();
+                        unsafe {
+                            modules[binding.policy].policy_attach_flow(
+                                self.policy_session,
+                                policy_handle,
+                                policy_table,
+                                mux_handle,
+                                mux_table,
+                            )?;
+                        }
+                        policy_io.transfer();
+                        mux_io.transfer();
+                        modules[pending.adapter].adapter_complete_flow(
+                            pending.adapter_flow,
+                            snolc_abi::STATUS_OK,
+                            &[],
+                        )?;
+                        self.active.push(ActiveServerFlow {
+                            adapter: pending.adapter,
+                            adapter_flow: pending.adapter_flow,
+                            mux_handle,
+                        });
+                    }
+                    Ok((response, _)) => {
+                        modules[pending.adapter].adapter_complete_flow(
+                            pending.adapter_flow,
+                            abi_status(response.status),
+                            response.reason.as_bytes(),
+                        )?;
+                        if let Some(mux) = &mut self.mux {
+                            mux.release_flow();
+                        }
+                    }
+                    Err(error) => {
+                        let _ = modules[pending.adapter].adapter_complete_flow(
+                            pending.adapter_flow,
+                            snolc_abi::STATUS_IO,
+                            b"tunnel stream failed",
+                        );
+                        return Err(error.into());
+                    }
+                }
+            }
+            return Ok(());
         }
+
+        if self.client_pending.is_none() {
+            for adapter in &binding.adapters {
+                match modules[*adapter].adapter_accept(context) {
+                    Poll::Ready(Ok((adapter_flow, request))) => {
+                        self.client_pending = Some(PendingClientFlow {
+                            metadata: OwnedFlowMetadata::from_request(&request),
+                            request,
+                            adapter: *adapter,
+                            adapter_flow,
+                            admitted: false,
+                            policy_port: None,
+                        });
+                        break;
+                    }
+                    Poll::Ready(Err(LoadError::ModuleStatus(snolc_abi::STATUS_UNSUPPORTED)))
+                    | Poll::Pending => {}
+                    Poll::Ready(Err(error)) => return Err(error.into()),
+                }
+            }
+        }
+
+        let Some(pending) = self.client_pending.as_mut() else {
+            if let Some(mux) = &mut self.mux
+                && let Poll::Ready(Err(error)) = mux.poll_drive(context)
+            {
+                return Err(error.into());
+            }
+            return Ok(());
+        };
+        if !pending.admitted {
+            let metadata = pending.metadata.abi();
+            match modules[binding.policy].policy_admit_flow(self.policy_session, &metadata, context)
+            {
+                Poll::Ready(Ok(())) => pending.admitted = true,
+                Poll::Ready(Err(error)) => {
+                    let (status, reason) = open_error(&error);
+                    modules[pending.adapter].adapter_complete_flow(
+                        pending.adapter_flow,
+                        abi_status(status),
+                        reason.as_bytes(),
+                    )?;
+                    self.client_pending = None;
+                    return Ok(());
+                }
+                Poll::Pending => return Ok(()),
+            }
+        }
+        if pending.policy_port.is_none() {
+            if pending.request.kind != StreamKind::Tcp {
+                modules[pending.adapter].adapter_complete_flow(
+                    pending.adapter_flow,
+                    snolc_abi::STATUS_UNSUPPORTED,
+                    b"UDP adapter path is unavailable",
+                )?;
+                self.client_pending = None;
+                return Ok(());
+            }
+            let (adapter_port, policy_port) = stack.open_tcp(FlowMetadata {
+                destination: pending.request.destination.clone(),
+                port: pending.request.port,
+                opaque: pending.request.metadata.clone(),
+            })?;
+            let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
+            let (adapter_handle, adapter_table) = adapter_io.raw_parts();
+            unsafe {
+                modules[pending.adapter].adapter_attach_flow(
+                    pending.adapter_flow,
+                    adapter_handle,
+                    adapter_table,
+                )?;
+            }
+            adapter_io.transfer();
+            pending.policy_port = Some(policy_port);
+        }
+        let request = pending.request.clone();
+        let mut mux = self.mux.take().ok_or(SessionFlowError::State)?;
+        self.opening = Some(Box::pin(async move {
+            let result = mux.open_flow_confirmed(&request).await;
+            (mux, result)
+        }));
         Ok(())
     }
 
@@ -1160,6 +1329,18 @@ fn open_error(error: &LoadError) -> (OpenStatus, &'static str) {
     }
 }
 
+fn abi_status(status: OpenStatus) -> u32 {
+    match status {
+        OpenStatus::Ok => snolc_abi::STATUS_OK,
+        OpenStatus::Denied => snolc_abi::STATUS_DENIED,
+        OpenStatus::Unsupported => snolc_abi::STATUS_UNSUPPORTED,
+        OpenStatus::ResourceLimit => snolc_abi::STATUS_RESOURCE,
+        OpenStatus::ConnectFailed => snolc_abi::STATUS_IO,
+        OpenStatus::ProtocolError => snolc_abi::STATUS_INVALID,
+        OpenStatus::InternalError => snolc_abi::STATUS_INTERNAL,
+    }
+}
+
 #[derive(Debug, Error)]
 enum SessionFlowError {
     #[error(transparent)]
@@ -1168,6 +1349,8 @@ enum SessionFlowError {
     Module(#[from] LoadError),
     #[error(transparent)]
     CoreIo(#[from] crate::core_io::CoreIoError),
+    #[error(transparent)]
+    Stack(#[from] StackError),
     #[error("flow state is inconsistent")]
     State,
     #[error("flow operation handle exhausted")]

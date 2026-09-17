@@ -1,7 +1,8 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -142,6 +143,83 @@ fn native_noise_policy_local_opens_private_storage_and_session() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn native_socks_tcp_payload_crosses_stack_mux_and_direct_adapter() {
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_endpoint = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        let (mut stream, _) = target.accept().unwrap();
+        let mut input = [0; 13];
+        stream.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"stack-payload");
+        stream.write_all(b"direct-reply").unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+    });
+    let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_endpoint = socks_listener.local_addr().unwrap();
+    drop(socks_listener);
+    let policy = ("policy_dummy", b"pump_buffer_bytes = 4096\n".as_slice());
+    let server = build_side(
+        "server-flow",
+        "server",
+        carrier_endpoint,
+        true,
+        ("protection_dummy", b""),
+        policy,
+    );
+    let socks_options = format!(
+        "listen = \"{socks_endpoint}\"\nmax_connections = 4\nmax_udp_associations = 2\nmax_request_bytes = 1024\nreject_fragments = true\n"
+    );
+    let client = build_side_with_adapter(
+        "client-flow",
+        "client",
+        carrier_endpoint,
+        false,
+        ("adapter_socks5", socks_options.as_bytes()),
+        ("protection_dummy", b""),
+        policy,
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+
+    let mut socks = TcpStream::connect(socks_endpoint).unwrap();
+    socks
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socks.write_all(&[5, 1, 0]).unwrap();
+    let mut greeting = [0; 2];
+    socks.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 0]);
+    let mut request = vec![5, 1, 0, 1];
+    request.extend_from_slice(&[127, 0, 0, 1]);
+    request.extend_from_slice(&target_endpoint.port().to_be_bytes());
+    request.extend_from_slice(b"stack-payload");
+    socks.write_all(&request).unwrap();
+    let mut response = [0; 10];
+    socks.read_exact(&mut response).unwrap();
+    assert_eq!(response[1], 0);
+    let mut reply = [0; 12];
+    socks.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"direct-reply");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client_handle.snapshot().flows != 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    target_thread.join().unwrap();
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+}
+
 fn run_pair(server: snolc::ValidatedConfig, client: snolc::ValidatedConfig) {
     let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
     let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
@@ -274,6 +352,29 @@ fn build_side(
     protection: (&str, &[u8]),
     policy: (&str, &[u8]),
 ) -> snolc::ValidatedConfig {
+    build_side_with_adapter(
+        identity,
+        role,
+        endpoint,
+        listen,
+        (
+            "adapter_direct",
+            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+        ),
+        protection,
+        policy,
+    )
+}
+
+fn build_side_with_adapter(
+    identity: &str,
+    role: &str,
+    endpoint: std::net::SocketAddr,
+    listen: bool,
+    adapter: (&str, &[u8]),
+    protection: (&str, &[u8]),
+    policy: (&str, &[u8]),
+) -> snolc::ValidatedConfig {
     let root = PathBuf::from(format!("/tmp/snolc-native-session-{identity}"));
     let adapter_config = root.join("adapter.toml");
     let protection_config = root.join("protection.toml");
@@ -294,8 +395,8 @@ fn build_side(
     let modules = vec![
         load(
             &format!("adapter-{identity}"),
-            "adapter_direct",
-            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+            adapter.0,
+            adapter.1,
             &adapter_config,
         ),
         load(

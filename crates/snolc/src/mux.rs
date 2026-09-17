@@ -94,6 +94,20 @@ where
         Ok(stream)
     }
 
+    pub async fn open_flow_confirmed(
+        &mut self,
+        request: &OpenRequest,
+    ) -> Result<(OpenResponse, Stream), MuxError> {
+        let mut stream = self.open_flow(request).await?;
+        match self.drive_operation(read_open_response(&mut stream)).await {
+            Ok(response) => Ok((response, stream)),
+            Err(error) => {
+                self.release_flow();
+                Err(error)
+            }
+        }
+    }
+
     pub async fn accept_flow(&mut self) -> Result<(OpenRequest, Stream), MuxError> {
         if self.role != Mode::Server || !self.policy_open {
             return Err(MuxError::PolicyRequired);
