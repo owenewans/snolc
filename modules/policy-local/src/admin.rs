@@ -105,6 +105,34 @@ pub enum CountLimit {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum WeeklyAccess {
+    Unlimited,
+    Windows { entries: Vec<WeeklyWindow> },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeeklyWindow {
+    pub weekday: Weekday,
+    pub start_second: u32,
+    pub end_second: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum Weekday {
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserSpec {
     pub status: UserStatus,
@@ -116,6 +144,7 @@ pub struct UserSpec {
     pub burst_bytes: u64,
     pub max_sessions: CountLimit,
     pub max_flows: CountLimit,
+    pub weekly_access: WeeklyAccess,
     pub weight: u32,
     pub group: String,
     pub rule_profile: String,
@@ -150,10 +179,75 @@ impl UserSpec {
             )
             || matches!(self.max_sessions, CountLimit::Limited { count: 0 })
             || matches!(self.max_flows, CountLimit::Limited { count: 0 })
+            || !self.weekly_access.valid()
         {
             return Err(AdminError::Invalid);
         }
         Ok(())
+    }
+}
+
+impl WeeklyAccess {
+    pub fn allows(&self, unix_seconds: u64) -> bool {
+        let Self::Windows { entries } = self else {
+            return true;
+        };
+        let day = Weekday::from_unix_days(unix_seconds / 86_400);
+        let second = (unix_seconds % 86_400) as u32;
+        entries.iter().any(|window| {
+            window.weekday == day && second >= window.start_second && second < window.end_second
+        })
+    }
+
+    fn valid(&self) -> bool {
+        let Self::Windows { entries } = self else {
+            return true;
+        };
+        if entries.is_empty() || entries.len() > 168 {
+            return false;
+        }
+        let mut windows: Vec<_> = entries
+            .iter()
+            .map(|window| (window.weekday, window.start_second, window.end_second))
+            .collect();
+        windows.sort_unstable();
+        windows
+            .iter()
+            .enumerate()
+            .all(|(index, (day, start, end))| {
+                *start < *end
+                    && *end <= 86_400
+                    && index.checked_sub(1).is_none_or(|previous| {
+                        windows[previous].0 != *day || windows[previous].2 <= *start
+                    })
+            })
+    }
+}
+
+impl Weekday {
+    fn from_unix_days(days: u64) -> Self {
+        match (days + 3) % 7 {
+            0 => Self::Monday,
+            1 => Self::Tuesday,
+            2 => Self::Wednesday,
+            3 => Self::Thursday,
+            4 => Self::Friday,
+            5 => Self::Saturday,
+            _ => Self::Sunday,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self, AdminError> {
+        match value {
+            0 => Ok(Self::Monday),
+            1 => Ok(Self::Tuesday),
+            2 => Ok(Self::Wednesday),
+            3 => Ok(Self::Thursday),
+            4 => Ok(Self::Friday),
+            5 => Ok(Self::Saturday),
+            6 => Ok(Self::Sunday),
+            _ => Err(AdminError::Encode),
+        }
     }
 }
 
@@ -188,6 +282,7 @@ struct StoredUserRecord {
     burst_bytes: u64,
     max_sessions: StoredCountLimit,
     max_flows: StoredCountLimit,
+    weekly_access: StoredWeeklyAccess,
     weight: u32,
     group: String,
     rule_profile: String,
@@ -222,6 +317,19 @@ enum StoredCountLimit {
     Limited(u32),
 }
 
+#[derive(Deserialize, Serialize)]
+enum StoredWeeklyAccess {
+    Unlimited,
+    Windows(Vec<StoredWeeklyWindow>),
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredWeeklyWindow {
+    weekday: u8,
+    start_second: u32,
+    end_second: u32,
+}
+
 pub(crate) fn encode_user_record(user: &UserRecord) -> Result<Vec<u8>, AdminError> {
     let stored = StoredUserRecord {
         id: user.id.clone(),
@@ -240,6 +348,7 @@ pub(crate) fn encode_user_record(user: &UserRecord) -> Result<Vec<u8>, AdminErro
         burst_bytes: user.spec.burst_bytes,
         max_sessions: stored_count(&user.spec.max_sessions),
         max_flows: stored_count(&user.spec.max_flows),
+        weekly_access: stored_weekly(&user.spec.weekly_access),
         weight: user.spec.weight,
         group: user.spec.group.clone(),
         rule_profile: user.spec.rule_profile.clone(),
@@ -272,6 +381,7 @@ pub(crate) fn decode_user_record(input: &[u8]) -> Result<UserRecord, AdminError>
             burst_bytes: stored.burst_bytes,
             max_sessions: runtime_count(stored.max_sessions),
             max_flows: runtime_count(stored.max_flows),
+            weekly_access: runtime_weekly(stored.weekly_access)?,
             weight: stored.weight,
             group: stored.group,
             rule_profile: stored.rule_profile,
@@ -309,6 +419,42 @@ fn runtime_count(limit: StoredCountLimit) -> CountLimit {
     match limit {
         StoredCountLimit::Unlimited => CountLimit::Unlimited,
         StoredCountLimit::Limited(count) => CountLimit::Limited { count },
+    }
+}
+
+fn stored_weekly(access: &WeeklyAccess) -> StoredWeeklyAccess {
+    match access {
+        WeeklyAccess::Unlimited => StoredWeeklyAccess::Unlimited,
+        WeeklyAccess::Windows { entries } => StoredWeeklyAccess::Windows(
+            entries
+                .iter()
+                .map(|window| StoredWeeklyWindow {
+                    weekday: window.weekday as u8,
+                    start_second: window.start_second,
+                    end_second: window.end_second,
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn runtime_weekly(access: StoredWeeklyAccess) -> Result<WeeklyAccess, AdminError> {
+    match access {
+        StoredWeeklyAccess::Unlimited => Ok(WeeklyAccess::Unlimited),
+        StoredWeeklyAccess::Windows(entries) => {
+            let entries = entries
+                .into_iter()
+                .map(|window| {
+                    Ok(WeeklyWindow {
+                        weekday: Weekday::from_u8(window.weekday)?,
+                        start_second: window.start_second,
+                        end_second: window.end_second,
+                    })
+                })
+                .collect::<Result<Vec<_>, AdminError>>()?;
+            let access = WeeklyAccess::Windows { entries };
+            access.valid().then_some(access).ok_or(AdminError::Encode)
+        }
     }
 }
 
@@ -732,6 +878,9 @@ rule_profile = "default"
 [user.expiration]
 mode = "unlimited"
 
+[user.weekly_access]
+mode = "unlimited"
+
 [user.quota]
 mode = "limited"
 bytes = 1000000
@@ -774,5 +923,21 @@ count = 16
             CredentialDigest::parse(&digest.hex()).unwrap().hex(),
             digest.hex()
         );
+    }
+
+    #[test]
+    fn weekly_windows_use_utc_and_reject_overlap() {
+        let access: WeeklyAccess = toml::from_str(
+            "mode = \"windows\"\n[[entries]]\nweekday = \"thursday\"\nstart_second = 0\nend_second = 7200\n",
+        )
+        .unwrap();
+        assert!(access.valid());
+        assert!(access.allows(3600));
+        assert!(!access.allows(7200));
+        let overlap: WeeklyAccess = toml::from_str(
+            "mode = \"windows\"\n[[entries]]\nweekday = \"monday\"\nstart_second = 0\nend_second = 100\n[[entries]]\nweekday = \"monday\"\nstart_second = 99\nend_second = 200\n",
+        )
+        .unwrap();
+        assert!(!overlap.valid());
     }
 }

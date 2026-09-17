@@ -1196,6 +1196,8 @@ rule_profile = "default"
 
 [user.expiration]
 mode = "unlimited"
+[user.weekly_access]
+mode = "unlimited"
 [user.quota]
 mode = "limited"
 bytes = 1048576

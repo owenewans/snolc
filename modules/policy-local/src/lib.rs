@@ -12,7 +12,7 @@ pub use accounting::{QuotaAccount, QuotaError, TokenBucket};
 pub use admin::{
     AdminDecision, AdminError, AdminSequencer, ByteLimit, ControlRequest, CountLimit, Credential,
     CredentialDigest, CredentialRecord, Expiration, RateLimit, RuleApply, UserId, UserRecord,
-    UserSpec, UserStatus,
+    UserSpec, UserStatus, Weekday, WeeklyAccess, WeeklyWindow,
 };
 pub use config::Options;
 pub use frame::{FrameDecoder, FrameError, encode_frame};
@@ -160,6 +160,10 @@ enum AuthState {
     User {
         user_id: String,
         reply: storage::ReadReply,
+    },
+    Clock {
+        user: Box<UserRecord>,
+        reply: storage::WriteReply,
     },
     Authenticated(String),
 }
@@ -713,7 +717,7 @@ unsafe extern "C" fn admit_flow(
             let Some(user) = state.admin.users.get(&user_id) else {
                 return abi::STATUS_DENIED;
             };
-            if !user_available(user) || flow_limit_reached(state, user) {
+            if !user_available_at(user, current_utc()) || flow_limit_reached(state, user) {
                 return abi::STATUS_DENIED;
             }
             let sniff = match destination_policy(state, user, &metadata) {
@@ -870,7 +874,18 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
             return abi::STATUS_INVALID;
         };
         let mut context = Context::from_waker(Waker::noop());
-        let stopped_users = advance_quota(state);
+        let now_utc = current_utc();
+        for user in state.admin.users.values_mut() {
+            user.max_observed_utc = user.max_observed_utc.max(now_utc);
+        }
+        let mut stopped_users: HashSet<_> = state
+            .admin
+            .users
+            .iter()
+            .filter(|(_, user)| !user_available_at(user, now_utc))
+            .map(|(id, _)| id.clone())
+            .collect();
+        stopped_users.extend(advance_quota(state));
         if !stopped_users.is_empty() {
             state.flows.retain(|_, flow| {
                 !flow
@@ -1644,8 +1659,9 @@ fn advance_authentication(state: &mut State, session: &mut PolicySession) -> Res
         },
         AuthState::User { user_id, reply } => match reply.try_recv() {
             Ok(Ok(Some(value))) => {
-                let user = decode_user_record(&value).map_err(|_| abi::STATUS_IO)?;
-                if user.id != user_id || !user_available(&user) {
+                let mut user = decode_user_record(&value).map_err(|_| abi::STATUS_IO)?;
+                let now = current_utc();
+                if user.id != user_id || !user_available_at(&user, now) {
                     queue_denied(session, "user-disabled")?;
                     return Ok(());
                 }
@@ -1653,20 +1669,31 @@ fn advance_authentication(state: &mut State, session: &mut PolicySession) -> Res
                     queue_denied(session, "session-limit")?;
                     return Ok(());
                 }
-                state.admin.loaded_users.insert(user_id.clone());
-                state.admin.users.insert(user_id.clone(), user);
-                session.auth = AuthState::Authenticated(user_id.clone());
-                let status = status_message(state, &user_id, "authenticated")?;
-                session
-                    .channel
-                    .queue_response(&status)
-                    .map_err(|_| abi::STATUS_RESOURCE)?;
+                if now > user.max_observed_utc {
+                    user.max_observed_utc = now;
+                    let value = encode_user_record(&user).map_err(admin_status)?;
+                    let reply = state
+                        .storage
+                        .put(format!("user/{user_id}"), value)
+                        .map_err(storage_status)?;
+                    session.auth = AuthState::Clock {
+                        user: Box::new(user),
+                        reply,
+                    };
+                } else {
+                    finish_authentication(state, session, user)?;
+                }
             }
             Ok(Ok(None)) => queue_denied(session, "user-unknown")?,
             Ok(Err(_)) | Err(TryRecvError::Disconnected) => return Err(abi::STATUS_IO),
             Err(TryRecvError::Empty) => {
                 session.auth = AuthState::User { user_id, reply };
             }
+        },
+        AuthState::Clock { user, reply } => match reply.try_recv() {
+            Ok(Ok(())) => finish_authentication(state, session, *user)?,
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => return Err(abi::STATUS_IO),
+            Err(TryRecvError::Empty) => session.auth = AuthState::Clock { user, reply },
         },
         auth => session.auth = auth,
     }
@@ -1680,18 +1707,41 @@ fn queue_denied(session: &mut PolicySession, reason: &str) -> Result<(), u32> {
         .map_err(|_| abi::STATUS_RESOURCE)
 }
 
-fn user_available(user: &UserRecord) -> bool {
+fn finish_authentication(
+    state: &mut State,
+    session: &mut PolicySession,
+    user: UserRecord,
+) -> Result<(), u32> {
+    let user_id = user.id.clone();
+    state.admin.loaded_users.insert(user_id.clone());
+    state.admin.users.insert(user_id.clone(), user);
+    session.auth = AuthState::Authenticated(user_id.clone());
+    let status = status_message(state, &user_id, "authenticated")?;
+    session
+        .channel
+        .queue_response(&status)
+        .map_err(|_| abi::STATUS_RESOURCE)
+}
+
+fn current_utc() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(u64::MAX)
+}
+
+fn user_available_at(user: &UserRecord, now: u64) -> bool {
     if user.spec.status != UserStatus::Enabled {
         return false;
     }
-    if let Expiration::AtUtc { unix_seconds } = user.spec.expiration {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(u64::MAX);
-        if now >= unix_seconds {
-            return false;
-        }
+    let now = now.max(user.max_observed_utc);
+    if let Expiration::AtUtc { unix_seconds } = user.spec.expiration
+        && now >= unix_seconds
+    {
+        return false;
+    }
+    if !user.spec.weekly_access.allows(now) {
+        return false;
     }
     !matches!(
         user.spec.quota,
@@ -2197,7 +2247,7 @@ fn prepare_admin_mutation(state: &State, request: ControlRequest) -> Result<Prep
                 durable_charged_bytes: 0,
                 upload_bytes: 0,
                 download_bytes: 0,
-                max_observed_utc: 0,
+                max_observed_utc: current_utc(),
             };
             put_user(&mut mutation, &mut changes, record)?;
             (Some(id), 1)
@@ -2396,7 +2446,7 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
         .users
         .iter()
         .filter_map(|(id, user)| match user {
-            Some(user) if user_available(user) => None,
+            Some(user) if user_available_at(user, current_utc()) => None,
             _ => Some(id.clone()),
         })
         .collect();
@@ -2886,6 +2936,55 @@ mod module_tests {
     }
 
     #[test]
+    fn saved_utc_prevents_clock_rollback_from_restoring_access() {
+        let spec: UserSpec = toml::from_str(
+            r#"
+status = "enabled"
+burst_bytes = 65507
+weight = 1
+group = "default"
+rule_profile = "default"
+
+[expiration]
+mode = "at-utc"
+unix_seconds = 150
+
+[weekly_access]
+mode = "unlimited"
+
+[quota]
+mode = "unlimited"
+
+[upload_rate]
+mode = "unlimited"
+
+[download_rate]
+mode = "unlimited"
+
+[combined_rate]
+mode = "unlimited"
+
+[max_sessions]
+mode = "unlimited"
+
+[max_flows]
+mode = "unlimited"
+"#,
+        )
+        .unwrap();
+        let user = UserRecord {
+            id: "00".repeat(16),
+            spec,
+            revision: 1,
+            durable_charged_bytes: 0,
+            upload_bytes: 0,
+            download_bytes: 0,
+            max_observed_utc: 200,
+        };
+        assert!(!user_available_at(&user, 100));
+    }
+
+    #[test]
     fn static_destination_rules_match_cidr_and_domain_boundaries() {
         assert!(cidr_matches("10.0.0.0/8", "10.42.0.1".parse().unwrap()));
         assert!(!cidr_matches("10.0.0.0/8", "11.0.0.1".parse().unwrap()));
@@ -2977,6 +3076,8 @@ group = "default"
 rule_profile = "default"
 
 [user.expiration]
+mode = "unlimited"
+[user.weekly_access]
 mode = "unlimited"
 [user.quota]
 mode = "limited"
@@ -3077,6 +3178,9 @@ group = "default"
 rule_profile = "default"
 
 [user.expiration]
+mode = "unlimited"
+
+[user.weekly_access]
 mode = "unlimited"
 
 [user.quota]
