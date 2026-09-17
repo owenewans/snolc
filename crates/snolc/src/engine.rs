@@ -23,7 +23,10 @@ use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::logging::{FileLogger, LogError};
 use crate::mux::{MuxError, MuxSession};
-use crate::stack::{FlowMetadata, SharedStackBridge, StackError, TcpStreamPort, UdpDatagramPort};
+use crate::stack::{
+    FlowMetadata, PacketTcpPort, PacketUdpPort, SharedStackBridge, StackError, TcpStreamPort,
+    UdpDatagramPort,
+};
 use crate::wire::{Destination, OpenRequest, OpenResponse, OpenStatus, StreamKind};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
@@ -153,16 +156,14 @@ struct PendingServerFlow {
 }
 
 struct ActiveServerFlow {
-    adapter: usize,
-    adapter_flow: u64,
+    adapter_flow: Option<(usize, u64)>,
     mux_handle: u64,
 }
 
 struct PendingClientFlow {
     request: OpenRequest,
     metadata: OwnedFlowMetadata,
-    adapter: usize,
-    adapter_flow: u64,
+    adapter_flow: Option<(usize, u64)>,
     admitted: bool,
     policy_port: Option<ClientPolicyPort>,
 }
@@ -174,6 +175,8 @@ enum PendingPorts {
 
 enum ClientPolicyPort {
     Tcp(TcpStreamPort),
+    PacketTcp(PacketTcpPort),
+    PacketUdp(PacketUdpPort),
     Udp(UdpDatagramPort),
 }
 
@@ -1116,6 +1119,25 @@ impl EstablishedSession {
                                 mux_io.transfer();
                                 mux_handle
                             }
+                            ClientPolicyPort::PacketTcp(policy_port) => {
+                                let policy_io =
+                                    RegisteredIo::register(policy_port, binding.core_io_limit)?;
+                                let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+                                let (policy_handle, policy_table) = policy_io.raw_parts();
+                                let (mux_handle, mux_table) = mux_io.raw_parts();
+                                unsafe {
+                                    modules[binding.policy].policy_attach_flow(
+                                        self.policy_session,
+                                        policy_handle,
+                                        policy_table,
+                                        mux_handle,
+                                        mux_table,
+                                    )?;
+                                }
+                                policy_io.transfer();
+                                mux_io.transfer();
+                                mux_handle
+                            }
                             ClientPolicyPort::Udp(policy_port) => {
                                 let policy_io = RegisteredDatagramIo::register(
                                     policy_port,
@@ -1140,39 +1162,114 @@ impl EstablishedSession {
                                 mux_io.transfer();
                                 mux_handle
                             }
+                            ClientPolicyPort::PacketUdp(policy_port) => {
+                                let policy_io = RegisteredDatagramIo::register(
+                                    policy_port,
+                                    binding.core_io_limit,
+                                )?;
+                                let mux_io = RegisteredDatagramIo::register(
+                                    MuxDatagramIo::new(stream),
+                                    binding.core_io_limit,
+                                )?;
+                                let (policy_handle, policy_table) = policy_io.raw_parts();
+                                let (mux_handle, mux_table) = mux_io.raw_parts();
+                                unsafe {
+                                    modules[binding.policy].policy_attach_datagram_flow(
+                                        self.policy_session,
+                                        policy_handle,
+                                        policy_table,
+                                        mux_handle,
+                                        mux_table,
+                                    )?;
+                                }
+                                policy_io.transfer();
+                                mux_io.transfer();
+                                mux_handle
+                            }
                         };
-                        modules[pending.adapter].adapter_complete_flow(
-                            pending.adapter_flow,
-                            snolc_abi::STATUS_OK,
-                            &[],
-                        )?;
+                        if let Some((adapter, flow)) = pending.adapter_flow {
+                            modules[adapter].adapter_complete_flow(
+                                flow,
+                                snolc_abi::STATUS_OK,
+                                &[],
+                            )?;
+                        }
                         self.active.push(ActiveServerFlow {
-                            adapter: pending.adapter,
                             adapter_flow: pending.adapter_flow,
                             mux_handle,
                         });
                     }
                     Ok((response, _)) => {
-                        modules[pending.adapter].adapter_complete_flow(
-                            pending.adapter_flow,
-                            abi_status(response.status),
-                            response.reason.as_bytes(),
-                        )?;
+                        if let Some((adapter, flow)) = pending.adapter_flow {
+                            modules[adapter].adapter_complete_flow(
+                                flow,
+                                abi_status(response.status),
+                                response.reason.as_bytes(),
+                            )?;
+                        }
                         if let Some(mux) = &mut self.mux {
                             mux.release_flow();
                         }
                     }
                     Err(error) => {
-                        let _ = modules[pending.adapter].adapter_complete_flow(
-                            pending.adapter_flow,
-                            snolc_abi::STATUS_IO,
-                            b"tunnel stream failed",
-                        );
+                        if let Some((adapter, flow)) = pending.adapter_flow {
+                            let _ = modules[adapter].adapter_complete_flow(
+                                flow,
+                                snolc_abi::STATUS_IO,
+                                b"tunnel stream failed",
+                            );
+                        }
                         return Err(error.into());
                     }
                 }
             }
             return Ok(());
+        }
+
+        if self.client_pending.is_none()
+            && binding
+                .adapters
+                .iter()
+                .copied()
+                .any(|adapter| modules[adapter].supports_packet_port())
+            && let Some((metadata, policy_port)) = stack.accept_packet_tcp()?
+        {
+            let request = OpenRequest {
+                kind: StreamKind::Tcp,
+                destination: metadata.destination,
+                port: metadata.port,
+                metadata: metadata.opaque,
+            };
+            self.client_pending = Some(PendingClientFlow {
+                metadata: OwnedFlowMetadata::from_request(&request),
+                request,
+                adapter_flow: None,
+                admitted: false,
+                policy_port: Some(ClientPolicyPort::PacketTcp(policy_port)),
+            });
+        }
+
+        if self.client_pending.is_none()
+            && binding
+                .adapters
+                .iter()
+                .copied()
+                .any(|adapter| modules[adapter].supports_packet_port())
+            && let Some((metadata, policy_port)) = stack.accept_packet_udp()?
+        {
+            let request = OpenRequest {
+                kind: StreamKind::Udp,
+                destination: metadata.destination,
+                port: metadata.port,
+                metadata: metadata.opaque,
+            };
+            self.client_pending = Some(PendingClientFlow {
+                metadata: OwnedFlowMetadata::from_request(&request),
+                request,
+                adapter_flow: None,
+                admitted: false,
+                policy_port: Some(ClientPolicyPort::PacketUdp(policy_port)),
+            });
         }
 
         if self.client_pending.is_none() {
@@ -1182,8 +1279,7 @@ impl EstablishedSession {
                         self.client_pending = Some(PendingClientFlow {
                             metadata: OwnedFlowMetadata::from_request(&request),
                             request,
-                            adapter: *adapter,
-                            adapter_flow,
+                            adapter_flow: Some((*adapter, adapter_flow)),
                             admitted: false,
                             policy_port: None,
                         });
@@ -1211,11 +1307,13 @@ impl EstablishedSession {
                 Poll::Ready(Ok(())) => pending.admitted = true,
                 Poll::Ready(Err(error)) => {
                     let (status, reason) = open_error(&error);
-                    modules[pending.adapter].adapter_complete_flow(
-                        pending.adapter_flow,
-                        abi_status(status),
-                        reason.as_bytes(),
-                    )?;
+                    if let Some((adapter, flow)) = pending.adapter_flow {
+                        modules[adapter].adapter_complete_flow(
+                            flow,
+                            abi_status(status),
+                            reason.as_bytes(),
+                        )?;
+                    }
                     self.client_pending = None;
                     return Ok(());
                 }
@@ -1223,6 +1321,7 @@ impl EstablishedSession {
             }
         }
         if pending.policy_port.is_none() {
+            let (adapter, adapter_flow) = pending.adapter_flow.ok_or(SessionFlowError::State)?;
             let metadata = FlowMetadata {
                 destination: pending.request.destination.clone(),
                 port: pending.request.port,
@@ -1234,8 +1333,8 @@ impl EstablishedSession {
                     let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
                     let (adapter_handle, adapter_table) = adapter_io.raw_parts();
                     unsafe {
-                        modules[pending.adapter].adapter_attach_flow(
-                            pending.adapter_flow,
+                        modules[adapter].adapter_attach_flow(
+                            adapter_flow,
                             adapter_handle,
                             adapter_table,
                         )?;
@@ -1249,8 +1348,8 @@ impl EstablishedSession {
                         RegisteredDatagramIo::register(adapter_port, binding.core_io_limit)?;
                     let (adapter_handle, adapter_table) = adapter_io.raw_parts();
                     unsafe {
-                        modules[pending.adapter].adapter_attach_datagram(
-                            pending.adapter_flow,
+                        modules[adapter].adapter_attach_datagram(
+                            adapter_flow,
                             adapter_handle,
                             adapter_table,
                         )?;
@@ -1428,8 +1527,7 @@ impl EstablishedSession {
         };
         modules[adapter].adapter_complete_flow(adapter_flow, snolc_abi::STATUS_OK, &[])?;
         self.active.push(ActiveServerFlow {
-            adapter,
-            adapter_flow,
+            adapter_flow: Some((adapter, adapter_flow)),
             mux_handle,
         });
         Ok(())
@@ -1452,7 +1550,9 @@ impl EstablishedSession {
             if is_registered(flow.mux_handle) {
                 true
             } else {
-                closed.push((flow.adapter, flow.adapter_flow));
+                if let Some(adapter_flow) = flow.adapter_flow {
+                    closed.push(adapter_flow);
+                }
                 false
             }
         });

@@ -3,6 +3,8 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,6 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, PrivateKey};
 use sha2::{Digest, Sha256};
+use smoltcp::iface::{Config as InterfaceConfig, Interface, PollIngressSingleResult, SocketSet};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::tcp;
+use smoltcp::time::Instant as SmolInstant;
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use snolc::config::Config;
 use snolc::loader::LoadedModule;
 use snolc::{Engine, Event, Host, Lifecycle};
@@ -90,6 +97,315 @@ fn native_ssh_carrier_establishes_policy_session() {
     );
     run_pair(server, client);
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn native_tun_tcp_path_uses_packet_port_and_smoltcp() {
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_endpoint = echo.local_addr().unwrap();
+    let echo_thread = thread::spawn(move || {
+        let (mut stream, _) = echo.accept().unwrap();
+        let mut input = [0; 4];
+        stream.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"ping");
+        stream.write_all(b"pong").unwrap();
+    });
+    let (module_tun, client_tun) = UnixDatagram::pair().unwrap();
+    client_tun.set_nonblocking(true).unwrap();
+    let adapter_options = format!(
+        "mode = \"android-fd\"\nfd = {}\nmtu = 1280\npacket_queue_bytes = 262144\n",
+        module_tun.as_raw_fd()
+    );
+    let server = build_side(
+        "server-tun",
+        "server",
+        carrier_endpoint,
+        true,
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
+    );
+    let client = build_side_with_adapter(
+        "client-tun",
+        "client",
+        carrier_endpoint,
+        false,
+        ("adapter_tun", adapter_options.as_bytes()),
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+    drop(module_tun);
+
+    let mut device = TunFixtureDevice {
+        socket: client_tun,
+        mtu: 1280,
+    };
+    let mut interface = Interface::new(
+        InterfaceConfig::new(HardwareAddress::Ip),
+        &mut device,
+        SmolInstant::from_millis(0),
+    );
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
+            .unwrap();
+    });
+    interface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(10, 0, 0, 1))
+        .unwrap();
+    let mut sockets = SocketSet::new(Vec::new());
+    let socket = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 16_384]),
+        tcp::SocketBuffer::new(vec![0; 16_384]),
+    ));
+    let std::net::IpAddr::V4(echo_ip) = echo_endpoint.ip() else {
+        panic!("fixture endpoint must use IPv4");
+    };
+    let [a, b, c, d] = echo_ip.octets();
+    {
+        let context = interface.context();
+        sockets
+            .get_mut::<tcp::Socket>(socket)
+            .connect(
+                context,
+                IpEndpoint::new(
+                    IpAddress::Ipv4(Ipv4Address::new(a, b, c, d)),
+                    echo_endpoint.port(),
+                ),
+                40_001,
+            )
+            .unwrap();
+    }
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(5);
+    let mut sent = false;
+    let mut output = [0; 4];
+    loop {
+        let now = SmolInstant::from_millis(started.elapsed().as_millis() as i64);
+        interface.poll_maintenance(now);
+        for _ in 0..32 {
+            if matches!(
+                interface.poll_ingress_single(now, &mut device, &mut sockets),
+                PollIngressSingleResult::None
+            ) {
+                break;
+            }
+        }
+        let _ = interface.poll_egress(now, &mut device, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(socket);
+        if socket.state() == tcp::State::Established && !sent && socket.can_send() {
+            assert_eq!(socket.send_slice(b"ping").unwrap(), 4);
+            sent = true;
+        }
+        if socket.can_recv() && socket.recv_slice(&mut output).unwrap() == 4 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "TUN TCP exchange timed out");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(&output, b"pong");
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+    echo_thread.join().unwrap();
+}
+
+#[test]
+fn native_tun_udp_path_preserves_datagrams() {
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_endpoint = echo.local_addr().unwrap();
+    let echo_thread = thread::spawn(move || {
+        let mut input = [0; 4];
+        let (length, peer) = echo.recv_from(&mut input).unwrap();
+        assert_eq!(&input[..length], b"ping");
+        echo.send_to(b"pong", peer).unwrap();
+    });
+    let (module_tun, client_tun) = UnixDatagram::pair().unwrap();
+    client_tun.set_nonblocking(true).unwrap();
+    let adapter_options = format!(
+        "mode = \"android-fd\"\nfd = {}\nmtu = 1280\npacket_queue_bytes = 262144\n",
+        module_tun.as_raw_fd()
+    );
+    let server = build_side(
+        "server-tun-udp",
+        "server",
+        carrier_endpoint,
+        true,
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 65507\n"),
+    );
+    let client = build_side_with_adapter(
+        "client-tun-udp",
+        "client",
+        carrier_endpoint,
+        false,
+        ("adapter_tun", adapter_options.as_bytes()),
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 65507\n"),
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+    drop(module_tun);
+
+    let mut device = TunFixtureDevice {
+        socket: client_tun,
+        mtu: 1280,
+    };
+    let mut interface = Interface::new(
+        InterfaceConfig::new(HardwareAddress::Ip),
+        &mut device,
+        SmolInstant::from_millis(0),
+    );
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
+            .unwrap();
+    });
+    interface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(10, 0, 0, 1))
+        .unwrap();
+    let mut sockets = SocketSet::new(Vec::new());
+    let socket = sockets.add(tun_fixture_udp_socket());
+    sockets
+        .get_mut::<smoltcp::socket::udp::Socket>(socket)
+        .bind(40_001)
+        .unwrap();
+    let std::net::IpAddr::V4(echo_ip) = echo_endpoint.ip() else {
+        panic!("fixture endpoint must use IPv4");
+    };
+    let [a, b, c, d] = echo_ip.octets();
+    let destination = IpEndpoint::new(
+        IpAddress::Ipv4(Ipv4Address::new(a, b, c, d)),
+        echo_endpoint.port(),
+    );
+    sockets
+        .get_mut::<smoltcp::socket::udp::Socket>(socket)
+        .send_slice(b"ping", destination)
+        .unwrap();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(5);
+    let mut output = [0; 4];
+    loop {
+        let now = SmolInstant::from_millis(started.elapsed().as_millis() as i64);
+        interface.poll_maintenance(now);
+        for _ in 0..32 {
+            if matches!(
+                interface.poll_ingress_single(now, &mut device, &mut sockets),
+                PollIngressSingleResult::None
+            ) {
+                break;
+            }
+        }
+        let _ = interface.poll_egress(now, &mut device, &mut sockets);
+        let socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(socket);
+        if socket.can_recv() {
+            let (length, peer) = socket.recv_slice(&mut output).unwrap();
+            assert_eq!(length, 4);
+            assert_eq!(peer.endpoint, destination);
+            break;
+        }
+        assert!(Instant::now() < deadline, "TUN UDP exchange timed out");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(&output, b"pong");
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+    echo_thread.join().unwrap();
+}
+
+fn tun_fixture_udp_socket() -> smoltcp::socket::udp::Socket<'static> {
+    smoltcp::socket::udp::Socket::new(
+        smoltcp::socket::udp::PacketBuffer::new(
+            vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8],
+            vec![0; 131_072],
+        ),
+        smoltcp::socket::udp::PacketBuffer::new(
+            vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 8],
+            vec![0; 131_072],
+        ),
+    )
+}
+
+struct TunFixtureDevice {
+    socket: UnixDatagram,
+    mtu: usize,
+}
+
+struct TunFixtureRx(Vec<u8>);
+
+struct TunFixtureTx<'a>(&'a UnixDatagram);
+
+impl Device for TunFixtureDevice {
+    type RxToken<'a> = TunFixtureRx;
+    type TxToken<'a> = TunFixtureTx<'a>;
+
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let mut packet = vec![0; self.mtu];
+        match self.socket.recv(&mut packet) {
+            Ok(length) => {
+                packet.truncate(length);
+                Some((TunFixtureRx(packet), TunFixtureTx(&self.socket)))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("TUN fixture receive failed: {error}"),
+        }
+    }
+
+    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(TunFixtureTx(&self.socket))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.medium = Medium::Ip;
+        capabilities.max_transmission_unit = self.mtu;
+        capabilities.checksum = ChecksumCapabilities::ignored();
+        capabilities
+    }
+}
+
+impl RxToken for TunFixtureRx {
+    fn consume<R, F>(self, function: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        function(&self.0)
+    }
+}
+
+impl TxToken for TunFixtureTx<'_> {
+    fn consume<R, F>(self, length: usize, function: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut packet = vec![0; length];
+        let result = function(&mut packet);
+        assert_eq!(self.0.send(&packet).unwrap(), packet.len());
+        result
+    }
 }
 
 #[test]

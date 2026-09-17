@@ -42,6 +42,11 @@ pub struct LoadedModule {
 unsafe impl Send for LoadedModule {}
 
 impl LoadedModule {
+    pub(crate) fn supports_packet_port(&self) -> bool {
+        unsafe { self.descriptor().adapter.as_ref() }
+            .is_some_and(|adapter| adapter.attach_packet_port.is_some())
+    }
+
     pub fn load(
         instance_name: String,
         path: &Path,
