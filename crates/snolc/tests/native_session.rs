@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -299,6 +299,99 @@ fn native_http_connect_preserves_early_payload() {
     assert_eq!(&reply, b"http-reply");
     proxy.shutdown(Shutdown::Both).unwrap();
     target_thread.join().unwrap();
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_socks_udp_preserves_datagram_boundaries() {
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let target = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let target_endpoint = target.local_addr().unwrap();
+    target
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let payloads = [Vec::new(), vec![1], b"udp-through-stack".to_vec()];
+    let expected = payloads.clone();
+    let target_thread = thread::spawn(move || {
+        let mut buffer = [0; 65_507];
+        for payload in expected {
+            let (length, source) = target.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..length], payload);
+            target.send_to(&buffer[..length], source).unwrap();
+        }
+    });
+    let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_endpoint = socks_listener.local_addr().unwrap();
+    drop(socks_listener);
+    let policy = ("policy_dummy", b"pump_buffer_bytes = 4096\n".as_slice());
+    let server = build_side(
+        "server-udp",
+        "server",
+        carrier_endpoint,
+        true,
+        ("protection_dummy", b""),
+        policy,
+    );
+    let socks_options = format!(
+        "listen = \"{socks_endpoint}\"\nmax_connections = 8\nmax_udp_associations = 2\nmax_request_bytes = 1024\nreject_fragments = true\n"
+    );
+    let client = build_side_with_adapter(
+        "client-udp",
+        "client",
+        carrier_endpoint,
+        false,
+        ("adapter_socks5", socks_options.as_bytes()),
+        ("protection_dummy", b""),
+        policy,
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+
+    let mut control = TcpStream::connect(socks_endpoint).unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    control.write_all(&[5, 1, 0]).unwrap();
+    let mut greeting = [0; 2];
+    control.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 0]);
+    control
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let mut response = [0; 10];
+    control.read_exact(&mut response).unwrap();
+    assert_eq!(response[..4], [5, 0, 0, 1]);
+    let relay = std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::new(response[4], response[5], response[6], response[7]),
+        u16::from_be_bytes([response[8], response[9]]),
+    );
+    let client_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client_udp
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    for payload in payloads {
+        let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
+        packet.extend_from_slice(&target_endpoint.port().to_be_bytes());
+        packet.extend_from_slice(&payload);
+        client_udp.send_to(&packet, relay).unwrap();
+        let mut reply = [0; 65_535];
+        let (length, _) = client_udp.recv_from(&mut reply).unwrap();
+        assert!(length >= 10);
+        assert_eq!(&reply[..8], &packet[..8]);
+        assert_eq!(&reply[8..10], &target_endpoint.port().to_be_bytes());
+        assert_eq!(&reply[10..length], payload);
+    }
+    target_thread.join().unwrap();
+    drop(control);
     client_handle.shutdown().unwrap();
     server_handle.shutdown().unwrap();
     client_thread.join().unwrap().unwrap();
