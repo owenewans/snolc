@@ -235,6 +235,34 @@ impl LoadedModule {
         self.finish_byte_io(status, stream, vec![Arc::clone(&self.library)])
     }
 
+    pub fn adapter_open(
+        &self,
+        request: &[u8],
+        context: &mut Context<'_>,
+    ) -> Poll<Result<u64, LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let adapter = match unsafe { self.descriptor().adapter.as_ref() } {
+            Some(adapter) => adapter,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))),
+        };
+        let open = match adapter.open {
+            Some(open) => open,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let mut flow = 0;
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe { open(instance, bytes(request), wake.handle(), &mut flow) };
+        match status {
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            snolc_abi::STATUS_OK if flow == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
+            snolc_abi::STATUS_OK => Poll::Ready(Ok(flow)),
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
+        }
+    }
+
     pub fn protection_wrap(
         &self,
         lower: &mut Option<ModuleByteIo>,
@@ -323,6 +351,65 @@ impl LoadedModule {
             snolc_abi::STATUS_OK if session == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
             snolc_abi::STATUS_OK => Poll::Ready(Ok(session)),
             status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
+        }
+    }
+
+    pub fn policy_admit_flow(
+        &self,
+        policy_session: u64,
+        metadata: &[u8],
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), LoadError>> {
+        let instance = match self.instance {
+            Some(instance) => instance,
+            None => return Poll::Ready(Err(LoadError::NotCreated)),
+        };
+        let policy = match unsafe { self.descriptor().policy.as_ref() } {
+            Some(policy) => policy,
+            None => return Poll::Ready(Err(LoadError::ClassTable(snolc_abi::CLASS_POLICY))),
+        };
+        let admit = match policy.admit_flow {
+            Some(admit) => admit,
+            None => return Poll::Ready(Err(LoadError::MissingFunction)),
+        };
+        let wake = WakeCall::new(context.waker());
+        let status = unsafe { admit(instance, policy_session, bytes(metadata), wake.handle()) };
+        match status {
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            snolc_abi::STATUS_OK => Poll::Ready(Ok(())),
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Both handles and I/O tables must remain valid until the policy closes them.
+    pub unsafe fn policy_attach_flow(
+        &self,
+        policy_session: u64,
+        stack_handle: u64,
+        stack_io: *const SnolByteIoV1,
+        mux_handle: u64,
+        mux_io: *const SnolByteIoV1,
+    ) -> Result<(), LoadError> {
+        let instance = self.instance.ok_or(LoadError::NotCreated)?;
+        let policy = unsafe { self.descriptor().policy.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_POLICY))?;
+        let attach = policy.attach_flow.ok_or(LoadError::MissingFunction)?;
+        let status = unsafe {
+            attach(
+                instance,
+                policy_session,
+                stack_handle,
+                stack_io,
+                mux_handle,
+                mux_io,
+            )
+        };
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(LoadError::ModuleStatus(status))
         }
     }
 
