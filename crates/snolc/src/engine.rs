@@ -18,6 +18,7 @@ use crate::core_io::RegisteredIo;
 use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::mux::{MuxError, MuxSession};
+use crate::stack::{SharedStackBridge, StackError};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
 const MODULE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -250,6 +251,12 @@ impl Engine {
                 return Err(error.into());
             }
         }
+        let stack = SharedStackBridge::new(
+            self.validated.config.stack.clone(),
+            self.validated.config.engine.max_flows,
+            self.validated.config.engine.max_managed_bytes,
+            self.validated.config.engine.max_ingress_packets_per_tick,
+        )?;
         let mut tunnels: Vec<_> = self
             .validated
             .tunnels
@@ -280,6 +287,7 @@ impl Engine {
                     }
                 },
                 _ = timer => {
+                    stack.poll();
                     self.poll_modules();
                     self.poll_tunnels(&mut tunnels);
                     self.drain_module_events();
@@ -795,6 +803,8 @@ pub enum EngineError {
     Config(#[from] crate::config::ConfigError),
     #[error(transparent)]
     Module(#[from] LoadError),
+    #[error(transparent)]
+    Stack(#[from] StackError),
     #[error("module instance {0} is duplicated")]
     DuplicateInstance(String),
     #[error("required module class mask {0:#x} is missing")]

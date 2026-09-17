@@ -1,6 +1,12 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::io;
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant as StdInstant;
 
+use futures::io::{AsyncRead, AsyncWrite};
 use smoltcp::iface::{
     Config as InterfaceConfig, Interface, PollIngressSingleResult, SocketHandle, SocketSet,
 };
@@ -59,6 +65,224 @@ pub struct StackBridge {
     max_managed_bytes: usize,
     max_ingress_packets_per_tick: usize,
     started: StdInstant,
+}
+
+pub struct SharedStackBridge {
+    inner: Rc<RefCell<StackBridge>>,
+    wakes: RefCell<Vec<Weak<PortWake>>>,
+}
+
+pub struct TcpStreamPort {
+    bridge: Weak<RefCell<StackBridge>>,
+    lease: Rc<TcpFlowLease>,
+    side: Side,
+    wake: Rc<PortWake>,
+    write_shutdown: bool,
+}
+
+struct TcpFlowLease {
+    bridge: Weak<RefCell<StackBridge>>,
+    handle: TcpFlowHandle,
+}
+
+#[derive(Default)]
+struct PortWake {
+    waker: RefCell<Option<Waker>>,
+}
+
+impl SharedStackBridge {
+    pub fn new(
+        config: StackConfig,
+        max_flows: usize,
+        max_managed_bytes: usize,
+        max_ingress_packets_per_tick: usize,
+    ) -> Result<Self, StackError> {
+        Ok(Self {
+            inner: Rc::new(RefCell::new(StackBridge::new(
+                config,
+                max_flows,
+                max_managed_bytes,
+                max_ingress_packets_per_tick,
+            )?)),
+            wakes: RefCell::new(Vec::new()),
+        })
+    }
+
+    pub fn open_tcp(
+        &self,
+        metadata: FlowMetadata,
+    ) -> Result<(TcpStreamPort, TcpStreamPort), StackError> {
+        let handle = self.inner.borrow_mut().open_tcp(metadata)?;
+        let lease = Rc::new(TcpFlowLease {
+            bridge: Rc::downgrade(&self.inner),
+            handle,
+        });
+        let adapter_wake = Rc::new(PortWake::default());
+        let policy_wake = Rc::new(PortWake::default());
+        self.wakes
+            .borrow_mut()
+            .extend([Rc::downgrade(&adapter_wake), Rc::downgrade(&policy_wake)]);
+        Ok((
+            TcpStreamPort {
+                bridge: Rc::downgrade(&self.inner),
+                lease: Rc::clone(&lease),
+                side: Side::Adapter,
+                wake: adapter_wake,
+                write_shutdown: false,
+            },
+            TcpStreamPort {
+                bridge: Rc::downgrade(&self.inner),
+                lease,
+                side: Side::Policy,
+                wake: policy_wake,
+                write_shutdown: false,
+            },
+        ))
+    }
+
+    pub fn poll(&self) {
+        self.inner.borrow_mut().poll();
+        self.wakes.borrow_mut().retain(|wake| {
+            let Some(wake) = wake.upgrade() else {
+                return false;
+            };
+            if let Some(waker) = wake.waker.borrow_mut().take() {
+                waker.wake();
+            }
+            true
+        });
+    }
+
+    pub fn managed_bytes(&self) -> usize {
+        self.inner.borrow().managed_bytes()
+    }
+}
+
+impl TcpStreamPort {
+    pub fn metadata(&self) -> Result<FlowMetadata, StackError> {
+        let bridge = self.bridge.upgrade().ok_or(StackError::Stopped)?;
+        Ok(bridge.borrow().tcp_metadata(self.lease.handle)?.clone())
+    }
+
+    fn pending<T>(&self, context: &Context<'_>) -> Poll<io::Result<T>> {
+        *self.wake.waker.borrow_mut() = Some(context.waker().clone());
+        Poll::Pending
+    }
+
+    fn bridge(&self) -> io::Result<Rc<RefCell<StackBridge>>> {
+        self.bridge
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stack is stopped"))
+    }
+}
+
+impl AsyncRead for TcpStreamPort {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        if output.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let bridge = match self.bridge() {
+            Ok(bridge) => bridge,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let mut bridge = bridge.borrow_mut();
+        let socket = match bridge.tcp_socket(self.lease.handle, self.side) {
+            Ok(socket) => socket,
+            Err(error) => return Poll::Ready(Err(stack_io_error(error))),
+        };
+        if socket.can_recv() {
+            return Poll::Ready(
+                socket
+                    .recv_slice(output)
+                    .map_err(|error| io::Error::other(error.to_string())),
+            );
+        }
+        if !socket.may_recv() {
+            return Poll::Ready(Ok(0));
+        }
+        drop(bridge);
+        self.pending(context)
+    }
+}
+
+impl AsyncWrite for TcpStreamPort {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.write_shutdown {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stack stream write side is closed",
+            )));
+        }
+        if input.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let bridge = match self.bridge() {
+            Ok(bridge) => bridge,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let mut bridge = bridge.borrow_mut();
+        let socket = match bridge.tcp_socket(self.lease.handle, self.side) {
+            Ok(socket) => socket,
+            Err(error) => return Poll::Ready(Err(stack_io_error(error))),
+        };
+        if socket.can_send() {
+            return Poll::Ready(
+                socket
+                    .send_slice(input)
+                    .map_err(|error| io::Error::other(error.to_string())),
+            );
+        }
+        if !socket.may_send() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stack stream is closed",
+            )));
+        }
+        drop(bridge);
+        self.pending(context)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_shutdown {
+            return Poll::Ready(Ok(()));
+        }
+        let bridge = match self.bridge() {
+            Ok(bridge) => bridge,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let result = bridge
+            .borrow_mut()
+            .tcp_shutdown_write(self.lease.handle, self.side)
+            .map_err(stack_io_error);
+        if result.is_ok() {
+            self.write_shutdown = true;
+        }
+        Poll::Ready(result)
+    }
+}
+
+impl Drop for TcpFlowLease {
+    fn drop(&mut self) {
+        if let Some(bridge) = self.bridge.upgrade() {
+            let _ = bridge.borrow_mut().close_tcp(self.handle);
+        }
+    }
+}
+
+fn stack_io_error(error: StackError) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 impl StackBridge {
@@ -686,19 +910,35 @@ pub enum StackError {
     Tcp(String),
     #[error("UDP operation failed")]
     Udp,
+    #[error("stack is stopped")]
+    Stopped,
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::task::{Context, Poll, Waker};
 
     use super::*;
     use crate::config::Config;
+    use futures::io::{AsyncRead, AsyncWrite};
 
     fn bridge() -> StackBridge {
         let text = include_str!("../../../config/templates/snolc-server-low-memory.toml");
         let config = Config::parse(text, Path::new("/etc/snolc")).unwrap();
         StackBridge::new(
+            config.stack,
+            16,
+            8 * 1024 * 1024,
+            config.engine.max_ingress_packets_per_tick,
+        )
+        .unwrap()
+    }
+
+    fn shared_bridge() -> SharedStackBridge {
+        let text = include_str!("../../../config/templates/snolc-server-low-memory.toml");
+        let config = Config::parse(text, Path::new("/etc/snolc")).unwrap();
+        SharedStackBridge::new(
             config.stack,
             16,
             8 * 1024 * 1024,
@@ -780,5 +1020,32 @@ mod tests {
         let second = bridge.open_tcp(metadata()).unwrap();
         assert_ne!(first, second);
         assert!(matches!(bridge.tcp_metadata(first), Err(StackError::Stale)));
+    }
+
+    #[test]
+    fn async_ports_exchange_and_release_the_same_flow() {
+        let bridge = shared_bridge();
+        let (mut adapter, mut policy) = bridge.open_tcp(metadata()).unwrap();
+        let allocated = bridge.managed_bytes();
+        assert!(allocated > 0);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut adapter).poll_write(&mut context, b"through-stack"),
+            Poll::Ready(Ok(13))
+        ));
+        let mut output = [0; 13];
+        for _ in 0..16 {
+            bridge.poll();
+            if let Poll::Ready(Ok(13)) = Pin::new(&mut policy).poll_read(&mut context, &mut output)
+            {
+                break;
+            }
+        }
+        assert_eq!(&output, b"through-stack");
+        assert_eq!(adapter.metadata().unwrap(), metadata());
+        drop(adapter);
+        assert_eq!(bridge.managed_bytes(), allocated);
+        drop(policy);
+        assert_eq!(bridge.managed_bytes(), 0);
     }
 }
