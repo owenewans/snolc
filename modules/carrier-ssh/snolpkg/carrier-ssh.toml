@@ -55,7 +55,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/carrier-ssh-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 1520973
 sha256 = "13c6599476f67f6c1bbe0f2b3a2661d64b2492c266a7ab40e0fa5c025d7653ea"
-build_output = "aarch64-linux-android/release/libsnolc_carrier_ssh.so"
+build_output = "release/libsnolc_carrier_ssh.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -64,4 +64,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/carrier-ssh-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 1401456
 sha256 = "397c290411422eac3d6fa686c90a31ef88d2cde711eedb029ef5d799a054aa0a"
-build_output = "armv7-linux-androideabi/release/libsnolc_carrier_ssh.so"
+build_output = "release/libsnolc_carrier_ssh.so"

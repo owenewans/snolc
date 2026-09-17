@@ -55,7 +55,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/policy-local-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 948750
 sha256 = "acbf096d0312b26f83e1e26c9c3a45a9defec4845047a03a9a31e27abd00c489"
-build_output = "aarch64-linux-android/release/libsnolc_policy_local.so"
+build_output = "release/libsnolc_policy_local.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -64,4 +64,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/policy-local-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 866759
 sha256 = "80103a8053aca6ee5b4ccf57c4d03a26c48f20d881c9aba7f5cba1a96323e57f"
-build_output = "armv7-linux-androideabi/release/libsnolc_policy_local.so"
+build_output = "release/libsnolc_policy_local.so"

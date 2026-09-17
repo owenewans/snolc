@@ -55,7 +55,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-noise-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 367961
 sha256 = "85fed5799100f5163937a8a56160f2cbafa26aeef151b336760f238e23fa06f2"
-build_output = "aarch64-linux-android/release/libsnolc_protection_noise.so"
+build_output = "release/libsnolc_protection_noise.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -64,4 +64,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-noise-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 358504
 sha256 = "7057a3722602953d91f4ffcbb694faca3393ba3874a05a40a7171c3a5ad0d500"
-build_output = "armv7-linux-androideabi/release/libsnolc_protection_noise.so"
+build_output = "release/libsnolc_protection_noise.so"

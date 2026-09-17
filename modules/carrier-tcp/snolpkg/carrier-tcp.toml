@@ -55,7 +55,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/carrier-tcp-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 327467
 sha256 = "978d4ceb4a1e53ebd7c722ef14d4193420db5b1c37155ee2c99ff7a5be221e78"
-build_output = "aarch64-linux-android/release/libsnolc_carrier_tcp.so"
+build_output = "release/libsnolc_carrier_tcp.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -64,4 +64,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/carrier-tcp-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 293782
 sha256 = "c07b33678ed1fbb4372c56d41c85560b897d5a388e4dadda2b7f9f0b92761568"
-build_output = "armv7-linux-androideabi/release/libsnolc_carrier_tcp.so"
+build_output = "release/libsnolc_carrier_tcp.so"

@@ -55,7 +55,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/policy-dummy-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 278261
 sha256 = "f69b3c33081bdbcd327d616afe6881403a4c813f8f70b12749801b6be4d48fb8"
-build_output = "aarch64-linux-android/release/libsnolc_policy_dummy.so"
+build_output = "release/libsnolc_policy_dummy.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -64,4 +64,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/policy-dummy-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 254334
 sha256 = "1453a30bf9da02ce90d6b69f1b6856e7d9ed3f04925cf0fc9c74552f81fb764b"
-build_output = "armv7-linux-androideabi/release/libsnolc_policy_dummy.so"
+build_output = "release/libsnolc_policy_dummy.so"

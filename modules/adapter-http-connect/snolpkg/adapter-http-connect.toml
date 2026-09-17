@@ -51,7 +51,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-http-connect-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 292157
 sha256 = "da51bc20d63c71dc169b81bf05c921b5c54652780302b4df8276ec88329a0a2f"
-build_output = "aarch64-linux-android/release/libsnolc_adapter_http_connect.so"
+build_output = "release/libsnolc_adapter_http_connect.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -60,4 +60,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-http-connect-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 264423
 sha256 = "dce2a4272bf83358f328ba0c3078a8d7821f1fb2b631846d096baf0cdcaebb32"
-build_output = "armv7-linux-androideabi/release/libsnolc_adapter_http_connect.so"
+build_output = "release/libsnolc_adapter_http_connect.so"

@@ -55,7 +55,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-dummy-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 233985
 sha256 = "40f40d00329d4d1a8bd4dcf70b173cdf616a335439e60c9371fd612757fd7ee3"
-build_output = "aarch64-linux-android/release/libsnolc_protection_dummy.so"
+build_output = "release/libsnolc_protection_dummy.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -64,4 +64,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-dummy-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 208894
 sha256 = "75e372105828ab5bdbd3066bfa7ad11ac746abd3ec25d621e627c8fbb0e899ee"
-build_output = "armv7-linux-androideabi/release/libsnolc_protection_dummy.so"
+build_output = "release/libsnolc_protection_dummy.so"

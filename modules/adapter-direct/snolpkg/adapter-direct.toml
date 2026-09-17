@@ -51,7 +51,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-direct-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 340019
 sha256 = "5aa8b0d91523cd5c1ca9e71d42d398a39b25415e2abcb8995ec4b630499ea155"
-build_output = "aarch64-linux-android/release/libsnolc_adapter_direct.so"
+build_output = "release/libsnolc_adapter_direct.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -60,4 +60,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-direct-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 311377
 sha256 = "cf185497b538984bdf6f418ba47c750b0005135a24cedc35f38a5bc833e3f660"
-build_output = "armv7-linux-androideabi/release/libsnolc_adapter_direct.so"
+build_output = "release/libsnolc_adapter_direct.so"

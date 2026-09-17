@@ -51,7 +51,7 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-socks5-0.0.1-aarch64-linux-android.tar.gz"
 byte_size = 305512
 sha256 = "936b8860aceaed15b85d73619a0897c6f4a524647d22c0aea1ee54940b985da7"
-build_output = "aarch64-linux-android/release/libsnolc_adapter_socks5.so"
+build_output = "release/libsnolc_adapter_socks5.so"
 
 [[artifacts]]
 target = "armv7-linux-androideabi"
@@ -60,4 +60,4 @@ minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-socks5-0.0.1-armv7-linux-androideabi.tar.gz"
 byte_size = 274997
 sha256 = "87831688ffddb82e096c6b4d2b92518083d01228d4cb39403612c4dc0c4b91cb"
-build_output = "armv7-linux-androideabi/release/libsnolc_adapter_socks5.so"
+build_output = "release/libsnolc_adapter_socks5.so"
