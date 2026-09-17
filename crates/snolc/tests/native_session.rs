@@ -19,7 +19,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use snolc::config::Config;
 use snolc::loader::LoadedModule;
-use snolc::{Engine, Event, Host, Lifecycle};
+use snolc::{Engine, Event, Host, Lifecycle, PlatformEvent};
 use snow::{Builder, params::NoiseParams};
 
 struct QuietHost;
@@ -51,6 +51,81 @@ fn native_tcp_dummy_path_establishes_policy_session() {
         ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
     );
     run_pair(server, client);
+}
+
+#[test]
+fn platform_network_change_reconnects_and_vpn_revoke_stops() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    drop(listener);
+    let server = build_side(
+        "server-platform",
+        "server",
+        endpoint,
+        true,
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
+    );
+    let client = build_side(
+        "client-platform",
+        "client",
+        endpoint,
+        false,
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let mut events = client_handle.subscribe().unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+
+    let mut established = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event,
+            Event::Tunnel {
+                state: "established",
+                ..
+            }
+        ) {
+            established += 1;
+        }
+    }
+    assert_eq!(established, 1);
+    client_handle
+        .platform_event(PlatformEvent::NetworkChanged)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut network_event = false;
+    while established < 2 {
+        while let Ok(event) = events.try_recv() {
+            network_event |= matches!(event, Event::Platform(PlatformEvent::NetworkChanged));
+            if matches!(
+                event,
+                Event::Tunnel {
+                    state: "established",
+                    ..
+                }
+            ) {
+                established += 1;
+            }
+        }
+        assert!(Instant::now() < deadline, "network reconnect timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(network_event);
+    assert_eq!(client_handle.snapshot().sessions, 1);
+
+    client_handle
+        .platform_event(PlatformEvent::VpnPermissionRevoked)
+        .unwrap();
+    client_thread.join().unwrap().unwrap();
+    assert_eq!(client_handle.snapshot().lifecycle, Lifecycle::Stopped);
+    server_handle.shutdown().unwrap();
+    server_thread.join().unwrap().unwrap();
 }
 
 #[test]

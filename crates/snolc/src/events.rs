@@ -31,6 +31,13 @@ pub enum Event {
     ModuleError { instance: String, message: String },
     Tunnel { name: String, state: &'static str },
     ResourceExhausted { resource: &'static str },
+    Platform(PlatformEvent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformEvent {
+    NetworkChanged,
+    VpnPermissionRevoked,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

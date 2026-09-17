@@ -19,7 +19,7 @@ use crate::config::{
 };
 use crate::control::{ControlError, UnixControlServer};
 use crate::core_io::{MuxDatagramIo, RegisteredDatagramIo, RegisteredIo, is_registered};
-use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
+use crate::events::{Event, EventReceiver, Lifecycle, PlatformEvent, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::logging::{FileLogger, LogError};
 use crate::mux::{MuxError, MuxSession};
@@ -78,7 +78,6 @@ enum TunnelState {
     Handshake(HandshakeFuture),
     PolicyAttach(Box<PolicyAttachState>),
     Established(Box<EstablishedSession>),
-    Failed,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -289,6 +288,10 @@ enum Command {
     Shutdown {
         response: oneshot::Sender<()>,
     },
+    Platform {
+        event: PlatformEvent,
+        response: oneshot::Sender<()>,
+    },
 }
 
 struct PendingControl {
@@ -495,6 +498,24 @@ impl Engine {
                         self.emit(Event::Lifecycle(Lifecycle::Stopping));
                         let _ = response.send(());
                         break;
+                    }
+                    Some(Command::Platform { event, response }) => {
+                        self.emit(Event::Platform(event));
+                        match event {
+                            PlatformEvent::NetworkChanged => {
+                                for tunnel in &mut tunnels {
+                                    tunnel.reset();
+                                }
+                                self.snapshot.sessions.store(0, Ordering::Release);
+                                self.snapshot.flows.store(0, Ordering::Release);
+                                let _ = response.send(());
+                            }
+                            PlatformEvent::VpnPermissionRevoked => {
+                                self.emit(Event::Lifecycle(Lifecycle::Stopping));
+                                let _ = response.send(());
+                                break;
+                            }
+                        }
                     }
                     None => {
                         self.emit(Event::Lifecycle(Lifecycle::Stopping));
@@ -881,10 +902,8 @@ impl TunnelRuntime {
                 TunnelState::Handshake(_) => "yamux policy handshake",
                 TunnelState::PolicyAttach(_) => "policy attach",
                 TunnelState::Established(_) => "established",
-                TunnelState::Failed => "failed",
             };
-            self.state = TunnelState::Failed;
-            self.deadline = None;
+            self.reset();
             return Err((
                 format!("tunnel establishment timed out during {stage}"),
                 false,
@@ -997,7 +1016,6 @@ impl TunnelRuntime {
                     return self.fail(error.to_string(), true);
                 }
             }
-            TunnelState::Failed => {}
         }
         Ok(TunnelUpdate::None)
     }
@@ -1009,13 +1027,20 @@ impl TunnelRuntime {
         }
     }
 
+    fn reset(&mut self) {
+        self.state = TunnelState::Carrier;
+        self.deadline = match self.binding.role {
+            Role::Client => Some(Instant::now() + self.binding.connect_timeout),
+            Role::Server => None,
+        };
+    }
+
     fn fail(
         &mut self,
         message: String,
         was_established: bool,
     ) -> Result<TunnelUpdate, (String, bool)> {
-        self.state = TunnelState::Failed;
-        self.deadline = None;
+        self.reset();
         Err((message, was_established))
     }
 }
@@ -1659,6 +1684,18 @@ impl EngineHandle {
         let mut commands = self.commands.clone();
         commands
             .try_send(Command::Shutdown {
+                response: response_tx,
+            })
+            .map_err(|_| EngineError::CommandQueue)?;
+        async_io::block_on(response_rx).map_err(|_| EngineError::Stopped)
+    }
+
+    pub fn platform_event(&self, event: PlatformEvent) -> Result<(), EngineError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let mut commands = self.commands.clone();
+        commands
+            .try_send(Command::Platform {
+                event,
                 response: response_tx,
             })
             .map_err(|_| EngineError::CommandQueue)?;
