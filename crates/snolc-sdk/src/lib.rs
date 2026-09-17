@@ -65,3 +65,8 @@ pub fn catch_status(function: impl FnOnce() -> u32) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(function))
         .unwrap_or(snolc_abi::STATUS_INTERNAL)
 }
+
+pub fn catch_io(function: impl FnOnce() -> abi::SnolIoResult) -> abi::SnolIoResult {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(function))
+        .unwrap_or_else(|_| abi::SnolIoResult::error(abi::STATUS_INTERNAL))
+}
