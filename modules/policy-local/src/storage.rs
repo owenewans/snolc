@@ -4,7 +4,7 @@ use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use redb::{BackendError, Database, Durability, ReadableDatabase, StorageBackend, TableDefinition};
@@ -39,12 +39,15 @@ enum Command {
         limit: usize,
         response: SyncSender<ScanResult>,
     },
-    Stop,
+    Stop {
+        response: SyncSender<()>,
+    },
 }
 
 pub struct StorageWorker {
     sender: SyncSender<Command>,
     worker: Option<JoinHandle<()>>,
+    stopping: Option<Receiver<()>>,
 }
 
 impl StorageWorker {
@@ -79,6 +82,7 @@ impl StorageWorker {
         Ok(Self {
             sender,
             worker: Some(worker),
+            stopping: None,
         })
     }
 
@@ -145,7 +149,38 @@ impl StorageWorker {
         Ok(receiver)
     }
 
+    pub fn start_shutdown(&mut self) -> Result<(), StorageError> {
+        if self.stopping.is_some() {
+            return Ok(());
+        }
+        let (response, reply) = sync_channel(1);
+        self.send(Command::Stop { response })?;
+        self.stopping = Some(reply);
+        Ok(())
+    }
+
+    pub fn poll_shutdown(&mut self) -> Result<bool, StorageError> {
+        self.start_shutdown()?;
+        let Some(stopping) = &self.stopping else {
+            return Err(StorageError::Stopped);
+        };
+        match stopping.try_recv() {
+            Ok(()) => {
+                self.stopping = None;
+                if let Some(worker) = self.worker.take() {
+                    worker.join().map_err(|_| StorageError::Stopped)?;
+                }
+                Ok(true)
+            }
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => Err(StorageError::Stopped),
+        }
+    }
+
     fn send(&self, command: Command) -> Result<(), StorageError> {
+        if self.stopping.is_some() {
+            return Err(StorageError::Stopped);
+        }
         self.sender.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => StorageError::QueueFull,
             TrySendError::Disconnected(_) => StorageError::Stopped,
@@ -155,7 +190,15 @@ impl StorageWorker {
 
 impl Drop for StorageWorker {
     fn drop(&mut self) {
-        let _ = self.sender.send(Command::Stop);
+        if self.stopping.is_none() {
+            let (response, reply) = sync_channel(1);
+            if self.sender.send(Command::Stop { response }).is_ok() {
+                self.stopping = Some(reply);
+            }
+        }
+        if let Some(stopping) = self.stopping.take() {
+            let _ = stopping.recv();
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -163,6 +206,7 @@ impl Drop for StorageWorker {
 }
 
 fn run(database: Database, receiver: Receiver<Command>) {
+    let mut stop = None;
     while let Ok(command) = receiver.recv() {
         match command {
             Command::Get { key, response } => {
@@ -190,8 +234,15 @@ fn run(database: Database, receiver: Receiver<Command>) {
             } => {
                 let _ = response.send(scan_values(&database, &prefix, limit));
             }
-            Command::Stop => break,
+            Command::Stop { response } => {
+                stop = Some(response);
+                break;
+            }
         }
+    }
+    drop(database);
+    if let Some(response) = stop {
+        let _ = response.send(());
     }
 }
 
@@ -721,6 +772,21 @@ mod tests {
             Err(StorageError::Limit)
         ));
         drop(worker);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shutdown_can_be_polled_without_waiting_on_the_worker() {
+        let path = path();
+        let mut worker = StorageWorker::open(path.clone(), 1_048_576, 16_777_216, 2).unwrap();
+        worker.start_shutdown().unwrap();
+        while !worker.poll_shutdown().unwrap() {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            worker.get("user/01".into()),
+            Err(StorageError::Stopped)
+        ));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

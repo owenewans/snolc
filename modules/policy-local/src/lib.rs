@@ -72,6 +72,7 @@ static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 
 struct State {
     started: Instant,
+    shutting_down: bool,
     global_rate: Option<TokenBucket>,
     user_deficit: HashMap<String, u64>,
     user_cursor: usize,
@@ -95,6 +96,7 @@ struct UserTraffic {
     debit: Option<PendingDebit>,
     refund: Option<PendingRefund>,
     failed: bool,
+    checkpoint_at: Instant,
 }
 
 struct PendingDebit {
@@ -566,6 +568,7 @@ fn initialize(
             instance,
             State {
                 started,
+                shutting_down: false,
                 global_rate,
                 user_deficit: HashMap::new(),
                 user_cursor: 0,
@@ -931,6 +934,9 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
             let Some(traffic) = state.traffic.get_mut(&user_id) else {
                 continue;
             };
+            if traffic.debit.is_some() || traffic.refund.is_some() || traffic.failed {
+                continue;
+            }
             let quota_budget = usize::try_from(traffic.quota.credit_remaining())
                 .unwrap_or(usize::MAX)
                 .min(max_work);
@@ -1143,6 +1149,8 @@ fn weighted_share(available: u64, weight: u64, total_weight: u64) -> u64 {
 }
 
 fn advance_quota(state: &mut State) -> HashSet<String> {
+    let now = Instant::now();
+    let checkpoint_interval = Duration::from_millis(state.options.checkpoint_interval_ms);
     let active_users: HashSet<String> = state
         .flows
         .values()
@@ -1221,6 +1229,7 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
                     debit: None,
                     refund: None,
                     failed: false,
+                    checkpoint_at: now + checkpoint_interval,
                 },
             );
         }
@@ -1269,6 +1278,7 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
                         continue;
                     }
                     state.admin.users.insert(user_id.clone(), pending.record);
+                    traffic.checkpoint_at = now + checkpoint_interval;
                     if !active {
                         remove_traffic.push(user_id.clone());
                         continue;
@@ -1288,11 +1298,16 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
                 }
             }
         }
-        if !active {
+        let checkpoint_due = active && now >= traffic.checkpoint_at;
+        if !active || checkpoint_due {
             let amount = match traffic.quota.request_refund() {
                 Ok(amount) => amount,
-                Err(_) if traffic.quota.credit_remaining() == 0 => {
+                Err(_) if traffic.quota.credit_remaining() == 0 && !active => {
                     remove_traffic.push(user_id.clone());
+                    continue;
+                }
+                Err(_) if traffic.quota.credit_remaining() == 0 => {
+                    traffic.checkpoint_at = now + checkpoint_interval;
                     continue;
                 }
                 Err(_) => {
@@ -2553,11 +2568,30 @@ struct SessionsResponse {
 }
 
 fn shutdown_instance(instance: u64) -> u32 {
-    if STATES.with(|states| states.borrow_mut().remove(&instance).is_some()) {
-        abi::STATUS_OK
-    } else {
-        abi::STATUS_INVALID
-    }
+    STATES.with(|states| {
+        let mut states = states.borrow_mut();
+        let Some(state) = states.get_mut(&instance) else {
+            return abi::STATUS_INVALID;
+        };
+        if !state.shutting_down {
+            state.shutting_down = true;
+            state.sessions.clear();
+            state.flows.clear();
+            state.datagram_flows.clear();
+        }
+        let _ = advance_quota(state);
+        if !state.traffic.is_empty() {
+            return abi::STATUS_PENDING;
+        }
+        match state.storage.poll_shutdown() {
+            Ok(false) => abi::STATUS_PENDING,
+            Ok(true) => {
+                states.remove(&instance);
+                abi::STATUS_OK
+            }
+            Err(_) => abi::STATUS_IO,
+        }
+    })
 }
 
 fn destroy_instance(instance: u64) {
@@ -2730,6 +2764,7 @@ mod module_tests {
             debit: None,
             refund: None,
             failed: false,
+            checkpoint_at: Instant::now() + Duration::from_secs(5),
         };
         let stack = MemoryIo {
             input: vec![b'x'; 100].into(),
@@ -2989,7 +3024,7 @@ count = 16
             control_instance(instance, skipped.as_bytes()),
             Err(abi::STATUS_DENIED)
         ));
-        shutdown_instance(instance);
+        drive_shutdown(instance);
         initialize(instance, options.as_bytes(), b"/tmp", std::ptr::null()).unwrap();
         assert_eq!(
             drive_control(instance, credential_add.as_bytes()),
@@ -3007,8 +3042,128 @@ count = 16
         let revoke_response: toml::Value =
             toml::from_str(std::str::from_utf8(&revoke_response).unwrap()).unwrap();
         assert_eq!(revoke_response["status"].as_str(), Some("ok"));
-        shutdown_instance(instance);
+        drive_shutdown(instance);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn graceful_shutdown_refunds_unused_durable_credit() {
+        let root = std::env::temp_dir().join(format!(
+            "snolc-policy-shutdown-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let database = root.join("policy.redb");
+        let template = include_str!("../../../config/templates/modules/policy.toml");
+        let mut template: toml::Value = toml::from_str(template).unwrap();
+        template["options"]["storage"]["path"] =
+            toml::Value::String(database.to_string_lossy().into_owned());
+        let options = toml::to_string(&template["options"]).unwrap();
+        let instance = 10_002;
+        initialize(instance, options.as_bytes(), b"/tmp", std::ptr::null()).unwrap();
+        let create = br#"
+method = "user.create"
+client_id = "shutdown-test"
+seq = 1
+
+[user]
+status = "enabled"
+burst_bytes = 65507
+weight = 1
+group = "default"
+rule_profile = "default"
+
+[user.expiration]
+mode = "unlimited"
+
+[user.quota]
+mode = "limited"
+bytes = 1000000
+
+[user.upload_rate]
+mode = "unlimited"
+
+[user.download_rate]
+mode = "unlimited"
+
+[user.combined_rate]
+mode = "unlimited"
+
+[user.max_sessions]
+mode = "limited"
+count = 2
+
+[user.max_flows]
+mode = "limited"
+count = 16
+"#;
+        let response = drive_control(instance, create);
+        let response: toml::Value =
+            toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+        let user_id = response["user_id"].as_str().unwrap().to_owned();
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let state = states.get_mut(&instance).unwrap();
+            let mut record = state.admin.users.get(&user_id).unwrap().clone();
+            let mut quota = QuotaAccount::new(Some(1_000_000), 0, 1_048_576).unwrap();
+            let credit = quota.request_credit().unwrap();
+            quota.commit_credit(credit).unwrap();
+            quota.charge(22).unwrap();
+            record.durable_charged_bytes = credit;
+            state
+                .storage
+                .put(
+                    format!("user/{user_id}"),
+                    encode_user_record(&record).unwrap(),
+                )
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap();
+            state.admin.users.insert(user_id.clone(), record);
+            state.traffic.insert(
+                user_id.clone(),
+                UserTraffic {
+                    quota,
+                    upload: None,
+                    download: None,
+                    combined: None,
+                    debit: None,
+                    refund: None,
+                    failed: false,
+                    checkpoint_at: Instant::now() + Duration::from_secs(5),
+                },
+            );
+        });
+        drive_shutdown(instance);
+
+        let worker = StorageWorker::open(database.clone(), 4_194_304, 134_217_728, 4).unwrap();
+        let stored = worker
+            .get(format!("user/{user_id}"))
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_user_record(&stored).unwrap().durable_charged_bytes,
+            22
+        );
+        drop(worker);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn drive_shutdown(instance: u64) {
+        loop {
+            match shutdown_instance(instance) {
+                abi::STATUS_OK => break,
+                abi::STATUS_PENDING => std::thread::yield_now(),
+                status => panic!("shutdown failed with status {status}"),
+            }
+        }
     }
 
     fn drive_control(instance: u64, request: &[u8]) -> Vec<u8> {

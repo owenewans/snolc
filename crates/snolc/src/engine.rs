@@ -542,13 +542,52 @@ impl Engine {
         drop(tunnels);
         self.snapshot.sessions.store(0, Ordering::Release);
         let mut errors = Vec::new();
-        for module in self.validated.modules.iter_mut().rev() {
-            if let Err(error) = module.shutdown() {
-                errors.push(Event::ModuleError {
-                    instance: module.instance_name().to_owned(),
-                    message: error.to_string(),
-                });
+        let shutdown_timeout =
+            Duration::from_millis(self.validated.config.engine.shutdown_timeout_ms);
+        let shutdown_deadline = Instant::now() + shutdown_timeout;
+        let mut stopped = vec![false; self.validated.modules.len()];
+        loop {
+            let wake = wake_handle(&self.wake);
+            for index in (0..self.validated.modules.len()).rev() {
+                if stopped[index] {
+                    continue;
+                }
+                let module = &mut self.validated.modules[index];
+                match module.poll_shutdown() {
+                    Poll::Ready(Ok(())) => stopped[index] = true,
+                    Poll::Ready(Err(error)) => {
+                        errors.push(Event::ModuleError {
+                            instance: module.instance_name().to_owned(),
+                            message: error.to_string(),
+                        });
+                        stopped[index] = true;
+                    }
+                    Poll::Pending => {
+                        if let Err(error) = module.poll(wake) {
+                            errors.push(Event::ModuleError {
+                                instance: module.instance_name().to_owned(),
+                                message: error.to_string(),
+                            });
+                            stopped[index] = true;
+                        }
+                    }
+                }
             }
+            if stopped.iter().all(|stopped| *stopped) {
+                break;
+            }
+            if Instant::now() >= shutdown_deadline {
+                for (index, module) in self.validated.modules.iter().enumerate() {
+                    if !stopped[index] {
+                        errors.push(Event::ModuleError {
+                            instance: module.instance_name().to_owned(),
+                            message: "module shutdown timed out".into(),
+                        });
+                    }
+                }
+                break;
+            }
+            async_io::Timer::after(MODULE_POLL_INTERVAL).await;
         }
         for event in errors {
             self.emit(event);

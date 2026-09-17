@@ -180,9 +180,9 @@ impl LoadedModule {
         Poll::Ready(check_output(status, output, written, max_response))
     }
 
-    pub fn shutdown(&mut self) -> Result<(), LoadError> {
+    pub fn poll_shutdown(&mut self) -> Poll<Result<(), LoadError>> {
         let Some(instance) = self.instance else {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         };
         let function = self
             .descriptor()
@@ -190,10 +190,10 @@ impl LoadedModule {
             .ok_or(LoadError::MissingFunction)?;
         // lifecycle calls run only on the engine owner thread.
         let status = unsafe { function(instance) };
-        if status == snolc_abi::STATUS_OK {
-            Ok(())
-        } else {
-            Err(LoadError::ModuleStatus(status))
+        match status {
+            snolc_abi::STATUS_OK => Poll::Ready(Ok(())),
+            snolc_abi::STATUS_PENDING => Poll::Pending,
+            status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
         }
     }
 

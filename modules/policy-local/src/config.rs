@@ -174,6 +174,7 @@ impl Options {
             || self.sniff_bytes > 16_384
             || self.sniff_timeout_ms == 0
             || self.checkpoint_interval_ms == 0
+            || self.checkpoint_interval_ms > 86_400_000
         {
             return Err(ConfigError::Invalid("policy limits are inconsistent"));
         }
