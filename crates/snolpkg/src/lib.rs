@@ -1218,6 +1218,10 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -1599,8 +1603,10 @@ build_output = "release/libtest.so"
             artifact_hash
         );
         fs::create_dir(repository.join("snolpkg")).unwrap();
-        fs::write(repository.join("snolpkg/test.toml"), manifest).unwrap();
-        fs::write(repository.join("snolpkg/test.toml.sig"), [0; 64]).unwrap();
+        let signing = SigningKey::from_bytes(&[8; 32]);
+        let signature = signing.sign(manifest.as_bytes()).to_bytes();
+        fs::write(repository.join("snolpkg/test.toml"), &manifest).unwrap();
+        fs::write(repository.join("snolpkg/test.toml.sig"), signature).unwrap();
         run_git(
             &repository,
             &["add", "snolpkg/test.toml", "snolpkg/test.toml.sig"],
@@ -1623,8 +1629,9 @@ build_output = "release/libtest.so"
         fs::write(
             packages.join("sources.toml"),
             format!(
-                "[[sources]]\nid = \"local\"\ngit = \"{}\"\ntrust = \"local-development\"\n",
-                repository.display()
+                "[[sources]]\nid = \"local\"\ngit = \"{}\"\ntrust = \"signed\"\npublic_key = \"{}\"\n",
+                repository.display(),
+                encode_hex(&signing.verifying_key().to_bytes())
             ),
         )
         .unwrap();
@@ -1645,6 +1652,106 @@ build_output = "release/libtest.so"
             b"native module"
         );
         remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn https_git_honors_explicit_proxy_without_direct_fallback() {
+        const CHILD: &str = "SNOLPKG_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let git = std::env::var("SNOLPKG_PROXY_TEST_ENDPOINT").unwrap();
+            let clone =
+                std::env::temp_dir().join(format!("snolpkg-proxy-child-{}", std::process::id()));
+            assert!(load_publication(&git, "test", &clone).is_err());
+            return;
+        }
+        assert_proxy_used(
+            "tests::https_git_honors_explicit_proxy_without_direct_fallback",
+            CHILD,
+            "/repository",
+        );
+    }
+
+    #[test]
+    fn https_artifact_honors_explicit_proxy_without_direct_fallback() {
+        const CHILD: &str = "SNOLPKG_ARTIFACT_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let url = std::env::var("SNOLPKG_PROXY_TEST_ENDPOINT").unwrap();
+            let artifact = Artifact {
+                target: "test".into(),
+                minimum_isa: "test".into(),
+                minimum_libc: None,
+                minimum_android_api: None,
+                url,
+                byte_size: 1,
+                sha256: "aa".repeat(32),
+                build_output: "release/module".into(),
+            };
+            let output = std::env::temp_dir().join(format!(
+                "snolpkg-artifact-proxy-child-{}",
+                std::process::id()
+            ));
+            assert!(download_artifact(&artifact, &output).is_err());
+            return;
+        }
+        assert_proxy_used(
+            "tests::https_artifact_honors_explicit_proxy_without_direct_fallback",
+            CHILD,
+            "/artifact.tar.gz",
+        );
+    }
+
+    fn assert_proxy_used(test_name: &str, child_marker: &str, suffix: &str) {
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let proxy_endpoint = format!("http://{}", proxy.local_addr().unwrap());
+        let endpoint = format!("https://{}{suffix}", target.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let worker_stop = Arc::clone(&stop);
+        let worker_connections = Arc::clone(&connections);
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match proxy.accept() {
+                    Ok((_stream, _)) => {
+                        worker_connections.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("proxy accept failed: {error}"),
+                }
+            }
+        });
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(child_marker, "1")
+            .env("SNOLPKG_PROXY_TEST_ENDPOINT", endpoint)
+            .env("HTTP_PROXY", &proxy_endpoint)
+            .env("HTTPS_PROXY", &proxy_endpoint)
+            .env("ALL_PROXY", &proxy_endpoint)
+            .env("NO_PROXY", "")
+            .env("http_proxy", &proxy_endpoint)
+            .env("https_proxy", &proxy_endpoint)
+            .env("all_proxy", &proxy_endpoint)
+            .env("no_proxy", "")
+            .output()
+            .unwrap();
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(connections.load(Ordering::Relaxed) > 0);
+        assert!(matches!(
+            target.accept(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
