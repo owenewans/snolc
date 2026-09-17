@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -16,6 +19,7 @@ pub const MAX_SUBSCRIPTION_BYTES: usize = 1_048_576;
 pub const MAX_SUBSCRIPTION_PROFILES: usize = 64;
 const URI_PREFIX: &str = "snolc://profile/";
 const MAX_ENCODED_PROFILE_BYTES: usize = MAX_PROFILE_BYTES.div_ceil(3) * 4;
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -477,6 +481,77 @@ pub fn generate_client_config(
     })
 }
 
+pub fn persist_client_config(
+    generated: &GeneratedClient,
+    root: &Path,
+) -> Result<PathBuf, ProfileError> {
+    if !root.is_absolute()
+        || !generated.main_path.starts_with(root)
+        || generated
+            .files
+            .iter()
+            .any(|file| !file.path.starts_with(root))
+    {
+        return Err(ProfileError::Path);
+    }
+    secure_directory(root)?;
+    for file in &generated.files {
+        atomic_write(&file.path, &file.contents)?;
+    }
+    atomic_write(&generated.main_path, generated.main_toml.as_bytes())?;
+    Ok(generated.main_path.clone())
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ProfileError> {
+    let parent = path.parent().ok_or(ProfileError::Path)?;
+    secure_directory(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(ProfileError::Path)?;
+    let temporary = parent.join(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        secure_file(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        secure_file(path)?;
+        File::open(parent)?.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result.map_err(ProfileError::Io)
+}
+
+fn secure_directory(path: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn secure_file(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn module_toml(module: &ProfileModule, options: toml::Table) -> Result<String, ProfileError> {
     let mut table = toml::Table::new();
     table.insert("wire_version".into(), 1.into());
@@ -696,6 +771,8 @@ pub enum ProfileError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     fn profile() -> Profile {
@@ -788,6 +865,56 @@ mod tests {
                 && file.secret
                 && String::from_utf8_lossy(&file.contents).contains(profile.credential.expose())
         }));
+    }
+
+    #[test]
+    fn persisted_client_config_is_atomic_and_private() {
+        let root = std::env::temp_dir().join(format!(
+            "snolcNG-persist-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut profile = profile();
+        profile.modules[1].package = "owenewans/protection-noise@0.0.1".into();
+        profile.modules[2].package = "owenewans/carrier-tcp@0.0.1".into();
+        profile.modules[3].package = "owenewans/policy-local@0.0.1".into();
+        let generated = generate_client_config(&profile, &root).unwrap();
+        let main = persist_client_config(&generated, &root).unwrap();
+        assert_eq!(fs::read_to_string(main).unwrap(), generated.main_toml);
+        assert_eq!(
+            fs::read_to_string(root.join("secrets/server-noise-key.hex")).unwrap(),
+            "server-pin\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for file in generated
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .chain(std::iter::once(&generated.main_path))
+            {
+                assert_eq!(
+                    fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert!(!fs::read_dir(root.join("config")).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
