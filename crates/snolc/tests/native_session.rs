@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use russh::keys::ssh_key::LineEnding;
+use russh::keys::{Algorithm, PrivateKey};
 use sha2::{Digest, Sha256};
 use snolc::config::Config;
 use snolc::loader::LoadedModule;
@@ -42,6 +44,52 @@ fn native_tcp_dummy_path_establishes_policy_session() {
         ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
     );
     run_pair(server, client);
+}
+
+#[test]
+fn native_ssh_carrier_establishes_policy_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    drop(listener);
+    let directory = std::env::temp_dir().join(format!(
+        "snolc-native-ssh-{}-{}",
+        std::process::id(),
+        endpoint.port()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let private_path = directory.join("host");
+    let public_path = directory.join("host.pub");
+    let private = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    fs::write(
+        &private_path,
+        private.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    fs::write(&public_path, private.public_key().to_openssh().unwrap()).unwrap();
+    let server_carrier = format!(
+        "mode = \"listen\"\nendpoint_ip = \"{endpoint}\"\nusername = \"snolc\"\nhost_key = \"{}\"\nmax_connections = 2\nqueue_chunks = 8\nchunk_bytes = 16384\ninactivity_timeout_ms = 15000\n\n[auth]\nmode = \"password\"\npassword = \"secret\"\n",
+        private_path.display()
+    );
+    let client_carrier = format!(
+        "mode = \"connect\"\nendpoint_ip = \"{endpoint}\"\nusername = \"snolc\"\nserver_host_key = \"{}\"\nmax_connections = 2\nqueue_chunks = 8\nchunk_bytes = 16384\ninactivity_timeout_ms = 15000\n\n[auth]\nmode = \"password\"\npassword = \"secret\"\n",
+        public_path.display()
+    );
+    let server = build_side_with_carrier(
+        "server-ssh",
+        "server",
+        ("carrier_ssh", server_carrier.as_bytes()),
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
+    );
+    let client = build_side_with_carrier(
+        "client-ssh",
+        "client",
+        ("carrier_ssh", client_carrier.as_bytes()),
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
+    );
+    run_pair(server, client);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -808,6 +856,51 @@ fn build_side_with_adapter_and_control(
     policy: (&str, &[u8]),
     control: Option<&Path>,
 ) -> snolc::ValidatedConfig {
+    let carrier_mode = if listen { "listen" } else { "connect" };
+    let carrier = format!(
+        "mode = \"{carrier_mode}\"\nendpoint_ip = \"{endpoint}\"\nmax_connections = 2\nnodelay = true\n"
+    );
+    build_side_with_modules(
+        identity,
+        role,
+        adapter,
+        ("carrier_tcp", carrier.as_bytes()),
+        protection,
+        policy,
+        control,
+    )
+}
+
+fn build_side_with_carrier(
+    identity: &str,
+    role: &str,
+    carrier: (&str, &[u8]),
+    protection: (&str, &[u8]),
+    policy: (&str, &[u8]),
+) -> snolc::ValidatedConfig {
+    build_side_with_modules(
+        identity,
+        role,
+        (
+            "adapter_direct",
+            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+        ),
+        carrier,
+        protection,
+        policy,
+        None,
+    )
+}
+
+fn build_side_with_modules(
+    identity: &str,
+    role: &str,
+    adapter: (&str, &[u8]),
+    carrier: (&str, &[u8]),
+    protection: (&str, &[u8]),
+    policy: (&str, &[u8]),
+    control: Option<&Path>,
+) -> snolc::ValidatedConfig {
     let root = PathBuf::from(format!("/tmp/snolc-native-session-{identity}"));
     let adapter_config = root.join("adapter.toml");
     let protection_config = root.join("protection.toml");
@@ -831,7 +924,6 @@ fn build_side_with_adapter_and_control(
             max_connections: 4,
         };
     }
-    let carrier_mode = if listen { "listen" } else { "connect" };
     let modules = vec![
         load(
             &format!("adapter-{identity}"),
@@ -847,11 +939,8 @@ fn build_side_with_adapter_and_control(
         ),
         load(
             &format!("carrier-{identity}"),
-            "carrier_tcp",
-            format!(
-                "mode = \"{carrier_mode}\"\nendpoint_ip = \"{endpoint}\"\nmax_connections = 2\nnodelay = true\n"
-            )
-            .as_bytes(),
+            carrier.0,
+            carrier.1,
             &carrier_config,
         ),
         load(

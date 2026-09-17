@@ -24,5 +24,7 @@ toml.workspace = true
 yamux.workspace = true
 
 [dev-dependencies]
+rand.workspace = true
+russh.workspace = true
 sha2.workspace = true
 snow.workspace = true

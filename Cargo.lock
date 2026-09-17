@@ -2041,6 +2041,8 @@ dependencies = [
  "futures",
  "libc",
  "libloading",
+ "rand",
+ "russh",
  "serde",
  "sha2 0.10.9",
  "smoltcp",
