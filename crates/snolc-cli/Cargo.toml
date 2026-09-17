@@ -1,0 +1,20 @@
+[package]
+name = "snolc-cli"
+description = "command line client for snolc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "snolc"
+path = "src/main.rs"
+
+[dependencies]
+ctrlc.workspace = true
+serde.workspace = true
+sha2.workspace = true
+snolc = { path = "../snolc" }
+toml.workspace = true

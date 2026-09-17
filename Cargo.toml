@@ -4,6 +4,7 @@ members = [
   "crates/snolc-abi",
   "crates/snolc-sdk",
   "crates/snolc",
+  "crates/snolc-cli",
   "modules/adapter-socks5",
   "modules/adapter-http-connect",
   "modules/adapter-direct",
@@ -27,6 +28,7 @@ repository = "https://github.com/owenewans/snolc"
 async-executor = "=1.14.0"
 async-io = "=2.6.0"
 crossbeam-queue = "=0.3.12"
+ctrlc = "=3.5.2"
 ed25519-dalek = "=3.0.0"
 flate2 = "=1.1.2"
 futures = "=0.3.34"
