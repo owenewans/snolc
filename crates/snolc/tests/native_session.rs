@@ -28,20 +28,16 @@ fn native_tcp_dummy_path_establishes_policy_session() {
         "server",
         endpoint,
         true,
-        "protection_dummy",
-        b"",
-        "policy_dummy",
-        b"pump_buffer_bytes = 4096\n",
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
     );
     let client = build_side(
         "client-dummy",
         "client",
         endpoint,
         false,
-        "protection_dummy",
-        b"",
-        "policy_dummy",
-        b"pump_buffer_bytes = 4096\n",
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
     );
     run_pair(server, client);
 }
@@ -76,20 +72,16 @@ fn native_tcp_noise_path_establishes_authenticated_policy_session() {
         "server",
         endpoint,
         true,
-        "protection_noise",
-        server_options.as_bytes(),
-        "policy_dummy",
-        b"pump_buffer_bytes = 4096\n",
+        ("protection_noise", server_options.as_bytes()),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
     );
     let client = build_side(
         "client-noise",
         "client",
         endpoint,
         false,
-        "protection_noise",
-        client_options.as_bytes(),
-        "policy_dummy",
-        b"pump_buffer_bytes = 4096\n",
+        ("protection_noise", client_options.as_bytes()),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
     );
     run_pair(server, client);
     fs::remove_dir_all(directory).unwrap();
@@ -127,20 +119,16 @@ fn native_noise_policy_local_opens_private_storage_and_session() {
         "server",
         endpoint,
         true,
-        "protection_noise",
-        server_protection.as_bytes(),
-        "policy_local",
-        server_policy.as_bytes(),
+        ("protection_noise", server_protection.as_bytes()),
+        ("policy_local", server_policy.as_bytes()),
     );
     let client = build_side(
         "client-local",
         "client",
         endpoint,
         false,
-        "protection_noise",
-        client_protection.as_bytes(),
-        "policy_local",
-        client_policy.as_bytes(),
+        ("protection_noise", client_protection.as_bytes()),
+        ("policy_local", client_policy.as_bytes()),
     );
     run_pair(server, client);
     assert!(directory.join("server-state/policy.redb").is_file());
@@ -178,10 +166,8 @@ fn build_side(
     role: &str,
     endpoint: std::net::SocketAddr,
     listen: bool,
-    protection_library: &str,
-    protection_options: &[u8],
-    policy_library: &str,
-    policy_options: &[u8],
+    protection: (&str, &[u8]),
+    policy: (&str, &[u8]),
 ) -> snolc::ValidatedConfig {
     let root = PathBuf::from(format!("/tmp/snolc-native-session-{identity}"));
     let adapter_config = root.join("adapter.toml");
@@ -209,8 +195,8 @@ fn build_side(
         ),
         load(
             &format!("protection-{identity}"),
-            protection_library,
-            protection_options,
+            protection.0,
+            protection.1,
             &protection_config,
         ),
         load(
@@ -224,8 +210,8 @@ fn build_side(
         ),
         load(
             &format!("policy-{identity}"),
-            policy_library,
-            policy_options,
+            policy.0,
+            policy.1,
             &policy_config,
         ),
     ];
