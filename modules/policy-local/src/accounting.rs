@@ -167,6 +167,10 @@ impl TokenBucket {
             / self.rate_bytes_per_second)
     }
 
+    pub fn refund(&mut self, bytes: u64) {
+        self.tokens = self.tokens.saturating_add(bytes).min(self.burst_bytes);
+    }
+
     fn refill(&mut self, now_nanos: u64) -> Result<(), QuotaError> {
         if now_nanos < self.last_nanos {
             return Err(QuotaError::Clock);
@@ -244,5 +248,7 @@ mod tests {
         assert_eq!(bucket.take(2_000, 0).unwrap(), 2_000);
         assert_eq!(bucket.take(1_000, 500_000_000).unwrap(), 500);
         assert_eq!(bucket.nanos_until(500, 500_000_000).unwrap(), 500_000_000);
+        bucket.refund(250);
+        assert_eq!(bucket.take(500, 500_000_000).unwrap(), 250);
     }
 }
