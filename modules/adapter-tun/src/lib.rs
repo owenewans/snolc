@@ -2,7 +2,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::task::{Context, Poll, Waker};
