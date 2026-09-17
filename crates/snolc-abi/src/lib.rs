@@ -153,6 +153,7 @@ unsafe impl Sync for SnolAdapterApiV1 {}
 pub type WrapFn = unsafe extern "C" fn(
     SnolHandle,
     SnolHandle,
+    *const SnolByteIoV1,
     SnolBytes,
     SnolWakeHandle,
     *mut SnolHandle,

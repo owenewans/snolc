@@ -8,6 +8,7 @@ members = [
   "modules/adapter-http-connect",
   "modules/adapter-direct",
   "modules/adapter-tun",
+  "modules/protection-dummy",
 ]
 
 [workspace.package]

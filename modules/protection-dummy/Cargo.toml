@@ -1,0 +1,17 @@
+[package]
+name = "snolc-protection-dummy"
+description = "pass-through protection module for snolc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde.workspace = true
+snolc-sdk = { path = "../../crates/snolc-sdk" }
+toml.workspace = true
