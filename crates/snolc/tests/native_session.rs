@@ -210,9 +210,18 @@ fn native_socks_tcp_payload_crosses_stack_mux_and_direct_adapter() {
     assert_eq!(&reply, b"direct-reply");
 
     let deadline = Instant::now() + Duration::from_secs(5);
+    while (client_handle.snapshot().flows != 1 || server_handle.snapshot().flows != 1)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(client_handle.snapshot().flows, 1);
+    assert_eq!(server_handle.snapshot().flows, 1);
+    socks.shutdown(Shutdown::Both).unwrap();
     while client_handle.snapshot().flows != 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(client_handle.snapshot().flows, 0);
     target_thread.join().unwrap();
     client_handle.shutdown().unwrap();
     server_handle.shutdown().unwrap();
