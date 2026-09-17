@@ -417,9 +417,10 @@ unsafe extern "C" fn admit_flow(
         if !INSTANCES.contains(instance) || session == 0 {
             return abi::STATUS_INVALID;
         }
-        if let Err(status) = unsafe { snolc_sdk::module::flow_metadata(metadata) } {
-            return status;
-        }
+        let metadata = match unsafe { snolc_sdk::module::flow_metadata(metadata) } {
+            Ok(metadata) => metadata,
+            Err(status) => return status,
+        };
         STATES.with(|states| {
             let mut states = states.borrow_mut();
             let Some(state) = states.get_mut(&instance) else {
@@ -440,7 +441,10 @@ unsafe extern "C" fn admit_flow(
             let Some(user) = state.admin.users.get(&user_id) else {
                 return abi::STATUS_DENIED;
             };
-            if !user_available(user) || flow_limit_reached(state, user) {
+            if !user_available(user)
+                || flow_limit_reached(state, user)
+                || !destination_allowed(state, user, &metadata)
+            {
                 return abi::STATUS_DENIED;
             }
             let Some(session) = state.sessions.get_mut(&session) else {
@@ -1261,6 +1265,131 @@ fn flow_limit_reached(state: &State, user: &UserRecord) -> bool {
     active.saturating_add(pending) >= count as usize
 }
 
+fn destination_allowed(
+    state: &State,
+    user: &UserRecord,
+    metadata: &snolc_sdk::module::BorrowedFlowMetadata<'_>,
+) -> bool {
+    let dynamic = state
+        .admin
+        .rules
+        .get(&user.spec.rule_profile)
+        .and_then(|rules| toml::from_str::<config::Rules>(rules).ok());
+    let rules = dynamic.as_ref().unwrap_or(&state.options.rules);
+    for entry in &rules.entries {
+        if !matches!(
+            entry.direction,
+            config::Direction::Upload | config::Direction::Both
+        ) || entry
+            .user_group
+            .as_deref()
+            .is_some_and(|group| group != user.spec.group)
+            || entry.port.is_some_and(|port| port != metadata.port)
+            || !static_protocol(entry)
+            || !address_rule_matches(entry, metadata)
+        {
+            continue;
+        }
+        return entry.action == config::Action::Allow;
+    }
+    rules.terminal == config::Action::Allow
+}
+
+fn static_protocol(entry: &config::RuleEntry) -> bool {
+    entry.tls_sni.is_none()
+        && entry.http_host.is_none()
+        && matches!(
+            entry.protocol,
+            config::ObservedProtocol::Any | config::ObservedProtocol::Unknown
+        )
+}
+
+fn address_rule_matches(
+    entry: &config::RuleEntry,
+    metadata: &snolc_sdk::module::BorrowedFlowMetadata<'_>,
+) -> bool {
+    if let Some(cidr) = &entry.cidr {
+        let Some(address) = metadata_ip(metadata) else {
+            return false;
+        };
+        if !cidr_matches(cidr, address) {
+            return false;
+        }
+    }
+    let domain = if metadata.address_type == abi::ADDRESS_DOMAIN {
+        std::str::from_utf8(metadata.address).ok()
+    } else {
+        None
+    };
+    if entry
+        .domain_exact
+        .as_deref()
+        .is_some_and(|expected| domain != Some(expected))
+    {
+        return false;
+    }
+    if let Some(suffix) = &entry.domain_suffix
+        && !domain.is_some_and(|domain| {
+            domain == suffix
+                || domain
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    {
+        return false;
+    }
+    true
+}
+
+fn metadata_ip(metadata: &snolc_sdk::module::BorrowedFlowMetadata<'_>) -> Option<std::net::IpAddr> {
+    match metadata.address_type {
+        abi::ADDRESS_IPV4 => metadata
+            .address
+            .try_into()
+            .map(|bytes: [u8; 4]| bytes)
+            .ok()
+            .map(std::net::Ipv4Addr::from)
+            .map(Into::into),
+        abi::ADDRESS_IPV6 => metadata
+            .address
+            .try_into()
+            .map(|bytes: [u8; 16]| bytes)
+            .ok()
+            .map(std::net::Ipv6Addr::from)
+            .map(Into::into),
+        _ => None,
+    }
+}
+
+fn cidr_matches(cidr: &str, address: std::net::IpAddr) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(network), Ok(prefix)) = (network.parse::<std::net::IpAddr>(), prefix.parse::<u8>())
+    else {
+        return false;
+    };
+    match (network, address) {
+        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(address)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(network) & mask == u32::from(address) & mask
+        }
+        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(address)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(network) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
+}
+
 fn status_message(state: &State, user_id: &str, status: &'static str) -> Result<String, u32> {
     let user = state.admin.users.get(user_id).ok_or(abi::STATUS_INVALID)?;
     toml::to_string(&PolicyStatus {
@@ -2023,6 +2152,66 @@ mod module_tests {
         assert_eq!(weighted_share(4_000, 1, 4), 1_000);
         assert_eq!(weighted_share(4_000, 3, 4), 3_000);
         assert_eq!(weighted_share(1, 1, 2), 0);
+    }
+
+    #[test]
+    fn static_destination_rules_match_cidr_and_domain_boundaries() {
+        assert!(cidr_matches("10.0.0.0/8", "10.42.0.1".parse().unwrap()));
+        assert!(!cidr_matches("10.0.0.0/8", "11.0.0.1".parse().unwrap()));
+        let rule: config::RuleEntry = toml::from_str(
+            "action = \"deny\"\ndirection = \"upload\"\nprotocol = \"any\"\nunavailable = \"deny\"\ndomain_suffix = \"example.com\"\n",
+        )
+        .unwrap();
+        let address = b"api.example.com";
+        let metadata = abi::SnolFlowMetadataV1 {
+            struct_size: size_of::<abi::SnolFlowMetadataV1>() as u32,
+            kind: abi::FLOW_TCP,
+            address_type: abi::ADDRESS_DOMAIN,
+            reserved: 0,
+            address: SnolBytes {
+                pointer: address.as_ptr(),
+                length: address.len(),
+            },
+            port: 443,
+            reserved2: [0; 6],
+            metadata: SnolBytes {
+                pointer: std::ptr::null(),
+                length: 0,
+            },
+        };
+        let metadata = unsafe { snolc_sdk::module::flow_metadata(&metadata) }.unwrap();
+        assert!(address_rule_matches(&rule, &metadata));
+        let unrelated = b"badexample.com";
+        let metadata = abi::SnolFlowMetadataV1 {
+            address: SnolBytes {
+                pointer: unrelated.as_ptr(),
+                length: unrelated.len(),
+            },
+            ..metadata_to_owned(&metadata)
+        };
+        let metadata = unsafe { snolc_sdk::module::flow_metadata(&metadata) }.unwrap();
+        assert!(!address_rule_matches(&rule, &metadata));
+    }
+
+    fn metadata_to_owned(
+        metadata: &snolc_sdk::module::BorrowedFlowMetadata<'_>,
+    ) -> abi::SnolFlowMetadataV1 {
+        abi::SnolFlowMetadataV1 {
+            struct_size: size_of::<abi::SnolFlowMetadataV1>() as u32,
+            kind: metadata.kind,
+            address_type: metadata.address_type,
+            reserved: 0,
+            address: SnolBytes {
+                pointer: metadata.address.as_ptr(),
+                length: metadata.address.len(),
+            },
+            port: metadata.port,
+            reserved2: [0; 6],
+            metadata: SnolBytes {
+                pointer: metadata.metadata.as_ptr(),
+                length: metadata.metadata.len(),
+            },
+        }
     }
 
     #[test]

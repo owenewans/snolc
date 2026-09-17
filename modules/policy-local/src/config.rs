@@ -195,6 +195,7 @@ impl Options {
         }
         for entry in &self.rules.entries {
             if entry.port == Some(0)
+                || entry.cidr.as_deref().is_some_and(|cidr| !valid_cidr(cidr))
                 || entry
                     .domain_exact
                     .as_deref()
@@ -242,6 +243,20 @@ fn valid_domain(domain: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
+}
+
+fn valid_cidr(cidr: &str) -> bool {
+    let Some((address, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(address), Ok(prefix)) = (address.parse::<std::net::IpAddr>(), prefix.parse::<u8>())
+    else {
+        return false;
+    };
+    match address {
+        std::net::IpAddr::V4(_) => prefix <= 32,
+        std::net::IpAddr::V6(_) => prefix <= 128,
+    }
 }
 
 fn valid_name(name: &str) -> bool {
