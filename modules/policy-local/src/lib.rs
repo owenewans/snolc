@@ -2035,6 +2035,7 @@ static POLICY: SnolPolicyApiV1 = SnolPolicyApiV1 {
     attach_session: Some(attach_session),
     admit_flow: Some(admit_flow),
     attach_flow: Some(attach_flow),
+    attach_datagram_flow: None,
 };
 
 snolc_sdk::declare_stateful_module! {

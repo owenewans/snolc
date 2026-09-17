@@ -678,6 +678,7 @@ static ADAPTER: SnolAdapterApiV1 = SnolAdapterApiV1 {
     attach: Some(attach),
     complete: Some(complete),
     close_flow: Some(close_flow),
+    attach_datagram: None,
 };
 
 snolc_sdk::declare_stateful_module! {

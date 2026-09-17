@@ -134,6 +134,7 @@ static ADAPTER: SnolAdapterApiV1 = SnolAdapterApiV1 {
     attach: Some(snolc_sdk::module::unsupported_adapter_attach),
     complete: Some(snolc_sdk::module::unsupported_adapter_complete),
     close_flow: Some(snolc_sdk::module::unsupported_adapter_close),
+    attach_datagram: None,
 };
 
 snolc_sdk::declare_module! {

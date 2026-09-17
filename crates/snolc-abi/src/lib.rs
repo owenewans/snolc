@@ -174,6 +174,8 @@ pub type AdapterAcceptFn = unsafe extern "C" fn(
 ) -> SnolStatus;
 pub type AdapterAttachFn =
     unsafe extern "C" fn(SnolHandle, SnolHandle, SnolHandle, *const SnolByteIoV1) -> SnolStatus;
+pub type AdapterAttachDatagramFn =
+    unsafe extern "C" fn(SnolHandle, SnolHandle, SnolHandle, *const SnolDatagramIoV1) -> SnolStatus;
 pub type AdapterCompleteFn =
     unsafe extern "C" fn(SnolHandle, SnolHandle, u32, SnolBytes) -> SnolStatus;
 pub type AdapterCloseFlowFn = unsafe extern "C" fn(SnolHandle, SnolHandle) -> SnolStatus;
@@ -187,6 +189,7 @@ pub struct SnolAdapterApiV1 {
     pub attach: Option<AdapterAttachFn>,
     pub complete: Option<AdapterCompleteFn>,
     pub close_flow: Option<AdapterCloseFlowFn>,
+    pub attach_datagram: Option<AdapterAttachDatagramFn>,
 }
 
 unsafe impl Sync for SnolAdapterApiV1 {}
@@ -245,6 +248,14 @@ pub type AttachFlowFn = unsafe extern "C" fn(
     SnolHandle,
     *const SnolByteIoV1,
 ) -> SnolStatus;
+pub type AttachDatagramFlowFn = unsafe extern "C" fn(
+    SnolHandle,
+    SnolHandle,
+    SnolHandle,
+    *const SnolDatagramIoV1,
+    SnolHandle,
+    *const SnolDatagramIoV1,
+) -> SnolStatus;
 
 #[repr(C)]
 pub struct SnolPolicyApiV1 {
@@ -253,6 +264,7 @@ pub struct SnolPolicyApiV1 {
     pub attach_session: Option<AttachSessionFn>,
     pub admit_flow: Option<AdmitFlowFn>,
     pub attach_flow: Option<AttachFlowFn>,
+    pub attach_datagram_flow: Option<AttachDatagramFlowFn>,
 }
 
 unsafe impl Sync for SnolPolicyApiV1 {}

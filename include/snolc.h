@@ -109,6 +109,9 @@ struct SnolAdapterApiV1 {
     SnolStatus (*complete)(SnolHandle instance, SnolHandle flow,
                            uint32_t status, SnolBytes reason);
     SnolStatus (*close_flow)(SnolHandle instance, SnolHandle flow);
+    SnolStatus (*attach_datagram)(SnolHandle instance, SnolHandle flow,
+                                  SnolHandle stack_socket,
+                                  const SnolDatagramIoV1 *stack_socket_io);
 };
 
 struct SnolProtectionApiV1 {
@@ -143,6 +146,10 @@ struct SnolPolicyApiV1 {
                                const SnolByteIoV1 *stack_socket_io,
                                SnolHandle mux_stream,
                                const SnolByteIoV1 *mux_stream_io);
+    SnolStatus (*attach_datagram_flow)(
+        SnolHandle instance, SnolHandle session, SnolHandle stack_socket,
+        const SnolDatagramIoV1 *stack_socket_io, SnolHandle mux_stream,
+        const SnolDatagramIoV1 *mux_stream_io);
 };
 
 struct SnolHostApiV1 {
