@@ -67,6 +67,20 @@ struct PackageLock<'a> {
     target: &'a str,
     content_sha256: String,
     library: &'a Path,
+    store: &'a Path,
+    dependencies: &'a [Dependency],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredLock {
+    wire_version: u32,
+    package: String,
+    target: String,
+    content_sha256: String,
+    library: PathBuf,
+    store: PathBuf,
+    dependencies: Vec<Dependency>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -459,6 +473,7 @@ pub fn install_binary(
     if package_module != module_name {
         return Err(PackageError::ManifestValue);
     }
+    validate_dependencies(&options.root, &publication.manifest.dependencies)?;
     let artifact = publication
         .manifest
         .artifacts
@@ -515,6 +530,7 @@ pub fn install_source(
     if package_module != module_name {
         return Err(PackageError::ManifestValue);
     }
+    validate_dependencies(&options.root, &publication.manifest.dependencies)?;
     let artifact = publication
         .manifest
         .artifacts
@@ -678,6 +694,8 @@ fn install_extracted(
         target: &artifact.target,
         content_sha256: library_hash,
         library: &library,
+        store: &store,
+        dependencies: &manifest.dependencies,
     })?;
     atomic_write(&lock, lock_data.as_bytes())?;
     Ok(InstallResult {
@@ -685,6 +703,236 @@ fn install_extracted(
         store,
         lock,
     })
+}
+
+pub fn delete_package(root: &Path, package: &str) -> Result<(), PackageError> {
+    if !root.is_absolute() {
+        return Err(PackageError::InstallOptions);
+    }
+    let (owner, name, version) = parse_package_identity(package)?;
+    let install_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(".install.lock"))
+        .map_err(|error| PackageError::IoAt("open install lock", error))?;
+    install_lock
+        .lock()
+        .map_err(|error| PackageError::IoAt("lock installer", error))?;
+    let lock_path = root
+        .join("locks")
+        .join(owner)
+        .join(name)
+        .join(format!("{version}.toml"));
+    let target = read_stored_lock(&lock_path)?;
+    if target.package != package {
+        return Err(PackageError::Lock);
+    }
+    for candidate in lock_files(&root.join("locks"))? {
+        if candidate == lock_path {
+            continue;
+        }
+        let lock = read_stored_lock(&candidate)?;
+        if lock.dependencies.iter().any(|dependency| {
+            dependency.package == format!("{owner}/{name}") && dependency.version == version
+        }) {
+            return Err(PackageError::ReverseDependency(lock.package));
+        }
+    }
+    let store_root = root.join("store").canonicalize()?;
+    let store = target.store.canonicalize()?;
+    let library = target.library.canonicalize()?;
+    if !store.starts_with(&store_root) || !library.starts_with(&store) {
+        return Err(PackageError::Lock);
+    }
+    let staging = Staging::new(root)?;
+    let trash = staging.path.join("package");
+    set_directory_mutable(&store)?;
+    if let Err(error) = fs::rename(&store, &trash) {
+        let _ = set_directory_readonly(&store);
+        return Err(PackageError::IoAt("move package to staging", error));
+    }
+    if let Err(error) = fs::remove_file(&lock_path) {
+        let _ = fs::rename(&trash, &store);
+        let _ = set_directory_readonly(&store);
+        return Err(error.into());
+    }
+    make_mutable(&trash).map_err(|error| match error {
+        PackageError::Io(error) => PackageError::IoAt("make package mutable", error),
+        error => error,
+    })?;
+    fs::remove_dir_all(&trash).map_err(|error| PackageError::IoAt("remove package", error))?;
+    Ok(())
+}
+
+pub fn write_template(
+    root: &Path,
+    package: &str,
+    role: &str,
+    output: &Path,
+) -> Result<(), PackageError> {
+    if !root.is_absolute() || output.as_os_str().is_empty() {
+        return Err(PackageError::InstallOptions);
+    }
+    validate_module_name(role)?;
+    let (owner, name, version) = parse_package_identity(package)?;
+    let install_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(".install.lock"))?;
+    install_lock.lock()?;
+    let lock_path = root
+        .join("locks")
+        .join(owner)
+        .join(name)
+        .join(format!("{version}.toml"));
+    let lock = read_stored_lock(&lock_path)?;
+    if lock.package != package {
+        return Err(PackageError::Lock);
+    }
+    let store_root = root.join("store").canonicalize()?;
+    let store = lock.store.canonicalize()?;
+    if !store.starts_with(&store_root) {
+        return Err(PackageError::Lock);
+    }
+    let template = store.join("templates").join(format!("{role}.toml"));
+    let template = template
+        .canonicalize()
+        .map_err(|_| PackageError::Template)?;
+    if !template.starts_with(&store) || !template.is_file() {
+        return Err(PackageError::Template);
+    }
+    let metadata = fs::metadata(&template)?;
+    if metadata.len() > MAX_MANIFEST_BYTES as u64 {
+        return Err(PackageError::Template);
+    }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    io::copy(&mut File::open(template)?, &mut destination)?;
+    destination.sync_all()?;
+    Ok(())
+}
+
+fn set_directory_mutable(path: &Path) -> Result<(), PackageError> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+fn set_directory_readonly(path: &Path) -> Result<(), PackageError> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o500);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+fn validate_dependencies(root: &Path, dependencies: &[Dependency]) -> Result<(), PackageError> {
+    for dependency in dependencies {
+        let (owner, name) = dependency
+            .package
+            .split_once('/')
+            .ok_or(PackageError::Dependency)?;
+        let lock_path = root
+            .join("locks")
+            .join(owner)
+            .join(name)
+            .join(format!("{}.toml", dependency.version));
+        let lock = read_stored_lock(&lock_path).map_err(|_| PackageError::Dependency)?;
+        let expected = format!("{}@{}", dependency.package, dependency.version);
+        let store_root = root.join("store").canonicalize()?;
+        let store = lock.store.canonicalize()?;
+        let library = lock.library.canonicalize()?;
+        if lock.wire_version != 1
+            || lock.package != expected
+            || lock.content_sha256 != dependency.content_sha256
+            || lock.target.is_empty()
+            || !store.starts_with(&store_root)
+            || !library.starts_with(&store)
+            || hash_file(&library)? != lock.content_sha256
+        {
+            return Err(PackageError::Dependency);
+        }
+    }
+    Ok(())
+}
+
+fn read_stored_lock(path: &Path) -> Result<StoredLock, PackageError> {
+    toml::from_str(&fs::read_to_string(path)?).map_err(PackageError::Toml)
+}
+
+fn lock_files(root: &Path) -> Result<Vec<PathBuf>, PackageError> {
+    let mut output = Vec::new();
+    if !root.exists() {
+        return Ok(output);
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            output.extend(lock_files(&path)?);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            output.push(path);
+        }
+    }
+    Ok(output)
+}
+
+fn parse_package_identity(package: &str) -> Result<(&str, &str, &str), PackageError> {
+    let (name, version) = package.rsplit_once('@').ok_or(PackageError::Lock)?;
+    let (owner, name) = name.split_once('/').ok_or(PackageError::Lock)?;
+    validate_package_name(&format!("{owner}/{name}"))?;
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+    {
+        return Err(PackageError::Lock);
+    }
+    Ok((owner, name, version))
+}
+
+fn make_mutable(path: &Path) -> Result<(), PackageError> {
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            make_mutable(&entry?.path())?;
+        }
+    }
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(if path.is_dir() { 0o700 } else { 0o600 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
 }
 
 fn hash_file(path: &Path) -> Result<String, PackageError> {
@@ -919,6 +1167,8 @@ pub enum PackageError {
     ArchiveSize,
     #[error("I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("I/O failed during {0}: {1}")]
+    IoAt(&'static str, io::Error),
     #[error("Git operation failed: {0}")]
     Git(String),
     #[error("Git source must be HTTPS or an absolute local path")]
@@ -943,6 +1193,14 @@ pub enum PackageError {
     ArtifactHash,
     #[error("source build failed with exit code {0:?}")]
     Build(Option<i32>),
+    #[error("package dependency is missing or conflicts")]
+    Dependency,
+    #[error("package lock is invalid")]
+    Lock,
+    #[error("package is required by {0}")]
+    ReverseDependency(String),
+    #[error("package template is unavailable")]
+    Template,
     #[error("module entry is missing")]
     Entry,
     #[error("immutable store content conflicts")]
@@ -1194,6 +1452,8 @@ trust = "local-development"
         let content = root.join("content");
         fs::create_dir_all(content.join("lib")).unwrap();
         fs::write(content.join("lib/libsnolc_carrier_tcp.so"), b"library").unwrap();
+        fs::create_dir(content.join("templates")).unwrap();
+        fs::write(content.join("templates/server.toml"), "wire_version = 1\n").unwrap();
         let manifest = PublicationManifest::parse(MANIFEST.as_bytes()).unwrap();
         let source = TrustedSource {
             id: "official".into(),
@@ -1215,6 +1475,8 @@ trust = "local-development"
             },
         )
         .unwrap();
+        let installed_store = result.store.clone();
+        let installed_lock = result.lock.clone();
         assert_eq!(result.package, "owenewans/carrier-tcp@0.0.1");
         assert!(result.store.join(&manifest.entry).is_file());
         let lock = fs::read_to_string(result.lock).unwrap();
@@ -1224,7 +1486,73 @@ trust = "local-development"
             lock["content_sha256"].as_str(),
             Some("b718f1354f7247312eca086d9a024afe5fa717ddea5adeddd6f12bcf945b2e8c")
         );
+        let output = root.join("generated/server.toml");
+        write_template(&root, "owenewans/carrier-tcp@0.0.1", "server", &output).unwrap();
+        assert_eq!(fs::read_to_string(output).unwrap(), "wire_version = 1\n");
+        assert!(
+            write_template(
+                &root,
+                "owenewans/carrier-tcp@0.0.1",
+                "server",
+                &root.join("generated/server.toml"),
+            )
+            .is_err()
+        );
+        delete_package(&root, "owenewans/carrier-tcp@0.0.1").unwrap();
+        assert!(!installed_store.exists());
+        assert!(!installed_lock.exists());
         remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn refuses_to_delete_reverse_dependency() {
+        let root = temporary_directory("delete-dependency");
+        let source = TrustedSource {
+            id: "official".into(),
+            git: "https://example.invalid/modules.git".into(),
+            trust: TrustMode::Signed,
+            public_key: Some("11".repeat(32)),
+        };
+        let options = InstallOptions {
+            root: root.clone(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            limits: limits(),
+            offline: false,
+        };
+        let base = PublicationManifest::parse(MANIFEST.as_bytes()).unwrap();
+        let base_content = root.join("base-content");
+        fs::create_dir_all(base_content.join("lib")).unwrap();
+        fs::write(base_content.join("lib/libsnolc_carrier_tcp.so"), b"base").unwrap();
+        let base_result =
+            install_extracted(&base, &source, &base.artifacts[0], &base_content, &options).unwrap();
+        let base_lock = read_stored_lock(&base_result.lock).unwrap();
+
+        let mut dependent = base.clone();
+        dependent.name = "owenewans/dependent".into();
+        dependent.entry = "lib/dependent.so".into();
+        dependent.dependencies.push(Dependency {
+            package: "owenewans/carrier-tcp".into(),
+            version: "0.0.1".into(),
+            content_sha256: base_lock.content_sha256,
+        });
+        let dependent_content = root.join("dependent-content");
+        fs::create_dir_all(dependent_content.join("lib")).unwrap();
+        fs::write(dependent_content.join("lib/dependent.so"), b"dependent").unwrap();
+        install_extracted(
+            &dependent,
+            &source,
+            &dependent.artifacts[0],
+            &dependent_content,
+            &options,
+        )
+        .unwrap();
+        assert!(matches!(
+            delete_package(&root, "owenewans/carrier-tcp@0.0.1"),
+            Err(PackageError::ReverseDependency(package)) if package == "owenewans/dependent@0.0.1"
+        ));
+        delete_package(&root, "owenewans/dependent@0.0.1").unwrap();
+        delete_package(&root, "owenewans/carrier-tcp@0.0.1").unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

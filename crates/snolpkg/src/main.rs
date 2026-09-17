@@ -3,7 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use snolpkg::{ExtractLimits, InstallOptions, install_binary, install_source};
+use snolpkg::{
+    ExtractLimits, InstallOptions, delete_package, install_binary, install_source, write_template,
+};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -59,6 +61,20 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
             println!("{}", result.package);
             Ok(())
+        }
+        [command, package] if command == "del" => {
+            delete_package(&package_root()?, package).map_err(|error| error.to_string())
+        }
+        [command, package, role_flag, role, output_flag, output]
+            if command == "template" && role_flag == "--role" && output_flag == "--output" =>
+        {
+            write_template(
+                &package_root()?,
+                package,
+                role,
+                PathBuf::from(output).as_path(),
+            )
+            .map_err(|error| error.to_string())
         }
         _ => Err(usage().into()),
     }

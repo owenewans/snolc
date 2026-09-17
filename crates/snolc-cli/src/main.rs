@@ -145,6 +145,16 @@ struct PackageLock {
     target: String,
     content_sha256: String,
     library: PathBuf,
+    store: PathBuf,
+    dependencies: Vec<LockedDependency>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LockedDependency {
+    package: String,
+    version: String,
+    content_sha256: String,
 }
 
 fn resolve_library(packages: &Path, package: &PackageIdentity) -> Result<PathBuf, String> {
@@ -159,6 +169,12 @@ fn resolve_library(packages: &Path, package: &PackageIdentity) -> Result<PathBuf
     if lock.wire_version != snolc::WIRE_VERSION
         || lock.package != *package
         || lock.target.is_empty()
+        || lock.store.as_os_str().is_empty()
+        || lock.dependencies.iter().any(|dependency| {
+            dependency.package.is_empty()
+                || dependency.version.is_empty()
+                || dependency.content_sha256.len() != 64
+        })
     {
         return Err(format!(
             "package lock {} is incompatible",
