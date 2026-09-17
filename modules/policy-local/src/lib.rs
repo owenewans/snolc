@@ -61,6 +61,7 @@ static SESSION_NEXT: AtomicU64 = AtomicU64::new(1);
 static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 
 struct State {
+    started: Instant,
     options: Options,
     storage: StorageWorker,
     admin: AdminState,
@@ -73,6 +74,9 @@ struct State {
 
 struct UserTraffic {
     quota: QuotaAccount,
+    upload: Option<TokenBucket>,
+    download: Option<TokenBucket>,
+    combined: Option<TokenBucket>,
     debit: Option<PendingDebit>,
     refund: Option<PendingRefund>,
     failed: bool,
@@ -88,6 +92,13 @@ struct PendingRefund {
     amount: u64,
     record: UserRecord,
     reply: storage::WriteReply,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RateGrant {
+    stack_to_mux: u64,
+    mux_to_stack: u64,
+    combined: u64,
 }
 
 struct PolicySession {
@@ -187,20 +198,28 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
     fn poll(
         &mut self,
         context: &mut Context<'_>,
-        max_work: usize,
+        max_stack_to_mux: usize,
+        max_mux_to_stack: usize,
+        max_total: usize,
     ) -> Poll<Result<(PumpReport, PumpReport), PumpError>> {
-        let upload = self
-            .upload
-            .poll(context, &mut self.stack, &mut self.mux, max_work);
+        let upload = self.upload.poll(
+            context,
+            &mut self.stack,
+            &mut self.mux,
+            max_stack_to_mux.min(max_total),
+        );
         let upload = match upload {
             Poll::Ready(Ok(report)) => report,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => PumpReport::default(),
         };
-        let remaining = max_work.saturating_sub(upload.written);
-        let download = self
-            .download
-            .poll(context, &mut self.mux, &mut self.stack, remaining);
+        let remaining = max_total.saturating_sub(upload.written);
+        let download = self.download.poll(
+            context,
+            &mut self.mux,
+            &mut self.stack,
+            max_mux_to_stack.min(remaining),
+        );
         let download = match download {
             Poll::Ready(Ok(report)) => report,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -263,6 +282,7 @@ fn initialize(
         states.borrow_mut().insert(
             instance,
             State {
+                started: Instant::now(),
                 options,
                 admin: AdminState {
                     sequencer,
@@ -485,33 +505,79 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         }
         let mut finished = Vec::new();
         let mut usage = Vec::new();
+        let now_nanos = u64::try_from(state.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let active_users: HashSet<String> = state
+            .flows
+            .values()
+            .filter_map(|flow| flow.user_id.clone())
+            .collect();
+        let mut grants = HashMap::new();
+        for user_id in active_users {
+            let Some(traffic) = state.traffic.get_mut(&user_id) else {
+                continue;
+            };
+            let budget = usize::try_from(traffic.quota.credit_remaining())
+                .unwrap_or(usize::MAX)
+                .min(state.options.sniff_bytes);
+            if let Ok(grant) = take_rate_grant(traffic, budget, now_nanos) {
+                grants.insert(user_id, grant);
+            }
+        }
         for (handle, flow) in &mut state.flows {
-            let budget = flow
+            let grant = flow
                 .user_id
                 .as_ref()
-                .and_then(|id| state.traffic.get(id))
-                .map(|traffic| {
-                    usize::try_from(traffic.quota.credit_remaining())
-                        .unwrap_or(usize::MAX)
-                        .min(state.options.sniff_bytes)
-                })
-                .unwrap_or(state.options.sniff_bytes);
-            if budget == 0 {
+                .and_then(|id| grants.remove(id))
+                .unwrap_or_else(|| {
+                    if flow.user_id.is_none() {
+                        let work = state.options.sniff_bytes as u64;
+                        RateGrant {
+                            stack_to_mux: work,
+                            mux_to_stack: work,
+                            combined: work,
+                        }
+                    } else {
+                        RateGrant::default()
+                    }
+                });
+            if grant.combined == 0 {
                 continue;
             }
-            match flow.poll(&mut context, budget) {
+            let result = flow.poll(
+                &mut context,
+                usize::try_from(grant.stack_to_mux).unwrap_or(usize::MAX),
+                usize::try_from(grant.mux_to_stack).unwrap_or(usize::MAX),
+                usize::try_from(grant.combined).unwrap_or(usize::MAX),
+            );
+            match result {
                 Poll::Ready(Ok((upload, download))) if upload.finished && download.finished => {
-                    usage.push((*handle, flow.user_id.clone(), upload, download));
+                    usage.push((*handle, flow.user_id.clone(), grant, upload, download));
                     finished.push(*handle);
                 }
                 Poll::Ready(Ok((upload, download))) => {
-                    usage.push((*handle, flow.user_id.clone(), upload, download));
+                    usage.push((*handle, flow.user_id.clone(), grant, upload, download));
                 }
-                Poll::Ready(Err(_)) => finished.push(*handle),
-                Poll::Pending => {}
+                Poll::Ready(Err(_)) => {
+                    usage.push((
+                        *handle,
+                        flow.user_id.clone(),
+                        grant,
+                        PumpReport::default(),
+                        PumpReport::default(),
+                    ));
+                    finished.push(*handle);
+                }
+                Poll::Pending => usage.push((
+                    *handle,
+                    flow.user_id.clone(),
+                    grant,
+                    PumpReport::default(),
+                    PumpReport::default(),
+                )),
             }
         }
-        for (handle, user_id, upload, download) in usage {
+        for (handle, user_id, grant, upload, download) in usage {
+            refund_rate(state, user_id.as_deref(), grant, upload, download);
             if charge_flow(state, user_id.as_deref(), upload, download).is_err() {
                 finished.push(handle);
             }
@@ -570,10 +636,38 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
                     continue;
                 }
             };
+            let now_nanos = u64::try_from(state.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let upload = match rate_bucket(&user.spec.upload_rate, user.spec.burst_bytes, now_nanos)
+            {
+                Ok(bucket) => bucket,
+                Err(_) => {
+                    stopped.insert(user_id);
+                    continue;
+                }
+            };
+            let download =
+                match rate_bucket(&user.spec.download_rate, user.spec.burst_bytes, now_nanos) {
+                    Ok(bucket) => bucket,
+                    Err(_) => {
+                        stopped.insert(user_id);
+                        continue;
+                    }
+                };
+            let combined =
+                match rate_bucket(&user.spec.combined_rate, user.spec.burst_bytes, now_nanos) {
+                    Ok(bucket) => bucket,
+                    Err(_) => {
+                        stopped.insert(user_id);
+                        continue;
+                    }
+                };
             state.traffic.insert(
                 user_id.clone(),
                 UserTraffic {
                     quota,
+                    upload,
+                    download,
+                    combined,
                     debit: None,
                     refund: None,
                     failed: false,
@@ -750,6 +844,74 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
         state.traffic.remove(&user_id);
     }
     stopped
+}
+
+fn rate_bucket(
+    rate: &RateLimit,
+    burst_bytes: u64,
+    now_nanos: u64,
+) -> Result<Option<TokenBucket>, QuotaError> {
+    match rate {
+        RateLimit::Unlimited => Ok(None),
+        RateLimit::Limited { bytes_per_second } => {
+            TokenBucket::new(*bytes_per_second, burst_bytes, now_nanos).map(Some)
+        }
+    }
+}
+
+fn take_rate_grant(
+    traffic: &mut UserTraffic,
+    budget: usize,
+    now_nanos: u64,
+) -> Result<RateGrant, QuotaError> {
+    let budget = u64::try_from(budget).map_err(|_| QuotaError::Overflow)?;
+    let combined = match &mut traffic.combined {
+        Some(bucket) => bucket.take(budget, now_nanos)?,
+        None => budget,
+    };
+    let user_upload = match &mut traffic.upload {
+        Some(bucket) => bucket.take(combined, now_nanos)?,
+        None => combined,
+    };
+    let user_download = match &mut traffic.download {
+        Some(bucket) => bucket.take(combined, now_nanos)?,
+        None => combined,
+    };
+    Ok(RateGrant {
+        stack_to_mux: user_download,
+        mux_to_stack: user_upload,
+        combined,
+    })
+}
+
+fn refund_rate(
+    state: &mut State,
+    user_id: Option<&str>,
+    grant: RateGrant,
+    stack_to_mux: PumpReport,
+    mux_to_stack: PumpReport,
+) {
+    let Some(user_id) = user_id else {
+        return;
+    };
+    let Some(traffic) = state.traffic.get_mut(user_id) else {
+        return;
+    };
+    let stack_written = u64::try_from(stack_to_mux.written).unwrap_or(u64::MAX);
+    let mux_written = u64::try_from(mux_to_stack.written).unwrap_or(u64::MAX);
+    if let Some(bucket) = &mut traffic.download {
+        bucket.refund(grant.stack_to_mux.saturating_sub(stack_written));
+    }
+    if let Some(bucket) = &mut traffic.upload {
+        bucket.refund(grant.mux_to_stack.saturating_sub(mux_written));
+    }
+    if let Some(bucket) = &mut traffic.combined {
+        bucket.refund(
+            grant
+                .combined
+                .saturating_sub(stack_written.saturating_add(mux_written)),
+        );
+    }
 }
 
 fn charge_flow(
@@ -1679,12 +1841,62 @@ mod module_tests {
         let mut flow = PolicyFlow::new(stack, mux, 16, None).unwrap();
         let mut context = Context::from_waker(Waker::noop());
         while !flow.upload.is_finished() || !flow.download.is_finished() {
-            let _ = flow.poll(&mut context, 16);
+            let _ = flow.poll(&mut context, 16, 16, 16);
         }
         assert_eq!(flow.mux.output, b"upload");
         assert_eq!(flow.stack.output, b"download");
         assert!(flow.mux.shutdown);
         assert!(flow.stack.shutdown);
+    }
+
+    #[test]
+    fn runtime_rate_grant_limits_pump_writes() {
+        let mut quota = QuotaAccount::new(None, 0, 100).unwrap();
+        let credit = quota.request_credit().unwrap();
+        quota.commit_credit(credit).unwrap();
+        let mut traffic = UserTraffic {
+            quota,
+            upload: Some(TokenBucket::new(10, 10, 0).unwrap()),
+            download: Some(TokenBucket::new(10, 10, 0).unwrap()),
+            combined: Some(TokenBucket::new(15, 15, 0).unwrap()),
+            debit: None,
+            refund: None,
+            failed: false,
+        };
+        let stack = MemoryIo {
+            input: vec![b'x'; 100].into(),
+            ..MemoryIo::default()
+        };
+        let mux = MemoryIo::default();
+        let mut flow = PolicyFlow::new(stack, mux, 100, Some("user".into())).unwrap();
+        let grant = take_rate_grant(&mut traffic, 100, 0).unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        let Poll::Ready(Ok((stack_to_mux, mux_to_stack))) = flow.poll(
+            &mut context,
+            grant.stack_to_mux as usize,
+            grant.mux_to_stack as usize,
+            grant.combined as usize,
+        ) else {
+            panic!("pump did not make progress");
+        };
+        assert_eq!(stack_to_mux.written, 10);
+        assert_eq!(mux_to_stack.written, 0);
+        traffic
+            .combined
+            .as_mut()
+            .unwrap()
+            .refund(grant.combined - 10);
+        traffic.upload.as_mut().unwrap().refund(grant.mux_to_stack);
+        assert_eq!(
+            take_rate_grant(&mut traffic, 100, 0).unwrap().stack_to_mux,
+            0
+        );
+        assert_eq!(
+            take_rate_grant(&mut traffic, 100, 1_000_000_000)
+                .unwrap()
+                .stack_to_mux,
+            10
+        );
     }
 
     #[test]
