@@ -15,7 +15,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
-    Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
+    Ipv6Address, Ipv6FragmentHeader, Ipv6Packet, TcpPacket, UdpPacket,
 };
 use snolc_sdk::{DatagramIo, DatagramRecv, HandleTable, TypedHandle};
 use thiserror::Error;
@@ -24,6 +24,11 @@ use crate::config::StackConfig;
 use crate::wire::Destination;
 
 const FIRST_DYNAMIC_PORT: u16 = 1024;
+const IPV6_HEADER_BYTES: usize = 40;
+const IPV6_FRAGMENT_HEADER_BYTES: usize = 8;
+pub(crate) const MAX_IPV6_PACKET_BYTES: usize = IPV6_HEADER_BYTES + u16::MAX as usize;
+const REASSEMBLY_BLOCK_BYTES: usize = 8;
+const REASSEMBLY_BLOCKS: usize = u16::MAX as usize / REASSEMBLY_BLOCK_BYTES + 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlowMetadata {
@@ -88,6 +93,46 @@ struct PacketUdpFlow {
     incoming: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ipv6FragmentKey {
+    source: Ipv6Address,
+    destination: Ipv6Address,
+    identifier: u32,
+}
+
+struct Ipv6ReassemblySlot {
+    key: Option<Ipv6FragmentKey>,
+    packet: Vec<u8>,
+    received: Vec<bool>,
+    prefix_len: usize,
+    previous_next_header: usize,
+    fragment_next_header: u8,
+    total_fragment_len: Option<usize>,
+    expires_at_ms: u64,
+}
+
+struct Ipv6Reassembly {
+    slots: Vec<Ipv6ReassemblySlot>,
+    timeout_ms: u64,
+}
+
+enum ReassemblyOutcome {
+    Packet(Vec<u8>),
+    Buffered,
+    Pending,
+    Dropped,
+}
+
+struct Ipv6Fragment<'a> {
+    key: Ipv6FragmentKey,
+    prefix_len: usize,
+    previous_next_header: usize,
+    next_header: u8,
+    offset: usize,
+    more: bool,
+    payload: &'a [u8],
+}
+
 pub struct StackBridge {
     interface: Interface,
     device: BoundedDevice,
@@ -107,6 +152,7 @@ pub struct StackBridge {
     max_managed_bytes: usize,
     max_ingress_packets_per_tick: usize,
     started: StdInstant,
+    ipv6_reassembly: Ipv6Reassembly,
 }
 
 pub struct SharedStackBridge {
@@ -597,7 +643,7 @@ impl DatagramIo for PacketPort {
                 "packet port is closed",
             )));
         }
-        if packet.is_empty() || packet.len() > u16::MAX as usize || !valid_ip_packet(packet) {
+        if packet.is_empty() || packet.len() > MAX_IPV6_PACKET_BYTES || !valid_ip_packet(packet) {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "packet port input is invalid",
@@ -608,13 +654,25 @@ impl DatagramIo for PacketPort {
             Err(error) => return Poll::Ready(Err(error)),
         };
         let mut bridge = bridge.borrow_mut();
-        if bridge.device.bytes.saturating_add(packet.len()) > bridge.device.byte_limit {
+        let available = bridge.device.byte_limit.saturating_sub(bridge.device.bytes);
+        let now_ms = u64::try_from(bridge.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let packet = match bridge.ipv6_reassembly.ingest(packet, now_ms, available) {
+            ReassemblyOutcome::Packet(packet) => packet,
+            ReassemblyOutcome::Pending => {
+                drop(bridge);
+                return self.pending(context);
+            }
+            ReassemblyOutcome::Buffered | ReassemblyOutcome::Dropped => {
+                return Poll::Ready(Ok(()));
+            }
+        };
+        if packet.len() > available {
             drop(bridge);
             return self.pending(context);
         }
         bridge.device.bytes += packet.len();
         bridge.device.ingress.push_back(QueuedPacket {
-            bytes: packet.to_vec(),
+            bytes: packet,
             external: true,
         });
         Poll::Ready(Ok(()))
@@ -847,6 +905,18 @@ impl StackBridge {
         max_managed_bytes: usize,
         max_ingress_packets_per_tick: usize,
     ) -> Result<Self, StackError> {
+        let reassembly_managed_bytes = Ipv6Reassembly::managed_bytes(config.reassembly_slots)
+            .and_then(|bytes| {
+                config
+                    .reassembly_slots
+                    .checked_mul(65_536)
+                    .and_then(|smoltcp| bytes.checked_add(smoltcp))
+            })
+            .and_then(|bytes| bytes.checked_add(config.packet_queue_bytes))
+            .ok_or(StackError::Resource)?;
+        if reassembly_managed_bytes > max_managed_bytes {
+            return Err(StackError::Resource);
+        }
         let mut device = BoundedDevice::new(config.mtu, config.packet_queue_bytes);
         let interface_config = InterfaceConfig::new(HardwareAddress::Ip);
         let mut interface = Interface::new(interface_config, &mut device, Instant::from_millis(0));
@@ -876,6 +946,8 @@ impl StackBridge {
                 .add_default_ipv6_route(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 1))
                 .map_err(|_| StackError::Resource)?;
         }
+        let ipv6_reassembly =
+            Ipv6Reassembly::new(config.reassembly_slots, config.reassembly_timeout_ms);
         Ok(Self {
             interface,
             device,
@@ -891,10 +963,11 @@ impl StackBridge {
             pending_packet_udp: VecDeque::new(),
             ports: PortPool::new(),
             config,
-            managed_bytes: 0,
+            managed_bytes: reassembly_managed_bytes,
             max_managed_bytes,
             max_ingress_packets_per_tick,
             started: StdInstant::now(),
+            ipv6_reassembly,
         })
     }
 
@@ -1765,6 +1838,223 @@ fn valid_ip_packet(packet: &[u8]) -> bool {
     }
 }
 
+impl Ipv6ReassemblySlot {
+    fn new() -> Self {
+        Self {
+            key: None,
+            packet: vec![0; MAX_IPV6_PACKET_BYTES],
+            received: vec![false; REASSEMBLY_BLOCKS],
+            prefix_len: 0,
+            previous_next_header: 0,
+            fragment_next_header: 0,
+            total_fragment_len: None,
+            expires_at_ms: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.key = None;
+        self.received.fill(false);
+        self.total_fragment_len = None;
+    }
+
+    fn is_complete(&self) -> bool {
+        let Some(total) = self.total_fragment_len else {
+            return false;
+        };
+        self.received[..total.div_ceil(REASSEMBLY_BLOCK_BYTES)]
+            .iter()
+            .all(|received| *received)
+    }
+
+    fn take_packet(&mut self, available: usize) -> Option<Vec<u8>> {
+        if !self.is_complete() {
+            return None;
+        }
+        let total = self.total_fragment_len?;
+        let packet_len = self.prefix_len.checked_add(total)?;
+        if packet_len > available {
+            return None;
+        }
+        let payload_len = packet_len.checked_sub(IPV6_HEADER_BYTES)?;
+        let payload_len = u16::try_from(payload_len).ok()?;
+        self.packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        self.packet[self.previous_next_header] = self.fragment_next_header;
+        let packet = self.packet[..packet_len].to_vec();
+        self.clear();
+        Some(packet)
+    }
+}
+
+impl Ipv6Reassembly {
+    fn new(slots: usize, timeout_ms: u64) -> Self {
+        Self {
+            slots: (0..slots).map(|_| Ipv6ReassemblySlot::new()).collect(),
+            timeout_ms,
+        }
+    }
+
+    fn managed_bytes(slots: usize) -> Option<usize> {
+        MAX_IPV6_PACKET_BYTES
+            .checked_add(REASSEMBLY_BLOCKS)?
+            .checked_mul(slots)
+    }
+
+    fn ingest(&mut self, packet: &[u8], now_ms: u64, available: usize) -> ReassemblyOutcome {
+        let fragment = match ipv6_fragment(packet) {
+            Ok(Some(fragment)) => fragment,
+            Ok(None) => return ReassemblyOutcome::Packet(packet.to_vec()),
+            Err(()) => return ReassemblyOutcome::Dropped,
+        };
+        for slot in &mut self.slots {
+            if slot.key.is_some() && slot.expires_at_ms <= now_ms {
+                slot.clear();
+            }
+        }
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.key == Some(fragment.key) && slot.is_complete())
+        {
+            return slot
+                .take_packet(available)
+                .map_or(ReassemblyOutcome::Pending, ReassemblyOutcome::Packet);
+        }
+        let Some(index) = self
+            .slots
+            .iter()
+            .position(|slot| slot.key == Some(fragment.key))
+            .or_else(|| self.slots.iter().position(|slot| slot.key.is_none()))
+        else {
+            return ReassemblyOutcome::Dropped;
+        };
+        let slot = &mut self.slots[index];
+        if slot.key.is_none() {
+            slot.key = Some(fragment.key);
+            slot.prefix_len = fragment.prefix_len;
+            slot.previous_next_header = fragment.previous_next_header;
+            slot.fragment_next_header = fragment.next_header;
+            slot.expires_at_ms = now_ms.saturating_add(self.timeout_ms);
+            slot.packet[..fragment.prefix_len].copy_from_slice(&packet[..fragment.prefix_len]);
+        } else if slot.prefix_len != fragment.prefix_len
+            || slot.previous_next_header != fragment.previous_next_header
+            || slot.fragment_next_header != fragment.next_header
+            || slot.packet[..4] != packet[..4]
+            || slot.packet[6..fragment.prefix_len] != packet[6..fragment.prefix_len]
+        {
+            slot.clear();
+            return ReassemblyOutcome::Dropped;
+        }
+        let Some(end) = fragment.offset.checked_add(fragment.payload.len()) else {
+            slot.clear();
+            return ReassemblyOutcome::Dropped;
+        };
+        if end == 0
+            || slot.prefix_len.checked_add(end).is_none()
+            || slot.prefix_len + end > MAX_IPV6_PACKET_BYTES
+            || fragment.more && fragment.payload.len() % REASSEMBLY_BLOCK_BYTES != 0
+            || slot
+                .total_fragment_len
+                .is_some_and(|total| end > total || fragment.more && end == total)
+        {
+            slot.clear();
+            return ReassemblyOutcome::Dropped;
+        }
+        let first_block = fragment.offset / REASSEMBLY_BLOCK_BYTES;
+        let last_block = end.div_ceil(REASSEMBLY_BLOCK_BYTES);
+        if slot.received[first_block..last_block]
+            .iter()
+            .any(|received| *received)
+        {
+            slot.clear();
+            return ReassemblyOutcome::Dropped;
+        }
+        let output_start = slot.prefix_len + fragment.offset;
+        slot.packet[output_start..output_start + fragment.payload.len()]
+            .copy_from_slice(fragment.payload);
+        slot.received[first_block..last_block].fill(true);
+        if !fragment.more {
+            if slot.total_fragment_len.is_some_and(|total| total != end) {
+                slot.clear();
+                return ReassemblyOutcome::Dropped;
+            }
+            slot.total_fragment_len = Some(end);
+        }
+        if slot.is_complete() {
+            slot.take_packet(available)
+                .map_or(ReassemblyOutcome::Pending, ReassemblyOutcome::Packet)
+        } else {
+            ReassemblyOutcome::Buffered
+        }
+    }
+}
+
+fn ipv6_fragment(packet: &[u8]) -> Result<Option<Ipv6Fragment<'_>>, ()> {
+    if packet.first().map(|byte| byte >> 4) != Some(6) {
+        return Ok(None);
+    }
+    let ipv6 = Ipv6Packet::new_checked(packet).map_err(|_| ())?;
+    let packet_len = IPV6_HEADER_BYTES
+        .checked_add(ipv6.payload().len())
+        .ok_or(())?;
+    let packet = &packet[..packet_len];
+    let mut next_header = packet[6];
+    let mut previous_next_header = 6;
+    let mut offset = IPV6_HEADER_BYTES;
+    loop {
+        match next_header {
+            44 => {
+                let end = offset.checked_add(IPV6_FRAGMENT_HEADER_BYTES).ok_or(())?;
+                let bytes = packet.get(offset..end).ok_or(())?;
+                if bytes[1] != 0 || u16::from_be_bytes([bytes[2], bytes[3]]) & 0x0006 != 0 {
+                    return Err(());
+                }
+                let header = Ipv6FragmentHeader::new_checked(&bytes[2..]).map_err(|_| ())?;
+                return Ok(Some(Ipv6Fragment {
+                    key: Ipv6FragmentKey {
+                        source: ipv6.src_addr(),
+                        destination: ipv6.dst_addr(),
+                        identifier: header.ident(),
+                    },
+                    prefix_len: offset,
+                    previous_next_header,
+                    next_header: bytes[0],
+                    offset: usize::from(header.frag_offset()) * REASSEMBLY_BLOCK_BYTES,
+                    more: header.more_frags(),
+                    payload: &packet[end..],
+                }));
+            }
+            0 | 43 | 60 => {
+                let header = packet.get(offset..offset + 2).ok_or(())?;
+                let length = (usize::from(header[1]) + 1).checked_mul(8).ok_or(())?;
+                if offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > packet.len())
+                {
+                    return Err(());
+                }
+                previous_next_header = offset;
+                next_header = header[0];
+                offset += length;
+            }
+            51 => {
+                let header = packet.get(offset..offset + 2).ok_or(())?;
+                let length = (usize::from(header[1]) + 2).checked_mul(4).ok_or(())?;
+                if offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > packet.len())
+                {
+                    return Err(());
+                }
+                previous_next_header = offset;
+                next_header = header[0];
+                offset += length;
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
 fn tcp_syn_tuple(packet: &[u8]) -> Option<PacketTcpTuple> {
     let (source, destination, payload) = match packet.first().map(|byte| byte >> 4)? {
         4 => {
@@ -2347,6 +2637,201 @@ mod tests {
         assert_eq!(&output, b"ipv6");
     }
 
+    #[test]
+    fn packet_fragmented_udp_reassembles_ipv4_and_ipv6() {
+        let server = shared_bridge();
+        let mut client_device = BoundedDevice::new(1280, 262_144);
+        let mut client_interface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut client_device,
+            Instant::from_millis(0),
+        );
+        client_interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
+                .unwrap();
+        });
+        client_interface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(10, 0, 0, 1))
+            .unwrap();
+        let mut client_sockets = SocketSet::new(Vec::new());
+        let ipv4 = client_sockets.add(fixture_udp_socket());
+        client_sockets
+            .get_mut::<udp::Socket>(ipv4)
+            .bind(40_001)
+            .unwrap();
+        let ipv4_payload = vec![4; 3000];
+        let ipv6_payload = vec![6; crate::wire::MAX_UDP_PAYLOAD];
+        client_sockets
+            .get_mut::<udp::Socket>(ipv4)
+            .send_slice(
+                &ipv4_payload,
+                IpEndpoint::new(IpAddress::v4(203, 0, 113, 9), 53),
+            )
+            .unwrap();
+        for tick in 0..64 {
+            poll_fixture_client(
+                &mut client_interface,
+                &mut client_device,
+                &mut client_sockets,
+                tick,
+            );
+            move_egress_to_ingress(&mut client_device, &mut server.inner.borrow_mut().device);
+            server.poll();
+            if server.inner.borrow().pending_packet_udp.len() == 1 {
+                break;
+            }
+        }
+        let packet = fixture_ipv6_udp_packet(&ipv6_payload);
+        let fragments = fragment_ipv6_packet(&packet, 1232);
+        let mut reassembly = Ipv6Reassembly::new(4, 15_000);
+        let mut rebuilt = None;
+        for fragment in &fragments {
+            let outcome = reassembly.ingest(fragment, 0, 262_144);
+            if let ReassemblyOutcome::Packet(value) = outcome {
+                rebuilt = Some(value);
+            }
+        }
+        assert_eq!(rebuilt.as_deref(), Some(packet.as_slice()));
+        let mut packet_port = server.packet_port();
+        let mut context = Context::from_waker(Waker::noop());
+        for fragment in fragments {
+            assert!(matches!(
+                packet_port.poll_send_datagram(&mut context, &fragment),
+                Poll::Ready(Ok(()))
+            ));
+            server.poll();
+        }
+        let mut received = Vec::new();
+        while let Some((metadata, mut port)) = server.accept_packet_udp().unwrap() {
+            let mut context = Context::from_waker(Waker::noop());
+            let mut output = vec![0; crate::wire::MAX_UDP_PAYLOAD];
+            let Poll::Ready(Ok(DatagramRecv::Datagram(length))) =
+                port.poll_recv_datagram(&mut context, &mut output)
+            else {
+                panic!("fragmented datagram was not delivered");
+            };
+            output.truncate(length);
+            received.push((metadata.destination, output));
+        }
+        received.sort_by(|left, right| left.1[0].cmp(&right.1[0]));
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].1, ipv4_payload);
+        assert_eq!(received[1].1, ipv6_payload);
+    }
+
+    fn fixture_ipv6_udp_packet(payload: &[u8]) -> Vec<u8> {
+        let mut device = BoundedDevice::new(MAX_IPV6_PACKET_BYTES, 262_144);
+        let mut interface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            Instant::from_millis(0),
+        );
+        interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(
+                    IpAddress::v6(0x2001, 0xdb8, 1, 0, 0, 0, 0, 2),
+                    64,
+                ))
+                .unwrap();
+        });
+        interface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1))
+            .unwrap();
+        let mut sockets = SocketSet::new(Vec::new());
+        let handle = sockets.add(udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 4],
+                vec![0; crate::wire::MAX_UDP_PAYLOAD + 8],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 4],
+                vec![0; crate::wire::MAX_UDP_PAYLOAD + 8],
+            ),
+        ));
+        sockets.get_mut::<udp::Socket>(handle).bind(40_002).unwrap();
+        sockets
+            .get_mut::<udp::Socket>(handle)
+            .send_slice(
+                payload,
+                IpEndpoint::new(IpAddress::v6(0x2001, 0xdb8, 2, 0, 0, 0, 0, 9), 53),
+            )
+            .unwrap();
+        for tick in 0..8 {
+            poll_fixture_client(&mut interface, &mut device, &mut sockets, tick);
+            if let Some(packet) = device.egress.pop_front() {
+                return packet;
+            }
+        }
+        panic!("IPv6 fixture did not emit a UDP packet");
+    }
+
+    fn fragment_ipv6_packet(packet: &[u8], fragment_bytes: usize) -> Vec<Vec<u8>> {
+        assert_eq!(fragment_bytes % REASSEMBLY_BLOCK_BYTES, 0);
+        let ipv6 = Ipv6Packet::new_checked(packet).unwrap();
+        let next_header = packet[6];
+        let payload = ipv6.payload();
+        let mut fragments = Vec::new();
+        let mut offset = 0;
+        while offset < payload.len() {
+            let length = fragment_bytes.min(payload.len() - offset);
+            let more = offset + length < payload.len();
+            let mut fragment = vec![0; IPV6_HEADER_BYTES + IPV6_FRAGMENT_HEADER_BYTES + length];
+            fragment[..IPV6_HEADER_BYTES].copy_from_slice(&packet[..IPV6_HEADER_BYTES]);
+            fragment[4..6].copy_from_slice(
+                &u16::try_from(IPV6_FRAGMENT_HEADER_BYTES + length)
+                    .unwrap()
+                    .to_be_bytes(),
+            );
+            fragment[6] = 44;
+            fragment[40] = next_header;
+            let raw_offset = u16::try_from(offset / REASSEMBLY_BLOCK_BYTES).unwrap() << 3;
+            fragment[42..44].copy_from_slice(&(raw_offset | u16::from(more)).to_be_bytes());
+            fragment[44..48].copy_from_slice(&0x1020_3040_u32.to_be_bytes());
+            fragment[48..].copy_from_slice(&payload[offset..offset + length]);
+            fragments.push(fragment);
+            offset += length;
+        }
+        fragments
+    }
+
+    #[test]
+    fn ipv6_reassembly_rejects_overlap_and_bounds_slots() {
+        let packet = fixture_ipv6_udp_packet(&[7; 3000]);
+        let fragments = fragment_ipv6_packet(&packet, 1232);
+        let mut reassembly = Ipv6Reassembly::new(4, 10);
+        for identifier in 0..4_u32 {
+            let mut fragment = fragments[0].clone();
+            fragment[44..48].copy_from_slice(&identifier.to_be_bytes());
+            assert!(matches!(
+                reassembly.ingest(&fragment, 0, 262_144),
+                ReassemblyOutcome::Buffered
+            ));
+        }
+        let mut fifth = fragments[0].clone();
+        fifth[44..48].copy_from_slice(&4_u32.to_be_bytes());
+        assert!(matches!(
+            reassembly.ingest(&fifth, 9, 262_144),
+            ReassemblyOutcome::Dropped
+        ));
+        assert!(matches!(
+            reassembly.ingest(&fifth, 10, 262_144),
+            ReassemblyOutcome::Buffered
+        ));
+
+        let mut overlap = Ipv6Reassembly::new(4, 10);
+        assert!(matches!(
+            overlap.ingest(&fragments[0], 0, 262_144),
+            ReassemblyOutcome::Buffered
+        ));
+        assert!(matches!(
+            overlap.ingest(&fragments[0], 1, 262_144),
+            ReassemblyOutcome::Dropped
+        ));
+    }
+
     fn fixture_udp_socket() -> udp::Socket<'static> {
         udp::Socket::new(
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
@@ -2387,6 +2872,7 @@ mod tests {
     #[test]
     fn async_ports_exchange_and_release_the_same_flow() {
         let bridge = shared_bridge();
+        let baseline = bridge.managed_bytes();
         let (mut adapter, mut policy) = bridge.open_tcp(metadata()).unwrap();
         let allocated = bridge.managed_bytes();
         assert!(allocated > 0);
@@ -2408,12 +2894,13 @@ mod tests {
         drop(adapter);
         assert_eq!(bridge.managed_bytes(), allocated);
         drop(policy);
-        assert_eq!(bridge.managed_bytes(), 0);
+        assert_eq!(bridge.managed_bytes(), baseline);
     }
 
     #[test]
     fn async_udp_ports_preserve_atomic_datagrams_and_release_flow() {
         let bridge = shared_bridge();
+        let baseline = bridge.managed_bytes();
         let (mut adapter, mut policy) = bridge.open_udp(metadata()).unwrap();
         let allocated = bridge.managed_bytes();
         let mut context = Context::from_waker(Waker::noop());
@@ -2440,6 +2927,6 @@ mod tests {
         drop(adapter);
         assert_eq!(bridge.managed_bytes(), allocated);
         drop(policy);
-        assert_eq!(bridge.managed_bytes(), 0);
+        assert_eq!(bridge.managed_bytes(), baseline);
     }
 }

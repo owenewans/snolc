@@ -198,6 +198,11 @@ impl Config {
                 "UDP socket cannot hold a maximum datagram",
             ));
         }
+        if self.stack.packet_queue_bytes < crate::stack::MAX_IPV6_PACKET_BYTES {
+            return Err(ConfigError::Invalid(
+                "packet queue cannot hold a reassembled IPv6 packet",
+            ));
+        }
         if self.yamux.max_streams_per_session < 2 {
             return Err(ConfigError::Invalid(
                 "yamux needs one policy and one user stream",
@@ -465,6 +470,17 @@ mod tests {
         assert!(matches!(
             Config::parse(&invalid, Path::new("/etc/snolc")),
             Err(ConfigError::Invalid("reassembly slots must be 4"))
+        ));
+    }
+
+    #[test]
+    fn rejects_packet_queue_that_cannot_hold_ipv6_reassembly() {
+        let invalid = TEMPLATE.replace("packet_queue_bytes = 262144", "packet_queue_bytes = 65574");
+        assert!(matches!(
+            Config::parse(&invalid, Path::new("/etc/snolc")),
+            Err(ConfigError::Invalid(
+                "packet queue cannot hold a reassembled IPv6 packet"
+            ))
         ));
     }
 }
