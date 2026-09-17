@@ -6,6 +6,7 @@ members = [
   "crates/snolc",
   "crates/snolc-cli",
   "crates/snolpkg",
+  "clients/snolcNG",
   "modules/adapter-socks5",
   "modules/adapter-http-connect",
   "modules/adapter-direct",
@@ -29,6 +30,7 @@ repository = "https://github.com/owenewans/snolc"
 [workspace.dependencies]
 async-executor = "=1.14.0"
 async-io = "=2.6.0"
+base64 = "=0.22.1"
 crossbeam-queue = "=0.3.12"
 ctrlc = "=3.5.2"
 ed25519-dalek = "=3.0.0"
