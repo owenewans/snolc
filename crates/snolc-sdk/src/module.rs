@@ -4,6 +4,53 @@ use std::sync::{Mutex, OnceLock};
 
 use snolc_abi::{SnolBytes, SnolBytesMut};
 
+/// # Safety
+///
+/// `written`, when non-null, must be writable for one `usize`.
+pub unsafe extern "C" fn unsupported_adapter_accept(
+    _instance: u64,
+    _request: SnolBytesMut,
+    written: *mut usize,
+    _wake: snolc_abi::SnolWakeHandle,
+    _flow: *mut u64,
+) -> u32 {
+    if let Some(written) = unsafe { written.as_mut() } {
+        *written = 0;
+    }
+    snolc_abi::STATUS_UNSUPPORTED
+}
+
+/// # Safety
+///
+/// ABI arguments must follow the adapter contract.
+pub unsafe extern "C" fn unsupported_adapter_attach(
+    _instance: u64,
+    _flow: u64,
+    _stack_socket: u64,
+    _stack_socket_io: *const snolc_abi::SnolByteIoV1,
+) -> u32 {
+    snolc_abi::STATUS_UNSUPPORTED
+}
+
+/// # Safety
+///
+/// ABI arguments must follow the adapter contract.
+pub unsafe extern "C" fn unsupported_adapter_complete(
+    _instance: u64,
+    _flow: u64,
+    _status: u32,
+    _reason: SnolBytes,
+) -> u32 {
+    snolc_abi::STATUS_UNSUPPORTED
+}
+
+/// # Safety
+///
+/// ABI arguments must follow the adapter contract.
+pub unsafe extern "C" fn unsupported_adapter_close(_instance: u64, _flow: u64) -> u32 {
+    snolc_abi::STATUS_UNSUPPORTED
+}
+
 pub struct Instances {
     next: AtomicU64,
     active: OnceLock<Mutex<HashSet<u64>>>,

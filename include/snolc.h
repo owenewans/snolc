@@ -82,6 +82,15 @@ struct SnolAdapterApiV1 {
     uint32_t reserved;
     SnolStatus (*open)(SnolHandle instance, SnolBytes request,
                        SnolWakeHandle wake, SnolHandle *flow);
+    SnolStatus (*accept)(SnolHandle instance, SnolBytesMut request,
+                         size_t *written, SnolWakeHandle wake,
+                         SnolHandle *flow);
+    SnolStatus (*attach)(SnolHandle instance, SnolHandle flow,
+                         SnolHandle stack_socket,
+                         const SnolByteIoV1 *stack_socket_io);
+    SnolStatus (*complete)(SnolHandle instance, SnolHandle flow,
+                           uint32_t status, SnolBytes reason);
+    SnolStatus (*close_flow)(SnolHandle instance, SnolHandle flow);
 };
 
 struct SnolProtectionApiV1 {

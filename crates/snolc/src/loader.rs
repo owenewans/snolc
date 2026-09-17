@@ -545,6 +545,10 @@ fn validate_class_tables(descriptor: &SnolModuleDescriptor) -> Result<(), LoadEr
         if adapter.struct_size < size_of::<snolc_abi::SnolAdapterApiV1>() as u32
             || adapter.reserved != 0
             || adapter.open.is_none()
+            || adapter.accept.is_none()
+            || adapter.attach.is_none()
+            || adapter.complete.is_none()
+            || adapter.close_flow.is_none()
         {
             return Err(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER));
         }
@@ -924,6 +928,10 @@ mod tests {
         struct_size: size_of::<snolc_abi::SnolAdapterApiV1>() as u32,
         reserved: 0,
         open: Some(open),
+        accept: Some(snolc_sdk::module::unsupported_adapter_accept),
+        attach: Some(snolc_sdk::module::unsupported_adapter_attach),
+        complete: Some(snolc_sdk::module::unsupported_adapter_complete),
+        close_flow: Some(snolc_sdk::module::unsupported_adapter_close),
     };
 
     static CLOSED: AtomicBool = AtomicBool::new(false);

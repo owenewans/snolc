@@ -163,6 +163,10 @@ static ADAPTER: SnolAdapterApiV1 = SnolAdapterApiV1 {
     struct_size: size_of::<SnolAdapterApiV1>() as u32,
     reserved: 0,
     open: Some(open),
+    accept: Some(snolc_sdk::module::unsupported_adapter_accept),
+    attach: Some(snolc_sdk::module::unsupported_adapter_attach),
+    complete: Some(snolc_sdk::module::unsupported_adapter_complete),
+    close_flow: Some(snolc_sdk::module::unsupported_adapter_close),
 };
 
 snolc_sdk::declare_module! {

@@ -140,12 +140,28 @@ unsafe impl Sync for SnolDatagramIoV1 {}
 
 pub type AdapterOpenFn =
     unsafe extern "C" fn(SnolHandle, SnolBytes, SnolWakeHandle, *mut SnolHandle) -> SnolStatus;
+pub type AdapterAcceptFn = unsafe extern "C" fn(
+    SnolHandle,
+    SnolBytesMut,
+    *mut usize,
+    SnolWakeHandle,
+    *mut SnolHandle,
+) -> SnolStatus;
+pub type AdapterAttachFn =
+    unsafe extern "C" fn(SnolHandle, SnolHandle, SnolHandle, *const SnolByteIoV1) -> SnolStatus;
+pub type AdapterCompleteFn =
+    unsafe extern "C" fn(SnolHandle, SnolHandle, u32, SnolBytes) -> SnolStatus;
+pub type AdapterCloseFlowFn = unsafe extern "C" fn(SnolHandle, SnolHandle) -> SnolStatus;
 
 #[repr(C)]
 pub struct SnolAdapterApiV1 {
     pub struct_size: u32,
     pub reserved: u32,
     pub open: Option<AdapterOpenFn>,
+    pub accept: Option<AdapterAcceptFn>,
+    pub attach: Option<AdapterAttachFn>,
+    pub complete: Option<AdapterCompleteFn>,
+    pub close_flow: Option<AdapterCloseFlowFn>,
 }
 
 unsafe impl Sync for SnolAdapterApiV1 {}
