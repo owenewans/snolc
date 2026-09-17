@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,188 @@ pub struct GeneratedFile {
     pub path: PathBuf,
     pub contents: Vec<u8>,
     pub secret: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Screen {
+    Profiles,
+    Connection,
+    Advanced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Denied(String),
+    Stopped(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerStatus {
+    pub used_bytes: u64,
+    pub limit_bytes: Option<u64>,
+    pub upload_bytes_per_second: Option<u64>,
+    pub download_bytes_per_second: Option<u64>,
+    pub expires_at: Option<String>,
+    pub revision: u64,
+    pub reason: Option<String>,
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedProfile {
+    pub source: String,
+    pub profile: Profile,
+    pub pending_packages: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+pub struct AppState {
+    pub screen: Screen,
+    pub profiles: Vec<ImportedProfile>,
+    pub selected: Option<usize>,
+    pub connection: ConnectionState,
+    pub status: Option<ServerStatus>,
+    repaint_requested: bool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            screen: Screen::Profiles,
+            profiles: Vec::new(),
+            selected: None,
+            connection: ConnectionState::Disconnected,
+            status: None,
+            repaint_requested: true,
+        }
+    }
+}
+
+impl AppState {
+    pub fn import_profile(
+        &mut self,
+        uri: &str,
+        source: String,
+        trusted_packages: &BTreeSet<String>,
+    ) -> Result<usize, ProfileError> {
+        let profile = Profile::from_uri(uri)?;
+        if self
+            .profiles
+            .iter()
+            .any(|existing| existing.profile.server_id == profile.server_id)
+        {
+            return Err(ProfileError::DuplicateServer);
+        }
+        let pending_packages = profile
+            .modules
+            .iter()
+            .filter(|module| !trusted_packages.contains(&module.package))
+            .map(|module| module.package.clone())
+            .collect();
+        self.profiles.push(ImportedProfile {
+            source,
+            profile,
+            pending_packages,
+        });
+        let index = self.profiles.len() - 1;
+        self.selected = Some(index);
+        self.repaint_requested = true;
+        Ok(index)
+    }
+
+    pub fn approve_package(&mut self, package: &str) -> Result<(), ProfileError> {
+        let profile = self.selected_profile_mut()?;
+        if !profile.pending_packages.remove(package) {
+            return Err(ProfileError::PackageApproval);
+        }
+        self.repaint_requested = true;
+        Ok(())
+    }
+
+    pub fn select(&mut self, index: usize) -> Result<(), ProfileError> {
+        if index >= self.profiles.len() {
+            return Err(ProfileError::Selection);
+        }
+        self.selected = Some(index);
+        self.status = None;
+        self.connection = ConnectionState::Disconnected;
+        self.repaint_requested = true;
+        Ok(())
+    }
+
+    pub fn begin_connect(&mut self) -> Result<(), ProfileError> {
+        if !self.selected_profile()?.pending_packages.is_empty() {
+            return Err(ProfileError::PackageApproval);
+        }
+        self.connection = ConnectionState::Connecting;
+        self.screen = Screen::Connection;
+        self.repaint_requested = true;
+        Ok(())
+    }
+
+    pub fn connected(&mut self) {
+        self.connection = ConnectionState::Connected;
+        self.repaint_requested = true;
+    }
+
+    pub fn denied(&mut self, reason: String) {
+        self.connection = ConnectionState::Denied(reason);
+        self.repaint_requested = true;
+    }
+
+    pub fn stopped(&mut self, reason: String) {
+        self.connection = ConnectionState::Stopped(reason);
+        if let Some(status) = &mut self.status {
+            status.stale = true;
+        }
+        self.repaint_requested = true;
+    }
+
+    pub fn apply_status(&mut self, mut status: ServerStatus) {
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|current| current.revision > status.revision)
+        {
+            return;
+        }
+        status.stale = false;
+        self.status = Some(status);
+        self.repaint_requested = true;
+    }
+
+    pub fn mark_stale(&mut self) {
+        if let Some(status) = &mut self.status {
+            status.stale = true;
+            self.repaint_requested = true;
+        }
+    }
+
+    pub fn set_screen(&mut self, screen: Screen) {
+        if self.screen != screen {
+            self.screen = screen;
+            self.repaint_requested = true;
+        }
+    }
+
+    pub fn take_repaint_request(&mut self) -> bool {
+        std::mem::take(&mut self.repaint_requested)
+    }
+
+    pub fn selected_profile(&self) -> Result<&ImportedProfile, ProfileError> {
+        self.selected
+            .and_then(|index| self.profiles.get(index))
+            .ok_or(ProfileError::Selection)
+    }
+
+    fn selected_profile_mut(&mut self) -> Result<&mut ImportedProfile, ProfileError> {
+        self.selected
+            .and_then(|index| self.profiles.get_mut(index))
+            .ok_or(ProfileError::Selection)
+    }
 }
 
 impl Profile {
@@ -500,6 +683,12 @@ pub enum ProfileError {
     Path,
     #[error("generated configuration is invalid: {0}")]
     Generated(String),
+    #[error("server_id is already imported")]
+    DuplicateServer,
+    #[error("profile selection is invalid")]
+    Selection,
+    #[error("native package requires approval")]
+    PackageApproval,
 }
 
 #[cfg(test)]
@@ -596,5 +785,54 @@ mod tests {
                 && file.secret
                 && String::from_utf8_lossy(&file.contents).contains(profile.credential.expose())
         }));
+    }
+
+    #[test]
+    fn app_state_requires_package_approval_and_marks_disconnected_status_stale() {
+        let profile = profile();
+        let uri = profile.to_uri().unwrap();
+        let mut app = AppState::default();
+        let trusted = BTreeSet::from([
+            "owenewans/tun@0.0.1".into(),
+            "owenewans/noise@0.0.1".into(),
+            "owenewans/tcp@0.0.1".into(),
+        ]);
+        app.import_profile(&uri, "clipboard".into(), &trusted)
+            .unwrap();
+        assert!(matches!(
+            app.begin_connect(),
+            Err(ProfileError::PackageApproval)
+        ));
+        app.approve_package("owenewans/policy@0.0.1").unwrap();
+        app.begin_connect().unwrap();
+        app.connected();
+        app.apply_status(ServerStatus {
+            used_bytes: 12,
+            limit_bytes: Some(100),
+            upload_bytes_per_second: Some(10),
+            download_bytes_per_second: Some(20),
+            expires_at: None,
+            revision: 2,
+            reason: None,
+            stale: true,
+        });
+        app.apply_status(ServerStatus {
+            used_bytes: 1,
+            limit_bytes: Some(100),
+            upload_bytes_per_second: None,
+            download_bytes_per_second: None,
+            expires_at: None,
+            revision: 1,
+            reason: None,
+            stale: false,
+        });
+        assert_eq!(app.status.as_ref().unwrap().used_bytes, 12);
+        app.stopped("revoked".into());
+        assert!(app.status.as_ref().unwrap().stale);
+        assert!(
+            matches!(app.connection, ConnectionState::Stopped(ref reason) if reason == "revoked")
+        );
+        assert!(app.take_repaint_request());
+        assert!(!app.take_repaint_request());
     }
 }
