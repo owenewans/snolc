@@ -19,7 +19,7 @@ pub use storage::{StorageError, StorageWorker};
 
 use admin::{decode_user_record, encode_user_record};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -76,6 +76,7 @@ struct PolicySession {
     auth: AuthState,
     subscribed: bool,
     last_status: Instant,
+    pending_flows: VecDeque<String>,
 }
 
 enum AuthState {
@@ -140,6 +141,7 @@ struct PreparedAdmin {
 }
 
 struct PolicyFlow<S, M> {
+    user_id: Option<String>,
     stack: S,
     mux: M,
     upload: Pump,
@@ -147,8 +149,14 @@ struct PolicyFlow<S, M> {
 }
 
 impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
-    fn new(stack: S, mux: M, buffer_bytes: usize) -> Result<Self, PumpError> {
+    fn new(
+        stack: S,
+        mux: M,
+        buffer_bytes: usize,
+        user_id: Option<String>,
+    ) -> Result<Self, PumpError> {
         Ok(Self {
+            user_id,
             stack,
             mux,
             upload: Pump::new(buffer_bytes)?,
@@ -320,6 +328,7 @@ unsafe extern "C" fn attach_session(
                     auth: AuthState::Waiting,
                     subscribed: false,
                     last_status: Instant::now(),
+                    pending_flows: VecDeque::new(),
                 },
             );
             *output = handle;
@@ -342,15 +351,29 @@ unsafe extern "C" fn admit_flow(
             return status;
         }
         STATES.with(|states| {
-            let states = states.borrow();
-            let Some(state) = states.get(&instance) else {
+            let mut states = states.borrow_mut();
+            let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
-            match state.sessions.get(&session).map(|session| &session.auth) {
-                Some(AuthState::Authenticated(_)) => abi::STATUS_OK,
-                Some(_) => abi::STATUS_PENDING,
-                None => abi::STATUS_INVALID,
+            let user_id = match state.sessions.get(&session).map(|session| &session.auth) {
+                Some(AuthState::Authenticated(user_id)) => user_id.clone(),
+                Some(_) => return abi::STATUS_PENDING,
+                None => return abi::STATUS_INVALID,
+            };
+            if user_id == "remote" {
+                return abi::STATUS_OK;
             }
+            let Some(user) = state.admin.users.get(&user_id) else {
+                return abi::STATUS_DENIED;
+            };
+            if !user_available(user) || flow_limit_reached(state, user) {
+                return abi::STATUS_DENIED;
+            }
+            let Some(session) = state.sessions.get_mut(&session) else {
+                return abi::STATUS_INVALID;
+            };
+            session.pending_flows.push_back(user_id);
+            abi::STATUS_OK
         })
     })
 }
@@ -378,9 +401,16 @@ unsafe extern "C" fn attach_flow(
             let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
-            if !state.sessions.contains_key(&session) {
-                return abi::STATUS_INVALID;
-            }
+            let user_id = match state.sessions.get_mut(&session) {
+                Some(session) if matches!(session.role, PolicyRole::Server) => {
+                    match session.pending_flows.pop_front() {
+                        Some(user_id) => Some(user_id),
+                        None => return abi::STATUS_DENIED,
+                    }
+                }
+                Some(_) => None,
+                None => return abi::STATUS_INVALID,
+            };
             let stack = match unsafe { ForeignByteIo::from_raw(stack_socket, stack_socket_io) } {
                 Ok(stack) => stack,
                 Err(_) => return abi::STATUS_INVALID,
@@ -389,7 +419,7 @@ unsafe extern "C" fn attach_flow(
                 Ok(mux) => mux,
                 Err(_) => return abi::STATUS_INVALID,
             };
-            let flow = match PolicyFlow::new(stack, mux, state.options.sniff_bytes) {
+            let flow = match PolicyFlow::new(stack, mux, state.options.sniff_bytes, user_id) {
                 Ok(flow) => flow,
                 Err(_) => return abi::STATUS_RESOURCE,
             };
@@ -623,6 +653,29 @@ fn session_limit_reached(state: &State, user: &UserRecord) -> bool {
         .filter(|session| matches!(&session.auth, AuthState::Authenticated(id) if id == &user.id))
         .count();
     active >= count as usize
+}
+
+fn flow_limit_reached(state: &State, user: &UserRecord) -> bool {
+    let CountLimit::Limited { count } = user.spec.max_flows else {
+        return false;
+    };
+    let active = state
+        .flows
+        .values()
+        .filter(|flow| flow.user_id.as_deref() == Some(user.id.as_str()))
+        .count();
+    let pending = state
+        .sessions
+        .values()
+        .map(|session| {
+            session
+                .pending_flows
+                .iter()
+                .filter(|id| id.as_str() == user.id)
+                .count()
+        })
+        .sum::<usize>();
+    active.saturating_add(pending) >= count as usize
 }
 
 fn status_message(state: &State, user_id: &str, status: &'static str) -> Result<String, u32> {
@@ -1082,6 +1135,14 @@ fn put_user(
 }
 
 fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
+    let stopped_users: HashSet<String> = mutation
+        .users
+        .iter()
+        .filter_map(|(id, user)| match user {
+            Some(user) if user_available(user) => None,
+            _ => Some(id.clone()),
+        })
+        .collect();
     for (id, user) in mutation.users {
         match user {
             Some(user) => {
@@ -1118,6 +1179,17 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
     }
     if let Some(session) = mutation.disconnect {
         state.sessions.remove(&session);
+    }
+    if !stopped_users.is_empty() {
+        state.flows.retain(|_, flow| {
+            !flow
+                .user_id
+                .as_ref()
+                .is_some_and(|id| stopped_users.contains(id))
+        });
+        state.sessions.retain(|_, session| {
+            !matches!(&session.auth, AuthState::Authenticated(id) if stopped_users.contains(id))
+        });
     }
 }
 
@@ -1285,7 +1357,7 @@ mod module_tests {
             input: b"download".iter().copied().collect(),
             ..MemoryIo::default()
         };
-        let mut flow = PolicyFlow::new(stack, mux, 16).unwrap();
+        let mut flow = PolicyFlow::new(stack, mux, 16, None).unwrap();
         let mut context = Context::from_waker(Waker::noop());
         while !flow.upload.is_finished() || !flow.download.is_finished() {
             let _ = flow.poll(&mut context, 16);
