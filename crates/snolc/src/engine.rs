@@ -17,12 +17,14 @@ use thiserror::Error;
 use crate::config::{
     Config, ControlConfig, LogLevel, LogSource, LoggingConfig, Role, YamuxConfig, parse_size,
 };
-use crate::core_io::{RegisteredIo, is_registered};
+use crate::core_io::{MuxDatagramIo, RegisteredDatagramIo, RegisteredIo, is_registered};
 use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::logging::{FileLogger, LogError};
 use crate::mux::{MuxError, MuxSession};
-use crate::stack::{FlowMetadata, SharedStackBridge, StackError, TcpStreamPort};
+use crate::stack::{
+    FlowMetadata, SharedStackBridge, StackError, TcpStreamPort, UdpDatagramPort,
+};
 use crate::wire::{Destination, OpenRequest, OpenResponse, OpenStatus, StreamKind};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
@@ -146,7 +148,7 @@ struct PendingServerFlow {
     admitted: bool,
     adapter_cursor: usize,
     adapter_flow: Option<(usize, u64)>,
-    ports: Option<(TcpStreamPort, TcpStreamPort)>,
+    ports: Option<PendingPorts>,
     response_sent: bool,
     accepted: bool,
 }
@@ -163,7 +165,17 @@ struct PendingClientFlow {
     adapter: usize,
     adapter_flow: u64,
     admitted: bool,
-    policy_port: Option<TcpStreamPort>,
+    policy_port: Option<ClientPolicyPort>,
+}
+
+enum PendingPorts {
+    Tcp(TcpStreamPort, TcpStreamPort),
+    Udp(UdpDatagramPort, UdpDatagramPort),
+}
+
+enum ClientPolicyPort {
+    Tcp(TcpStreamPort),
+    Udp(UdpDatagramPort),
 }
 
 struct OwnedFlowMetadata {
@@ -1018,21 +1030,52 @@ impl EstablishedSession {
                     Ok((response, stream)) if response.status == OpenStatus::Ok => {
                         let policy_port =
                             pending.policy_port.take().ok_or(SessionFlowError::State)?;
-                        let policy_io = RegisteredIo::register(policy_port, binding.core_io_limit)?;
-                        let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
-                        let (policy_handle, policy_table) = policy_io.raw_parts();
-                        let (mux_handle, mux_table) = mux_io.raw_parts();
-                        unsafe {
-                            modules[binding.policy].policy_attach_flow(
-                                self.policy_session,
-                                policy_handle,
-                                policy_table,
-                                mux_handle,
-                                mux_table,
-                            )?;
-                        }
-                        policy_io.transfer();
-                        mux_io.transfer();
+                        let mux_handle = match policy_port {
+                            ClientPolicyPort::Tcp(policy_port) => {
+                                let policy_io =
+                                    RegisteredIo::register(policy_port, binding.core_io_limit)?;
+                                let mux_io =
+                                    RegisteredIo::register(stream, binding.core_io_limit)?;
+                                let (policy_handle, policy_table) = policy_io.raw_parts();
+                                let (mux_handle, mux_table) = mux_io.raw_parts();
+                                unsafe {
+                                    modules[binding.policy].policy_attach_flow(
+                                        self.policy_session,
+                                        policy_handle,
+                                        policy_table,
+                                        mux_handle,
+                                        mux_table,
+                                    )?;
+                                }
+                                policy_io.transfer();
+                                mux_io.transfer();
+                                mux_handle
+                            }
+                            ClientPolicyPort::Udp(policy_port) => {
+                                let policy_io = RegisteredDatagramIo::register(
+                                    policy_port,
+                                    binding.core_io_limit,
+                                )?;
+                                let mux_io = RegisteredDatagramIo::register(
+                                    MuxDatagramIo::new(stream),
+                                    binding.core_io_limit,
+                                )?;
+                                let (policy_handle, policy_table) = policy_io.raw_parts();
+                                let (mux_handle, mux_table) = mux_io.raw_parts();
+                                unsafe {
+                                    modules[binding.policy].policy_attach_datagram_flow(
+                                        self.policy_session,
+                                        policy_handle,
+                                        policy_table,
+                                        mux_handle,
+                                        mux_table,
+                                    )?;
+                                }
+                                policy_io.transfer();
+                                mux_io.transfer();
+                                mux_handle
+                            }
+                        };
                         modules[pending.adapter].adapter_complete_flow(
                             pending.adapter_flow,
                             snolc_abi::STATUS_OK,
@@ -1115,31 +1158,44 @@ impl EstablishedSession {
             }
         }
         if pending.policy_port.is_none() {
-            if pending.request.kind != StreamKind::Tcp {
-                modules[pending.adapter].adapter_complete_flow(
-                    pending.adapter_flow,
-                    snolc_abi::STATUS_UNSUPPORTED,
-                    b"UDP adapter path is unavailable",
-                )?;
-                self.client_pending = None;
-                return Ok(());
-            }
-            let (adapter_port, policy_port) = stack.open_tcp(FlowMetadata {
+            let metadata = FlowMetadata {
                 destination: pending.request.destination.clone(),
                 port: pending.request.port,
                 opaque: pending.request.metadata.clone(),
-            })?;
-            let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
-            let (adapter_handle, adapter_table) = adapter_io.raw_parts();
-            unsafe {
-                modules[pending.adapter].adapter_attach_flow(
-                    pending.adapter_flow,
-                    adapter_handle,
-                    adapter_table,
-                )?;
-            }
-            adapter_io.transfer();
-            pending.policy_port = Some(policy_port);
+            };
+            pending.policy_port = Some(match pending.request.kind {
+                StreamKind::Tcp => {
+                    let (adapter_port, policy_port) = stack.open_tcp(metadata)?;
+                    let adapter_io =
+                        RegisteredIo::register(adapter_port, binding.core_io_limit)?;
+                    let (adapter_handle, adapter_table) = adapter_io.raw_parts();
+                    unsafe {
+                        modules[pending.adapter].adapter_attach_flow(
+                            pending.adapter_flow,
+                            adapter_handle,
+                            adapter_table,
+                        )?;
+                    }
+                    adapter_io.transfer();
+                    ClientPolicyPort::Tcp(policy_port)
+                }
+                StreamKind::Udp => {
+                    let (adapter_port, policy_port) = stack.open_udp(metadata)?;
+                    let adapter_io =
+                        RegisteredDatagramIo::register(adapter_port, binding.core_io_limit)?;
+                    let (adapter_handle, adapter_table) = adapter_io.raw_parts();
+                    unsafe {
+                        modules[pending.adapter].adapter_attach_datagram(
+                            pending.adapter_flow,
+                            adapter_handle,
+                            adapter_table,
+                        )?;
+                    }
+                    adapter_io.transfer();
+                    ClientPolicyPort::Udp(policy_port)
+                }
+                StreamKind::Policy => return Err(SessionFlowError::State),
+            });
         }
         let request = pending.request.clone();
         let mut mux = self.mux.take().ok_or(SessionFlowError::State)?;
@@ -1180,17 +1236,21 @@ impl EstablishedSession {
         match modules[adapter].adapter_open(pending.operation, &metadata, context) {
             Poll::Ready(Ok(flow)) => {
                 pending.adapter_flow = Some((adapter, flow));
-                if pending.request.kind != StreamKind::Tcp {
-                    return self.start_response(
-                        OpenStatus::Unsupported,
-                        "UDP adapter path is unavailable",
-                    );
-                }
-                match stack.open_tcp(FlowMetadata {
+                let metadata = FlowMetadata {
                     destination: pending.request.destination.clone(),
                     port: pending.request.port,
                     opaque: pending.request.metadata.clone(),
-                }) {
+                };
+                let ports = match pending.request.kind {
+                    StreamKind::Tcp => stack
+                        .open_tcp(metadata)
+                        .map(|(adapter, policy)| PendingPorts::Tcp(adapter, policy)),
+                    StreamKind::Udp => stack
+                        .open_udp(metadata)
+                        .map(|(adapter, policy)| PendingPorts::Udp(adapter, policy)),
+                    StreamKind::Policy => Err(StackError::Metadata),
+                };
+                match ports {
                     Ok(ports) => pending.ports = Some(ports),
                     Err(_) => {
                         return self.start_response(
@@ -1242,35 +1302,67 @@ impl EstablishedSession {
     ) -> Result<(), SessionFlowError> {
         let mut pending = self.pending.take().ok_or(SessionFlowError::State)?;
         let (adapter, adapter_flow) = pending.adapter_flow.ok_or(SessionFlowError::State)?;
-        let (adapter_port, policy_port) = pending.ports.take().ok_or(SessionFlowError::State)?;
+        let ports = pending.ports.take().ok_or(SessionFlowError::State)?;
         let stream = pending.stream.take().ok_or(SessionFlowError::State)?;
-        let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
-        let policy_io = RegisteredIo::register(policy_port, binding.core_io_limit)?;
-        let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
-        let (adapter_handle, adapter_table) = adapter_io.raw_parts();
-        let (policy_handle, policy_table) = policy_io.raw_parts();
-        let (mux_handle, mux_table) = mux_io.raw_parts();
-        if let Err(error) = unsafe {
-            modules[adapter].adapter_attach_flow(adapter_flow, adapter_handle, adapter_table)
-        } {
-            let _ = modules[adapter].adapter_close_flow(adapter_flow);
-            return Err(error.into());
-        }
-        adapter_io.transfer();
-        if let Err(error) = unsafe {
-            modules[binding.policy].policy_attach_flow(
-                self.policy_session,
-                policy_handle,
-                policy_table,
-                mux_handle,
-                mux_table,
-            )
-        } {
-            let _ = modules[adapter].adapter_close_flow(adapter_flow);
-            return Err(error.into());
-        }
-        policy_io.transfer();
-        mux_io.transfer();
+        let mux_handle = match ports {
+            PendingPorts::Tcp(adapter_port, policy_port) => {
+                let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
+                let policy_io = RegisteredIo::register(policy_port, binding.core_io_limit)?;
+                let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+                let (adapter_handle, adapter_table) = adapter_io.raw_parts();
+                let (policy_handle, policy_table) = policy_io.raw_parts();
+                let (mux_handle, mux_table) = mux_io.raw_parts();
+                unsafe {
+                    modules[adapter].adapter_attach_flow(
+                        adapter_flow,
+                        adapter_handle,
+                        adapter_table,
+                    )?;
+                    modules[binding.policy].policy_attach_flow(
+                        self.policy_session,
+                        policy_handle,
+                        policy_table,
+                        mux_handle,
+                        mux_table,
+                    )?;
+                }
+                adapter_io.transfer();
+                policy_io.transfer();
+                mux_io.transfer();
+                mux_handle
+            }
+            PendingPorts::Udp(adapter_port, policy_port) => {
+                let adapter_io =
+                    RegisteredDatagramIo::register(adapter_port, binding.core_io_limit)?;
+                let policy_io =
+                    RegisteredDatagramIo::register(policy_port, binding.core_io_limit)?;
+                let mux_io = RegisteredDatagramIo::register(
+                    MuxDatagramIo::new(stream),
+                    binding.core_io_limit,
+                )?;
+                let (adapter_handle, adapter_table) = adapter_io.raw_parts();
+                let (policy_handle, policy_table) = policy_io.raw_parts();
+                let (mux_handle, mux_table) = mux_io.raw_parts();
+                unsafe {
+                    modules[adapter].adapter_attach_datagram(
+                        adapter_flow,
+                        adapter_handle,
+                        adapter_table,
+                    )?;
+                    modules[binding.policy].policy_attach_datagram_flow(
+                        self.policy_session,
+                        policy_handle,
+                        policy_table,
+                        mux_handle,
+                        mux_table,
+                    )?;
+                }
+                adapter_io.transfer();
+                policy_io.transfer();
+                mux_io.transfer();
+                mux_handle
+            }
+        };
         modules[adapter].adapter_complete_flow(adapter_flow, snolc_abi::STATUS_OK, &[])?;
         self.active.push(ActiveServerFlow {
             adapter,

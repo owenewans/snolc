@@ -11,8 +11,8 @@ use std::task::{Context, Poll, Waker};
 use futures::io::{AsyncRead, AsyncWrite};
 use libloading::{Library, Symbol};
 use snolc_abi::{
-    ModuleEntry, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolFlowMetadataV1, SnolHostApiV1,
-    SnolIoResult, SnolModuleDescriptor, SnolWakeHandle,
+    ModuleEntry, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolDatagramIoV1, SnolFlowMetadataV1,
+    SnolHostApiV1, SnolIoResult, SnolModuleDescriptor, SnolWakeHandle,
 };
 use thiserror::Error;
 
@@ -367,6 +367,29 @@ impl LoadedModule {
         }
     }
 
+    /// # Safety
+    ///
+    /// The stack handle and I/O table must remain valid until the adapter closes them.
+    pub unsafe fn adapter_attach_datagram(
+        &self,
+        flow: u64,
+        stack_handle: u64,
+        stack_io: *const SnolDatagramIoV1,
+    ) -> Result<(), LoadError> {
+        let instance = self.instance.ok_or(LoadError::NotCreated)?;
+        let adapter = unsafe { self.descriptor().adapter.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))?;
+        let attach = adapter
+            .attach_datagram
+            .ok_or(LoadError::MissingFunction)?;
+        let status = unsafe { attach(instance, flow, stack_handle, stack_io) };
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(LoadError::ModuleStatus(status))
+        }
+    }
+
     pub fn adapter_complete_flow(
         &self,
         flow: u64,
@@ -531,6 +554,40 @@ impl LoadedModule {
         let policy = unsafe { self.descriptor().policy.as_ref() }
             .ok_or(LoadError::ClassTable(snolc_abi::CLASS_POLICY))?;
         let attach = policy.attach_flow.ok_or(LoadError::MissingFunction)?;
+        let status = unsafe {
+            attach(
+                instance,
+                policy_session,
+                stack_handle,
+                stack_io,
+                mux_handle,
+                mux_io,
+            )
+        };
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(LoadError::ModuleStatus(status))
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Both handles and I/O tables must remain valid until the policy closes them.
+    pub unsafe fn policy_attach_datagram_flow(
+        &self,
+        policy_session: u64,
+        stack_handle: u64,
+        stack_io: *const SnolDatagramIoV1,
+        mux_handle: u64,
+        mux_io: *const SnolDatagramIoV1,
+    ) -> Result<(), LoadError> {
+        let instance = self.instance.ok_or(LoadError::NotCreated)?;
+        let policy = unsafe { self.descriptor().policy.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_POLICY))?;
+        let attach = policy
+            .attach_datagram_flow
+            .ok_or(LoadError::MissingFunction)?;
         let status = unsafe {
             attach(
                 instance,
