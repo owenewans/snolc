@@ -729,7 +729,7 @@ unsafe extern "C" fn admit_flow(
             let Some(user) = state.admin.users.get(&user_id) else {
                 return abi::STATUS_DENIED;
             };
-            if !user_available_at(user, current_utc()) || flow_limit_reached(state, user) {
+            if !flow_available_at(state, user, current_utc()) || flow_limit_reached(state, user) {
                 return abi::STATUS_DENIED;
             }
             let sniff = match destination_policy(state, user, &metadata) {
@@ -897,7 +897,7 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
             .admin
             .users
             .iter()
-            .filter(|(_, user)| !user_available_at(user, now_utc))
+            .filter(|(_, user)| !user_access_allowed_at(user, now_utc))
             .map(|(id, _)| id.clone())
             .collect();
         stopped_users.extend(advance_quota(state));
@@ -1746,6 +1746,14 @@ fn current_utc() -> u64 {
 }
 
 fn user_available_at(user: &UserRecord, now: u64) -> bool {
+    user_access_allowed_at(user, now)
+        && !matches!(
+            user.spec.quota,
+            ByteLimit::Limited { bytes } if user.durable_charged_bytes >= bytes
+        )
+}
+
+fn user_access_allowed_at(user: &UserRecord, now: u64) -> bool {
     if user.spec.status != UserStatus::Enabled {
         return false;
     }
@@ -1758,10 +1766,21 @@ fn user_available_at(user: &UserRecord, now: u64) -> bool {
     if !user.spec.weekly_access.allows(now) {
         return false;
     }
-    !matches!(
-        user.spec.quota,
-        ByteLimit::Limited { bytes } if user.durable_charged_bytes >= bytes
-    )
+    true
+}
+
+fn flow_available_at(state: &State, user: &UserRecord, now: u64) -> bool {
+    if !user_access_allowed_at(user, now) {
+        return false;
+    }
+    state
+        .traffic
+        .get(&user.id)
+        .is_some_and(|traffic| traffic.quota.credit_remaining() != 0)
+        || !matches!(
+            user.spec.quota,
+            ByteLimit::Limited { bytes } if user.durable_charged_bytes >= bytes
+        )
 }
 
 fn session_limit_reached(state: &State, user: &UserRecord) -> bool {
