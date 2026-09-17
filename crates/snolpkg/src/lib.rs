@@ -93,6 +93,8 @@ pub struct PublicationManifest {
     pub wire_version: u32,
     pub classes: Vec<String>,
     pub family: String,
+    pub roles: Vec<String>,
+    pub platforms: Vec<PlatformCapability>,
     pub entry: PathBuf,
     pub dependencies: Vec<Dependency>,
     pub source: SourceRevision,
@@ -119,6 +121,14 @@ pub struct SourceRevision {
 #[serde(deny_unknown_fields)]
 pub struct BuildRecipe {
     pub package: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformCapability {
+    pub target: String,
+    pub roles: Vec<String>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,7 +202,11 @@ impl PublicationManifest {
         }
         validate_package_name(&self.name)?;
         validate_relative_path(&self.entry)?;
-        if self.classes.is_empty() || self.artifacts.is_empty() {
+        if self.classes.is_empty()
+            || self.roles.is_empty()
+            || self.platforms.is_empty()
+            || self.artifacts.is_empty()
+        {
             return Err(PackageError::ManifestValue);
         }
         let mut classes = BTreeSet::new();
@@ -203,6 +217,37 @@ impl PublicationManifest {
             ) || !classes.insert(class)
             {
                 return Err(PackageError::ManifestValue);
+            }
+        }
+        let mut roles = BTreeSet::new();
+        for role in &self.roles {
+            validate_module_name(role)?;
+            if !roles.insert(role) {
+                return Err(PackageError::ManifestValue);
+            }
+        }
+        let mut platform_targets = BTreeSet::new();
+        for platform in &self.platforms {
+            if platform.target.is_empty()
+                || platform.roles.is_empty()
+                || platform.capabilities.is_empty()
+                || !platform_targets.insert(&platform.target)
+            {
+                return Err(PackageError::ManifestValue);
+            }
+            let mut platform_roles = BTreeSet::new();
+            for role in &platform.roles {
+                validate_module_name(role)?;
+                if !roles.contains(role) || !platform_roles.insert(role) {
+                    return Err(PackageError::ManifestValue);
+                }
+            }
+            let mut capabilities = BTreeSet::new();
+            for capability in &platform.capabilities {
+                validate_module_name(capability)?;
+                if !capabilities.insert(capability) {
+                    return Err(PackageError::ManifestValue);
+                }
             }
         }
         let mut dependencies = BTreeSet::new();
@@ -225,9 +270,15 @@ impl PublicationManifest {
             {
                 return Err(PackageError::ManifestValue);
             }
+            if !platform_targets.contains(&artifact.target) {
+                return Err(PackageError::ManifestValue);
+            }
             if artifact.target.contains("android") != artifact.minimum_android_api.is_some() {
                 return Err(PackageError::ManifestValue);
             }
+        }
+        if targets != platform_targets {
+            return Err(PackageError::ManifestValue);
         }
         Ok(())
     }
@@ -1238,6 +1289,7 @@ package_version = "0.0.1"
 wire_version = 1
 classes = ["carrier"]
 family = "tcp"
+roles = ["client", "server"]
 entry = "lib/libsnolc_carrier_tcp.so"
 toolchain = "1.98.1"
 dependencies = []
@@ -1247,6 +1299,11 @@ revision = "0123456789abcdef0123456789abcdef01234567"
 
 [build]
 package = "snolc-carrier-tcp"
+
+[[platforms]]
+target = "x86_64-unknown-linux-gnu"
+roles = ["client", "server"]
+capabilities = ["connect", "listen"]
 
 [[artifacts]]
 target = "x86_64-unknown-linux-gnu"
@@ -1578,6 +1635,7 @@ package_version = "0.0.1"
 wire_version = 1
 classes = ["carrier"]
 family = "test"
+roles = ["client", "server"]
 entry = "lib/module.so"
 toolchain = "1.98.1"
 dependencies = []
@@ -1588,13 +1646,18 @@ revision = "0123456789abcdef0123456789abcdef01234567"
 [build]
 package = "snolc-test"
 
+[[platforms]]
+target = "{0}"
+roles = ["client", "server"]
+capabilities = ["connect", "listen"]
+
 [[artifacts]]
-target = "{}"
+target = "{0}"
 minimum_isa = "test"
 minimum_libc = "2.28"
-url = "file://{}"
-byte_size = {}
-sha256 = "{}"
+url = "file://{1}"
+byte_size = {2}
+sha256 = "{3}"
 build_output = "release/libtest.so"
 "#,
             env!("SNOLPKG_TARGET"),
@@ -1814,6 +1877,7 @@ package_version = "0.0.1"
 wire_version = 1
 classes = ["carrier"]
 family = "test"
+roles = ["client", "server"]
 entry = "lib/module.so"
 toolchain = "1.98.1"
 dependencies = []
@@ -1824,8 +1888,13 @@ revision = "{}"
 [build]
 package = "source-test"
 
+[[platforms]]
+target = "{1}"
+roles = ["client", "server"]
+capabilities = ["connect", "listen"]
+
 [[artifacts]]
-target = "{}"
+target = "{1}"
 minimum_isa = "test"
 minimum_libc = "2.28"
 url = "file:///missing-source-artifact"
