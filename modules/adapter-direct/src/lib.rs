@@ -3,7 +3,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::task::{Context, Poll, Waker};
@@ -11,8 +13,14 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::Deserialize;
-use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolByteIoV1, SnolBytes, SnolWakeHandle};
-use snolc_sdk::{ByteIo, ForeignByteIo, Pump};
+use snolc_sdk::abi::{
+    self, SnolAdapterApiV1, SnolByteIoV1, SnolBytes, SnolDatagramIoV1, SnolWakeHandle,
+};
+use snolc_sdk::{
+    ByteIo, DatagramIo, DatagramPump, DatagramRecv, ForeignByteIo, ForeignDatagramIo, Pump,
+};
+
+const MAX_UDP_PAYLOAD: usize = 65_507;
 
 pub trait SocketProtector: Send + Sync {
     fn protect(&self, socket: &TcpStream) -> io::Result<()>;
@@ -201,11 +209,12 @@ enum Destination {
 }
 
 struct ConnectRequest {
+    kind: u32,
     destination: Destination,
     dns_mode: DnsMode,
     resolve_timeout: Duration,
     connect_timeout: Duration,
-    response: SyncSender<Result<TcpStream, DirectError>>,
+    response: SyncSender<Result<Endpoint, DirectError>>,
     wake: WorkerWake,
 }
 
@@ -222,7 +231,7 @@ impl WorkerWake {
 }
 
 struct PendingOpen {
-    response: Receiver<Result<TcpStream, DirectError>>,
+    response: Receiver<Result<Endpoint, DirectError>>,
     retained_wake: Option<SnolWakeHandle>,
 }
 
@@ -241,8 +250,14 @@ struct State {
     sender: Option<SyncSender<ConnectRequest>>,
     worker: Option<JoinHandle<()>>,
     pending: HashMap<u64, PendingOpen>,
-    ready: HashMap<u64, TcpStream>,
+    ready: HashMap<u64, Endpoint>,
     active: HashMap<u64, DirectFlow<ForeignByteIo>>,
+    active_datagrams: HashMap<u64, DirectDatagramFlow<ForeignDatagramIo>>,
+}
+
+enum Endpoint {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
 }
 
 impl Drop for State {
@@ -294,6 +309,96 @@ struct DirectFlow<S> {
     endpoint: TcpIo,
     upload: Pump,
     download: Pump,
+}
+
+struct UdpIo {
+    socket: UdpSocket,
+    buffer: Vec<u8>,
+    pending: Option<usize>,
+}
+
+impl DatagramIo for UdpIo {
+    fn poll_recv_datagram(
+        &mut self,
+        _context: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<DatagramRecv>> {
+        if self.pending.is_none() {
+            match self.socket.recv(&mut self.buffer) {
+                Ok(length) => self.pending = Some(length),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+        let length = self.pending.expect("set above");
+        if output.len() < length {
+            return Poll::Ready(Ok(DatagramRecv::BufferTooSmall(length)));
+        }
+        output[..length].copy_from_slice(&self.buffer[..length]);
+        self.pending = None;
+        Poll::Ready(Ok(DatagramRecv::Datagram(length)))
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        _context: &mut Context<'_>,
+        datagram: &[u8],
+    ) -> Poll<io::Result<()>> {
+        match self.socket.send(datagram) {
+            Ok(length) if length == datagram.len() => Poll::Ready(Ok(())),
+            Ok(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "UDP socket accepted a partial datagram",
+            ))),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct DirectDatagramFlow<S> {
+    stack: S,
+    endpoint: UdpIo,
+    upload: DatagramPump,
+    download: DatagramPump,
+}
+
+impl<S: DatagramIo> DirectDatagramFlow<S> {
+    fn new(stack: S, socket: UdpSocket) -> Result<Self, DirectError> {
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            stack,
+            endpoint: UdpIo {
+                socket,
+                buffer: vec![0; MAX_UDP_PAYLOAD],
+                pending: None,
+            },
+            upload: DatagramPump::new(MAX_UDP_PAYLOAD).map_err(|_| DirectError::Resource)?,
+            download: DatagramPump::new(MAX_UDP_PAYLOAD).map_err(|_| DirectError::Resource)?,
+        })
+    }
+
+    fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<bool, DirectError>> {
+        let upload = self
+            .upload
+            .poll(context, &mut self.stack, &mut self.endpoint)
+            .map_err(|error| DirectError::Io(io::Error::other(error.to_string())));
+        let download = self
+            .download
+            .poll(context, &mut self.endpoint, &mut self.stack)
+            .map_err(|error| DirectError::Io(io::Error::other(error.to_string())));
+        match (upload, download) {
+            (Poll::Ready(Ok(upload)), Poll::Ready(Ok(download))) => {
+                Poll::Ready(Ok(upload.finished && download.finished))
+            }
+            (Poll::Ready(Err(error)), _) | (_, Poll::Ready(Err(error))) => Poll::Ready(Err(error)),
+            _ => Poll::Pending,
+        }
+    }
 }
 
 impl<S: ByteIo> DirectFlow<S> {
@@ -352,6 +457,7 @@ fn initialize(
                 pending: HashMap::new(),
                 ready: HashMap::new(),
                 active: HashMap::new(),
+                active_datagrams: HashMap::new(),
             },
         );
     });
@@ -373,7 +479,7 @@ unsafe extern "C" fn open(
             Ok(metadata) => metadata,
             Err(status) => return status,
         };
-        if metadata.kind != abi::FLOW_TCP {
+        if !matches!(metadata.kind, abi::FLOW_TCP | abi::FLOW_UDP) {
             return abi::STATUS_UNSUPPORTED;
         }
         let Some(output) = (unsafe { output.as_mut() }) else {
@@ -422,6 +528,7 @@ unsafe extern "C" fn open(
             };
             let (response_tx, response_rx) = sync_channel(1);
             let request = ConnectRequest {
+                kind: metadata.kind,
                 destination,
                 dns_mode: state.options.dns_mode,
                 resolve_timeout: Duration::from_millis(state.options.resolve_timeout_ms),
@@ -489,6 +596,7 @@ fn owned_destination(
 fn connect_worker(receiver: Receiver<ConnectRequest>) {
     while let Ok(request) = receiver.recv() {
         let result = connect_destination(
+            request.kind,
             request.destination,
             request.dns_mode,
             request.resolve_timeout,
@@ -500,11 +608,12 @@ fn connect_worker(receiver: Receiver<ConnectRequest>) {
 }
 
 fn connect_destination(
+    kind: u32,
     destination: Destination,
     dns_mode: DnsMode,
     _resolve_timeout: Duration,
     connect_timeout: Duration,
-) -> Result<TcpStream, DirectError> {
+) -> Result<Endpoint, DirectError> {
     let addresses = match destination {
         Destination::Ip(address) => vec![address],
         Destination::Domain(_, _) if matches!(dns_mode, DnsMode::RejectDomains) => {
@@ -522,12 +631,28 @@ fn connect_destination(
     }
     let mut last_error = None;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, connect_timeout) {
-            Ok(stream) => return Ok(stream),
+        let result = match kind {
+            abi::FLOW_TCP => TcpStream::connect_timeout(&address, connect_timeout)
+                .map(Endpoint::Tcp),
+            abi::FLOW_UDP => connect_udp(address).map(Endpoint::Udp),
+            _ => return Err(DirectError::InvalidDestination),
+        };
+        match result {
+            Ok(endpoint) => return Ok(endpoint),
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.map_or(DirectError::NoAddress, DirectError::Io))
+}
+
+fn connect_udp(address: SocketAddr) -> io::Result<UdpSocket> {
+    let bind = match address {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind)?;
+    socket.connect(address)?;
+    Ok(socket)
 }
 
 fn error_status(error: &DirectError) -> u32 {
@@ -584,6 +709,10 @@ unsafe extern "C" fn attach(
             let Some(endpoint) = state.ready.remove(&flow) else {
                 return abi::STATUS_INVALID;
             };
+            let Endpoint::Tcp(endpoint) = endpoint else {
+                state.ready.insert(flow, endpoint);
+                return abi::STATUS_INVALID;
+            };
             let stack = match unsafe { ForeignByteIo::from_raw(stack_socket, stack_socket_io) } {
                 Ok(stack) => stack,
                 Err(_) => return abi::STATUS_INVALID,
@@ -593,6 +722,44 @@ unsafe extern "C" fn attach(
                 Err(error) => return error_status(&error),
             };
             state.active.insert(flow, flow_state);
+            abi::STATUS_OK
+        })
+    })
+}
+
+unsafe extern "C" fn attach_datagram(
+    instance: u64,
+    flow: u64,
+    stack_socket: u64,
+    stack_socket_io: *const SnolDatagramIoV1,
+) -> u32 {
+    snolc_sdk::catch_status(|| {
+        if !INSTANCES.contains(instance) || flow == 0 || stack_socket == 0 {
+            return abi::STATUS_INVALID;
+        }
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let Some(state) = states.get_mut(&instance) else {
+                return abi::STATUS_INVALID;
+            };
+            let Some(endpoint) = state.ready.remove(&flow) else {
+                return abi::STATUS_INVALID;
+            };
+            let Endpoint::Udp(endpoint) = endpoint else {
+                state.ready.insert(flow, endpoint);
+                return abi::STATUS_INVALID;
+            };
+            let stack = match unsafe {
+                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
+            } {
+                Ok(stack) => stack,
+                Err(_) => return abi::STATUS_INVALID,
+            };
+            let flow_state = match DirectDatagramFlow::new(stack, endpoint) {
+                Ok(flow) => flow,
+                Err(error) => return error_status(&error),
+            };
+            state.active_datagrams.insert(flow, flow_state);
             abi::STATUS_OK
         })
     })
@@ -623,7 +790,8 @@ unsafe extern "C" fn close_flow(instance: u64, flow: u64) -> u32 {
             };
             let removed = state.pending.remove(&flow).is_some()
                 | state.ready.remove(&flow).is_some()
-                | state.active.remove(&flow).is_some();
+                | state.active.remove(&flow).is_some()
+                | state.active_datagrams.remove(&flow).is_some();
             if removed {
                 abi::STATUS_OK
             } else {
@@ -649,6 +817,16 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         }
         for handle in finished {
             state.active.remove(&handle);
+        }
+        let mut finished = Vec::new();
+        for (handle, flow) in &mut state.active_datagrams {
+            match flow.poll(&mut context) {
+                Poll::Ready(Ok(true)) | Poll::Ready(Err(_)) => finished.push(*handle),
+                Poll::Ready(Ok(false)) | Poll::Pending => {}
+            }
+        }
+        for handle in finished {
+            state.active_datagrams.remove(&handle);
         }
         abi::STATUS_PENDING
     })
@@ -678,7 +856,7 @@ static ADAPTER: SnolAdapterApiV1 = SnolAdapterApiV1 {
     attach: Some(attach),
     complete: Some(complete),
     close_flow: Some(close_flow),
-    attach_datagram: None,
+    attach_datagram: Some(attach_datagram),
 };
 
 snolc_sdk::declare_stateful_module! {
@@ -792,6 +970,7 @@ mod tests {
         let (response_tx, response_rx) = sync_channel(1);
         sender
             .try_send(ConnectRequest {
+                kind: abi::FLOW_TCP,
                 destination: Destination::Ip(address),
                 dns_mode: DnsMode::RejectDomains,
                 resolve_timeout: Duration::from_secs(1),
@@ -804,6 +983,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
+        let Endpoint::Tcp(stream) = stream else {
+            panic!("worker returned a UDP endpoint");
+        };
         assert_eq!(stream.peer_addr().unwrap(), address);
         drop(stream);
         drop(sender);
