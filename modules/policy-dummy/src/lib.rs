@@ -6,8 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use serde::Deserialize;
-use snolc_sdk::abi::{self, SnolByteIoV1, SnolBytes, SnolPolicyApiV1, SnolWakeHandle};
-use snolc_sdk::{ByteIo, ForeignByteIo, Pump, PumpError, PumpReport};
+use snolc_sdk::abi::{
+    self, SnolByteIoV1, SnolBytes, SnolDatagramIoV1, SnolPolicyApiV1, SnolWakeHandle,
+};
+use snolc_sdk::{
+    ByteIo, DatagramIo, DatagramPump, DatagramPumpReport, ForeignByteIo, ForeignDatagramIo, Pump,
+    PumpError, PumpReport,
+};
+
+const MAX_UDP_PAYLOAD: usize = 65_507;
 
 pub struct DummyFlow<A, M> {
     stack: A,
@@ -47,6 +54,43 @@ impl<A: ByteIo, M: ByteIo> DummyFlow<A, M> {
     }
 }
 
+pub struct DummyDatagramFlow<A, M> {
+    stack: A,
+    mux: M,
+    upload: DatagramPump,
+    download: DatagramPump,
+}
+
+impl<A: DatagramIo, M: DatagramIo> DummyDatagramFlow<A, M> {
+    pub fn new(stack: A, mux: M) -> Result<Self, PumpError> {
+        Ok(Self {
+            stack,
+            mux,
+            upload: DatagramPump::new(MAX_UDP_PAYLOAD)?,
+            download: DatagramPump::new(MAX_UDP_PAYLOAD)?,
+        })
+    }
+
+    pub fn poll(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(DatagramPumpReport, DatagramPumpReport), PumpError>> {
+        let upload = self
+            .upload
+            .poll(context, &mut self.stack, &mut self.mux);
+        let download = self
+            .download
+            .poll(context, &mut self.mux, &mut self.stack);
+        match (upload, download) {
+            (Poll::Ready(Ok(upload)), Poll::Ready(Ok(download))) => {
+                Poll::Ready(Ok((upload, download)))
+            }
+            (Poll::Ready(Err(error)), _) | (_, Poll::Ready(Err(error))) => Poll::Ready(Err(error)),
+            _ => Poll::Pending,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Options {
@@ -73,6 +117,7 @@ struct State {
     pump_buffer_bytes: usize,
     sessions: HashMap<u64, ForeignByteIo>,
     flows: HashMap<u64, DummyFlow<ForeignByteIo, ForeignByteIo>>,
+    datagram_flows: HashMap<u64, DummyDatagramFlow<ForeignDatagramIo, ForeignDatagramIo>>,
 }
 
 thread_local! {
@@ -93,6 +138,7 @@ fn initialize(
                 pump_buffer_bytes: options.pump_buffer_bytes,
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
+                datagram_flows: HashMap::new(),
             },
         );
     });
@@ -199,6 +245,56 @@ unsafe extern "C" fn attach_flow(
     })
 }
 
+unsafe extern "C" fn attach_datagram_flow(
+    instance: u64,
+    session: u64,
+    stack_socket: u64,
+    stack_socket_io: *const SnolDatagramIoV1,
+    mux_stream: u64,
+    mux_stream_io: *const SnolDatagramIoV1,
+) -> u32 {
+    snolc_sdk::catch_status(|| {
+        if !INSTANCES.contains(instance)
+            || session == 0
+            || stack_socket == 0
+            || stack_socket_io.is_null()
+            || mux_stream == 0
+            || mux_stream_io.is_null()
+        {
+            return abi::STATUS_INVALID;
+        }
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let Some(state) = states.get_mut(&instance) else {
+                return abi::STATUS_INVALID;
+            };
+            if !state.sessions.contains_key(&session) {
+                return abi::STATUS_INVALID;
+            }
+            let stack = match unsafe {
+                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
+            } {
+                Ok(stack) => stack,
+                Err(_) => return abi::STATUS_INVALID,
+            };
+            let mux = match unsafe { ForeignDatagramIo::from_raw(mux_stream, mux_stream_io) } {
+                Ok(mux) => mux,
+                Err(_) => return abi::STATUS_INVALID,
+            };
+            let flow = match DummyDatagramFlow::new(stack, mux) {
+                Ok(flow) => flow,
+                Err(_) => return abi::STATUS_RESOURCE,
+            };
+            let handle = FLOW_NEXT.fetch_add(1, Ordering::Relaxed);
+            if handle == 0 {
+                return abi::STATUS_RESOURCE;
+            }
+            state.datagram_flows.insert(handle, flow);
+            abi::STATUS_OK
+        })
+    })
+}
+
 fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
     STATES.with(|states| {
         let mut states = states.borrow_mut();
@@ -218,6 +314,19 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         }
         for handle in finished {
             state.flows.remove(&handle);
+        }
+        let mut finished = Vec::new();
+        for (handle, flow) in &mut state.datagram_flows {
+            match flow.poll(&mut context) {
+                Poll::Ready(Ok((upload, download))) if upload.finished && download.finished => {
+                    finished.push(*handle);
+                }
+                Poll::Ready(Err(_)) => return abi::STATUS_IO,
+                Poll::Ready(Ok(_)) | Poll::Pending => {}
+            }
+        }
+        for handle in finished {
+            state.datagram_flows.remove(&handle);
         }
         abi::STATUS_PENDING
     })
@@ -245,7 +354,7 @@ static POLICY: SnolPolicyApiV1 = SnolPolicyApiV1 {
     attach_session: Some(attach_session),
     admit_flow: Some(admit_flow),
     attach_flow: Some(attach_flow),
-    attach_datagram_flow: None,
+    attach_datagram_flow: Some(attach_datagram_flow),
 };
 
 snolc_sdk::declare_stateful_module! {
