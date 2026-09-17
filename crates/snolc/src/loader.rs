@@ -11,8 +11,8 @@ use std::task::{Context, Poll, Waker};
 use futures::io::{AsyncRead, AsyncWrite};
 use libloading::{Library, Symbol};
 use snolc_abi::{
-    ModuleEntry, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolHostApiV1, SnolIoResult,
-    SnolModuleDescriptor, SnolWakeHandle,
+    ModuleEntry, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolFlowMetadataV1, SnolHostApiV1,
+    SnolIoResult, SnolModuleDescriptor, SnolWakeHandle,
 };
 use thiserror::Error;
 
@@ -237,7 +237,7 @@ impl LoadedModule {
 
     pub fn adapter_open(
         &self,
-        request: &[u8],
+        metadata: &SnolFlowMetadataV1,
         context: &mut Context<'_>,
     ) -> Poll<Result<u64, LoadError>> {
         let instance = match self.instance {
@@ -254,7 +254,7 @@ impl LoadedModule {
         };
         let mut flow = 0;
         let wake = WakeCall::new(context.waker());
-        let status = unsafe { open(instance, bytes(request), wake.handle(), &mut flow) };
+        let status = unsafe { open(instance, metadata, wake.handle(), &mut flow) };
         match status {
             snolc_abi::STATUS_PENDING => Poll::Pending,
             snolc_abi::STATUS_OK if flow == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
@@ -357,7 +357,7 @@ impl LoadedModule {
     pub fn policy_admit_flow(
         &self,
         policy_session: u64,
-        metadata: &[u8],
+        metadata: &SnolFlowMetadataV1,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), LoadError>> {
         let instance = match self.instance {
@@ -373,7 +373,7 @@ impl LoadedModule {
             None => return Poll::Ready(Err(LoadError::MissingFunction)),
         };
         let wake = WakeCall::new(context.waker());
-        let status = unsafe { admit(instance, policy_session, bytes(metadata), wake.handle()) };
+        let status = unsafe { admit(instance, policy_session, metadata, wake.handle()) };
         match status {
             snolc_abi::STATUS_PENDING => Poll::Pending,
             snolc_abi::STATUS_OK => Poll::Ready(Ok(())),
@@ -917,7 +917,7 @@ mod tests {
     unsafe extern "C" fn destroy(_: u64) {}
     unsafe extern "C" fn open(
         _: u64,
-        _: SnolBytes,
+        _: *const SnolFlowMetadataV1,
         _: snolc_abi::SnolWakeHandle,
         _: *mut u64,
     ) -> u32 {

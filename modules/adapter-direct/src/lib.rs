@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::Deserialize;
-use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolBytes, SnolWakeHandle};
+use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolWakeHandle};
 
 pub trait SocketProtector: Send + Sync {
     fn protect(&self, socket: &TcpStream) -> io::Result<()>;
@@ -193,7 +193,7 @@ static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 
 unsafe extern "C" fn open(
     instance: u64,
-    request: SnolBytes,
+    metadata: *const abi::SnolFlowMetadataV1,
     _wake: SnolWakeHandle,
     output: *mut u64,
 ) -> u32 {
@@ -201,13 +201,10 @@ unsafe extern "C" fn open(
         if !INSTANCES.contains(instance) {
             return abi::STATUS_INVALID;
         }
-        let request = match unsafe { snolc_sdk::module::input(request) } {
-            Ok(request) => request,
+        let _metadata = match unsafe { snolc_sdk::module::flow_metadata(metadata) } {
+            Ok(metadata) => metadata,
             Err(status) => return status,
         };
-        if request.is_empty() || request.len() > 4096 {
-            return abi::STATUS_INVALID;
-        }
         let Some(output) = (unsafe { output.as_mut() }) else {
             return abi::STATUS_INVALID;
         };

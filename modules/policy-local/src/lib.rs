@@ -331,12 +331,15 @@ unsafe extern "C" fn attach_session(
 unsafe extern "C" fn admit_flow(
     instance: u64,
     session: u64,
-    metadata: SnolBytes,
+    metadata: *const abi::SnolFlowMetadataV1,
     _wake: SnolWakeHandle,
 ) -> u32 {
     snolc_sdk::catch_status(|| {
-        if !INSTANCES.contains(instance) || session == 0 || metadata.length > 1024 {
+        if !INSTANCES.contains(instance) || session == 0 {
             return abi::STATUS_INVALID;
+        }
+        if let Err(status) = unsafe { snolc_sdk::module::flow_metadata(metadata) } {
+            return status;
         }
         STATES.with(|states| {
             let states = states.borrow();

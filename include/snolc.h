@@ -22,6 +22,11 @@
 #define SNOLC_IO_EOF 2u
 #define SNOLC_IO_ERROR 3u
 #define SNOLC_IO_BUFFER_TOO_SMALL 4u
+#define SNOLC_FLOW_TCP 1u
+#define SNOLC_FLOW_UDP 2u
+#define SNOLC_ADDRESS_IPV4 1u
+#define SNOLC_ADDRESS_IPV6 2u
+#define SNOLC_ADDRESS_DOMAIN 3u
 
 typedef uint64_t SnolHandle;
 typedef uint32_t SnolStatus;
@@ -52,6 +57,7 @@ typedef struct {
 typedef struct SnolHostApiV1 SnolHostApiV1;
 typedef struct SnolByteIoV1 SnolByteIoV1;
 typedef struct SnolDatagramIoV1 SnolDatagramIoV1;
+typedef struct SnolFlowMetadataV1 SnolFlowMetadataV1;
 typedef struct SnolAdapterApiV1 SnolAdapterApiV1;
 typedef struct SnolProtectionApiV1 SnolProtectionApiV1;
 typedef struct SnolCarrierApiV1 SnolCarrierApiV1;
@@ -77,13 +83,24 @@ struct SnolDatagramIoV1 {
     SnolStatus (*close)(SnolHandle io);
 };
 
+struct SnolFlowMetadataV1 {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t address_type;
+    uint32_t reserved;
+    SnolBytes address;
+    uint16_t port;
+    uint8_t reserved2[6];
+    SnolBytes metadata;
+};
+
 struct SnolAdapterApiV1 {
     uint32_t struct_size;
     uint32_t reserved;
-    SnolStatus (*open)(SnolHandle instance, SnolBytes request,
+    SnolStatus (*open)(SnolHandle instance, const SnolFlowMetadataV1 *metadata,
                        SnolWakeHandle wake, SnolHandle *flow);
-    SnolStatus (*accept)(SnolHandle instance, SnolBytesMut request,
-                         size_t *written, SnolWakeHandle wake,
+    SnolStatus (*accept)(SnolHandle instance, SnolFlowMetadataV1 *metadata,
+                         SnolWakeHandle wake,
                          SnolHandle *flow);
     SnolStatus (*attach)(SnolHandle instance, SnolHandle flow,
                          SnolHandle stack_socket,
@@ -118,7 +135,8 @@ struct SnolPolicyApiV1 {
                                   SnolBytes context, SnolWakeHandle wake,
                                   SnolHandle *session);
     SnolStatus (*admit_flow)(SnolHandle instance, SnolHandle session,
-                             SnolBytes metadata, SnolWakeHandle wake);
+                              const SnolFlowMetadataV1 *metadata,
+                              SnolWakeHandle wake);
     SnolStatus (*attach_flow)(SnolHandle instance, SnolHandle session,
                                SnolHandle stack_socket,
                                const SnolByteIoV1 *stack_socket_io,

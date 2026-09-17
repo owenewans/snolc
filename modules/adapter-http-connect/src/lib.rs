@@ -1,10 +1,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
-use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolBytes, SnolWakeHandle};
+use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolWakeHandle};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Host {
@@ -128,34 +127,17 @@ fn validate_config(config: &[u8], _base: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
-
 unsafe extern "C" fn open(
     instance: u64,
-    request: SnolBytes,
+    _metadata: *const abi::SnolFlowMetadataV1,
     _wake: SnolWakeHandle,
-    output: *mut u64,
+    _output: *mut u64,
 ) -> u32 {
     snolc_sdk::catch_status(|| {
         if !INSTANCES.contains(instance) {
             return abi::STATUS_INVALID;
         }
-        let request = match unsafe { snolc_sdk::module::input(request) } {
-            Ok(request) => request,
-            Err(status) => return status,
-        };
-        if parse_connect(request, 65_536).is_err() {
-            return abi::STATUS_INVALID;
-        }
-        let Some(output) = (unsafe { output.as_mut() }) else {
-            return abi::STATUS_INVALID;
-        };
-        let handle = FLOW_NEXT.fetch_add(1, Ordering::Relaxed);
-        if handle == 0 {
-            return abi::STATUS_RESOURCE;
-        }
-        *output = handle;
-        abi::STATUS_OK
+        abi::STATUS_UNSUPPORTED
     })
 }
 

@@ -3,10 +3,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
-use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolBytes, SnolWakeHandle};
+use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolWakeHandle};
 
 pub struct TunFd {
     file: File,
@@ -112,27 +111,17 @@ fn validate_config(config: &[u8], _base: &[u8]) -> Result<(), String> {
     }
 }
 
-static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
-
 unsafe extern "C" fn open(
     instance: u64,
-    _request: SnolBytes,
+    _metadata: *const abi::SnolFlowMetadataV1,
     _wake: SnolWakeHandle,
-    output: *mut u64,
+    _output: *mut u64,
 ) -> u32 {
     snolc_sdk::catch_status(|| {
         if !INSTANCES.contains(instance) {
             return abi::STATUS_INVALID;
         }
-        let Some(output) = (unsafe { output.as_mut() }) else {
-            return abi::STATUS_INVALID;
-        };
-        let handle = FLOW_NEXT.fetch_add(1, Ordering::Relaxed);
-        if handle == 0 {
-            return abi::STATUS_RESOURCE;
-        }
-        *output = handle;
-        abi::STATUS_OK
+        abi::STATUS_UNSUPPORTED
     })
 }
 

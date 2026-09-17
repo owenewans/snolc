@@ -137,14 +137,16 @@ unsafe extern "C" fn attach_session(
 unsafe extern "C" fn admit_flow(
     instance: u64,
     session: u64,
-    metadata: SnolBytes,
+    metadata: *const abi::SnolFlowMetadataV1,
     _wake: SnolWakeHandle,
 ) -> u32 {
     snolc_sdk::catch_status(|| {
-        if !INSTANCES.contains(instance) || session == 0 || metadata.length > 1024 {
-            abi::STATUS_INVALID
-        } else {
-            abi::STATUS_OK
+        if !INSTANCES.contains(instance) || session == 0 {
+            return abi::STATUS_INVALID;
+        }
+        match unsafe { snolc_sdk::module::flow_metadata(metadata) } {
+            Ok(_) => abi::STATUS_OK,
+            Err(status) => status,
         }
     })
 }

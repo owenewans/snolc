@@ -25,6 +25,12 @@ pub const IO_EOF: u32 = 2;
 pub const IO_ERROR: u32 = 3;
 pub const IO_BUFFER_TOO_SMALL: u32 = 4;
 
+pub const FLOW_TCP: u32 = 1;
+pub const FLOW_UDP: u32 = 2;
+pub const ADDRESS_IPV4: u32 = 1;
+pub const ADDRESS_IPV6: u32 = 2;
+pub const ADDRESS_DOMAIN: u32 = 3;
+
 pub type SnolHandle = u64;
 pub type SnolStatus = u32;
 
@@ -43,6 +49,21 @@ pub struct SnolBytesMut {
     pub pointer: *mut u8,
     pub length: usize,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnolFlowMetadataV1 {
+    pub struct_size: u32,
+    pub kind: u32,
+    pub address_type: u32,
+    pub reserved: u32,
+    pub address: SnolBytes,
+    pub port: u16,
+    pub reserved2: [u8; 6],
+    pub metadata: SnolBytes,
+}
+
+unsafe impl Sync for SnolFlowMetadataV1 {}
 
 unsafe impl Sync for SnolBytesMut {}
 
@@ -138,12 +159,15 @@ pub struct SnolDatagramIoV1 {
 
 unsafe impl Sync for SnolDatagramIoV1 {}
 
-pub type AdapterOpenFn =
-    unsafe extern "C" fn(SnolHandle, SnolBytes, SnolWakeHandle, *mut SnolHandle) -> SnolStatus;
+pub type AdapterOpenFn = unsafe extern "C" fn(
+    SnolHandle,
+    *const SnolFlowMetadataV1,
+    SnolWakeHandle,
+    *mut SnolHandle,
+) -> SnolStatus;
 pub type AdapterAcceptFn = unsafe extern "C" fn(
     SnolHandle,
-    SnolBytesMut,
-    *mut usize,
+    *mut SnolFlowMetadataV1,
     SnolWakeHandle,
     *mut SnolHandle,
 ) -> SnolStatus;
@@ -206,8 +230,12 @@ pub type AttachSessionFn = unsafe extern "C" fn(
     SnolWakeHandle,
     *mut SnolHandle,
 ) -> SnolStatus;
-pub type AdmitFlowFn =
-    unsafe extern "C" fn(SnolHandle, SnolHandle, SnolBytes, SnolWakeHandle) -> SnolStatus;
+pub type AdmitFlowFn = unsafe extern "C" fn(
+    SnolHandle,
+    SnolHandle,
+    *const SnolFlowMetadataV1,
+    SnolWakeHandle,
+) -> SnolStatus;
 pub type AttachFlowFn = unsafe extern "C" fn(
     SnolHandle,
     SnolHandle,
@@ -304,5 +332,11 @@ mod tests {
     #[test]
     fn required_datagram_length_is_preserved() {
         assert_eq!(SnolIoResult::buffer_too_small(65_507).count, 65_507);
+    }
+
+    #[test]
+    fn flow_metadata_has_fixed_prefix_layout() {
+        assert_eq!(core::mem::offset_of!(SnolFlowMetadataV1, address), 16);
+        assert_eq!(core::mem::offset_of!(SnolFlowMetadataV1, port), 32);
     }
 }

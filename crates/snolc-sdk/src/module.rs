@@ -4,19 +4,68 @@ use std::sync::{Mutex, OnceLock};
 
 use snolc_abi::{SnolBytes, SnolBytesMut};
 
+pub struct BorrowedFlowMetadata<'a> {
+    pub kind: u32,
+    pub address_type: u32,
+    pub address: &'a [u8],
+    pub port: u16,
+    pub metadata: &'a [u8],
+}
+
 /// # Safety
 ///
-/// `written`, when non-null, must be writable for one `usize`.
+/// `metadata` and its borrowed byte fields must remain readable for the returned borrow.
+pub unsafe fn flow_metadata<'a>(
+    metadata: *const snolc_abi::SnolFlowMetadataV1,
+) -> Result<BorrowedFlowMetadata<'a>, u32> {
+    let metadata = unsafe { metadata.as_ref() }.ok_or(snolc_abi::STATUS_INVALID)?;
+    if metadata.struct_size < size_of::<snolc_abi::SnolFlowMetadataV1>() as u32
+        || metadata.reserved != 0
+        || metadata.reserved2 != [0; 6]
+        || !matches!(metadata.kind, snolc_abi::FLOW_TCP | snolc_abi::FLOW_UDP)
+        || !matches!(
+            metadata.address_type,
+            snolc_abi::ADDRESS_IPV4 | snolc_abi::ADDRESS_IPV6 | snolc_abi::ADDRESS_DOMAIN
+        )
+        || metadata.port == 0
+        || metadata.metadata.length > 1024
+    {
+        return Err(snolc_abi::STATUS_INVALID);
+    }
+    let address = unsafe { input(metadata.address)? };
+    let opaque = unsafe { input(metadata.metadata)? };
+    let address_valid = match metadata.address_type {
+        snolc_abi::ADDRESS_IPV4 => address.len() == 4,
+        snolc_abi::ADDRESS_IPV6 => address.len() == 16,
+        snolc_abi::ADDRESS_DOMAIN => {
+            !address.is_empty()
+                && address.len() <= 253
+                && address.is_ascii()
+                && address.iter().all(|byte| !byte.is_ascii_uppercase())
+        }
+        _ => false,
+    };
+    if !address_valid {
+        return Err(snolc_abi::STATUS_INVALID);
+    }
+    Ok(BorrowedFlowMetadata {
+        kind: metadata.kind,
+        address_type: metadata.address_type,
+        address,
+        port: metadata.port,
+        metadata: opaque,
+    })
+}
+
+/// # Safety
+///
+/// ABI arguments must follow the adapter contract.
 pub unsafe extern "C" fn unsupported_adapter_accept(
     _instance: u64,
-    _request: SnolBytesMut,
-    written: *mut usize,
+    _metadata: *mut snolc_abi::SnolFlowMetadataV1,
     _wake: snolc_abi::SnolWakeHandle,
     _flow: *mut u64,
 ) -> u32 {
-    if let Some(written) = unsafe { written.as_mut() } {
-        *written = 0;
-    }
     snolc_abi::STATUS_UNSUPPORTED
 }
 
@@ -461,5 +510,32 @@ mod tests {
         assert_ne!(first, second);
         assert!(!instances.contains(first));
         assert!(instances.contains(second));
+    }
+
+    #[test]
+    fn validates_borrowed_flow_metadata_before_access() {
+        let address = b"example.com";
+        let opaque = b"opaque";
+        let mut metadata = snolc_abi::SnolFlowMetadataV1 {
+            struct_size: size_of::<snolc_abi::SnolFlowMetadataV1>() as u32,
+            kind: snolc_abi::FLOW_TCP,
+            address_type: snolc_abi::ADDRESS_DOMAIN,
+            reserved: 0,
+            address: SnolBytes {
+                pointer: address.as_ptr(),
+                length: address.len(),
+            },
+            port: 443,
+            reserved2: [0; 6],
+            metadata: SnolBytes {
+                pointer: opaque.as_ptr(),
+                length: opaque.len(),
+            },
+        };
+        let borrowed = unsafe { flow_metadata(&metadata) }.unwrap();
+        assert_eq!(borrowed.address, address);
+        assert_eq!(borrowed.metadata, opaque);
+        metadata.reserved2[0] = 1;
+        assert!(unsafe { flow_metadata(&metadata) }.is_err());
     }
 }
