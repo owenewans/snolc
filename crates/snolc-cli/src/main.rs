@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use snolc::{Deployment, Engine, Event, Host};
+use snolc_ng::{AccessProvisioning, ProvisionProfile};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -45,8 +46,31 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
                 .write_all(&response)
                 .map_err(|error| error.to_string())
         }
+        [command, socket, instance, profile, user_id, client_id, seq]
+            if command == "provision" =>
+        {
+            let profile = fs::read_to_string(profile).map_err(|error| error.to_string())?;
+            let profile = ProvisionProfile::parse_toml(&profile).map_err(|error| error.to_string())?;
+            let seq = seq
+                .parse::<u64>()
+                .map_err(|_| "provision seq must be an unsigned integer".to_owned())?;
+            let provisioning = AccessProvisioning::new(profile, user_id, client_id, seq)
+                .map_err(|error| error.to_string())?;
+            let response = snolc::control::request(
+                Path::new(socket),
+                instance,
+                provisioning.request(),
+                16_384,
+            )
+            .map_err(|error| error.to_string())?;
+            let access = provisioning
+                .finish(&response)
+                .map_err(|error| error.to_string())?;
+            println!("{}", access.uri);
+            Ok(())
+        }
         _ => Err(
-            "usage: snolc version | validate <snolc.toml> | run <snolc.toml> | control <socket> <instance> <request.toml>"
+            "usage: snolc version | validate <snolc.toml> | run <snolc.toml> | control <socket> <instance> <request.toml> | provision <socket> <policy-instance> <profile.toml> <user-id> <client-id> <seq>"
                 .into(),
         ),
     }
