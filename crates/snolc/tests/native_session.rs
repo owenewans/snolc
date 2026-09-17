@@ -30,6 +30,8 @@ fn native_tcp_dummy_path_establishes_policy_session() {
         true,
         "protection_dummy",
         b"",
+        "policy_dummy",
+        b"pump_buffer_bytes = 4096\n",
     );
     let client = build_side(
         "client-dummy",
@@ -38,6 +40,8 @@ fn native_tcp_dummy_path_establishes_policy_session() {
         false,
         "protection_dummy",
         b"",
+        "policy_dummy",
+        b"pump_buffer_bytes = 4096\n",
     );
     run_pair(server, client);
 }
@@ -74,6 +78,8 @@ fn native_tcp_noise_path_establishes_authenticated_policy_session() {
         true,
         "protection_noise",
         server_options.as_bytes(),
+        "policy_dummy",
+        b"pump_buffer_bytes = 4096\n",
     );
     let client = build_side(
         "client-noise",
@@ -82,8 +88,63 @@ fn native_tcp_noise_path_establishes_authenticated_policy_session() {
         false,
         "protection_noise",
         client_options.as_bytes(),
+        "policy_dummy",
+        b"pump_buffer_bytes = 4096\n",
     );
     run_pair(server, client);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn native_noise_policy_local_opens_private_storage_and_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    drop(listener);
+    let params: NoiseParams = "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let keypair = Builder::new(params).generate_keypair().unwrap();
+    let directory = std::env::temp_dir().join(format!(
+        "snolc-native-local-{}-{}",
+        std::process::id(),
+        endpoint.port()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let private = directory.join("server.key");
+    let public = directory.join("server.pub");
+    fs::write(&private, keypair.private).unwrap();
+    fs::write(&public, keypair.public).unwrap();
+    let server_protection = format!(
+        "mode = \"server\"\nprivate_key_file = \"{}\"\n",
+        private.display()
+    );
+    let client_protection = format!(
+        "mode = \"client\"\nserver_public_key_file = \"{}\"\n",
+        public.display()
+    );
+    let server_policy = policy_local_options(&directory.join("server-state/policy.redb"));
+    let client_policy = policy_local_options(&directory.join("client-state/policy.redb"));
+    let server = build_side(
+        "server-local",
+        "server",
+        endpoint,
+        true,
+        "protection_noise",
+        server_protection.as_bytes(),
+        "policy_local",
+        server_policy.as_bytes(),
+    );
+    let client = build_side(
+        "client-local",
+        "client",
+        endpoint,
+        false,
+        "protection_noise",
+        client_protection.as_bytes(),
+        "policy_local",
+        client_policy.as_bytes(),
+    );
+    run_pair(server, client);
+    assert!(directory.join("server-state/policy.redb").is_file());
+    assert!(directory.join("client-state/policy.redb").is_file());
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -119,6 +180,8 @@ fn build_side(
     listen: bool,
     protection_library: &str,
     protection_options: &[u8],
+    policy_library: &str,
+    policy_options: &[u8],
 ) -> snolc::ValidatedConfig {
     let root = PathBuf::from(format!("/tmp/snolc-native-session-{identity}"));
     let adapter_config = root.join("adapter.toml");
@@ -161,12 +224,20 @@ fn build_side(
         ),
         load(
             &format!("policy-{identity}"),
-            "policy_dummy",
-            b"pump_buffer_bytes = 4096\n",
+            policy_library,
+            policy_options,
             &policy_config,
         ),
     ];
     Engine::validate(config, modules).unwrap()
+}
+
+fn policy_local_options(path: &Path) -> String {
+    let template = include_str!("../../../config/templates/policy-local-server.toml");
+    let mut template: toml::Value = toml::from_str(template).unwrap();
+    template["options"]["storage"]["path"] =
+        toml::Value::String(path.to_string_lossy().into_owned());
+    toml::to_string(&template["options"]).unwrap()
 }
 
 fn load(instance: &str, library: &str, options: &[u8], source: &Path) -> LoadedModule {
