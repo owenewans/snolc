@@ -99,7 +99,8 @@ impl FrameReader {
         if self.data.len() != expected {
             return None;
         }
-        let frame = self.data.split_off(2);
+        let frame = self.data[2..expected].to_vec();
+        self.data.clear();
         self.expected = None;
         Some(frame)
     }
@@ -939,6 +940,18 @@ mod tests {
                 assert_eq!(reader.take().unwrap(), record[2..]);
             }
         }
+    }
+
+    #[test]
+    fn frame_reader_resets_between_records() {
+        let (mut client, _) = pair();
+        let first = client.seal(b"first").unwrap();
+        let second = client.seal(b"second").unwrap();
+        let mut reader = FrameReader::default();
+        reader.push(&first, MAX_CIPHERTEXT).unwrap();
+        assert_eq!(reader.take().unwrap(), first[2..]);
+        reader.push(&second, MAX_CIPHERTEXT).unwrap();
+        assert_eq!(reader.take().unwrap(), second[2..]);
     }
 
     #[test]
