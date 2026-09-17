@@ -24,6 +24,10 @@ enum Command {
         key: String,
         response: SyncSender<Result<(), StorageError>>,
     },
+    Apply {
+        changes: Vec<(String, Option<Vec<u8>>)>,
+        response: SyncSender<Result<(), StorageError>>,
+    },
     Stop,
 }
 
@@ -96,6 +100,24 @@ impl StorageWorker {
         Ok(receiver)
     }
 
+    pub fn apply(
+        &self,
+        changes: Vec<(String, Option<Vec<u8>>)>,
+    ) -> Result<WriteReply, StorageError> {
+        if changes.is_empty() {
+            return Err(StorageError::Invalid);
+        }
+        for (key, _) in &changes {
+            validate_key(key)?;
+        }
+        let (sender, receiver) = sync_channel(1);
+        self.send(Command::Apply {
+            changes,
+            response: sender,
+        })?;
+        Ok(receiver)
+    }
+
     fn send(&self, command: Command) -> Result<(), StorageError> {
         self.sender.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => StorageError::QueueFull,
@@ -131,6 +153,15 @@ fn run(database: Database, path: PathBuf, max_bytes: u64, receiver: Receiver<Com
             Command::Delete { key, response } => {
                 let _ = response.send(delete_value(&database, &key));
             }
+            Command::Apply { changes, response } => {
+                let added: usize = changes
+                    .iter()
+                    .filter_map(|(key, value)| value.as_ref().map(|value| key.len() + value.len()))
+                    .sum();
+                let result = enforce_size(&path, max_bytes, 0, added)
+                    .and_then(|()| apply_values(&database, &changes));
+                let _ = response.send(result);
+            }
             Command::Stop => break,
         }
     }
@@ -163,6 +194,29 @@ fn delete_value(database: &Database, key: &str) -> Result<(), StorageError> {
     {
         let mut table = transaction.open_table(KV).map_err(table_error)?;
         table.remove(key).map_err(storage_error)?;
+    }
+    transaction.commit().map_err(commit_error)
+}
+
+fn apply_values(
+    database: &Database,
+    changes: &[(String, Option<Vec<u8>>)],
+) -> Result<(), StorageError> {
+    let mut transaction = database.begin_write().map_err(transaction_error)?;
+    transaction
+        .set_durability(Durability::Immediate)
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    {
+        let mut table = transaction.open_table(KV).map_err(table_error)?;
+        for (key, value) in changes {
+            if let Some(value) = value {
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(storage_error)?;
+            } else {
+                table.remove(key.as_str()).map_err(storage_error)?;
+            }
+        }
     }
     transaction.commit().map_err(commit_error)
 }
@@ -317,6 +371,41 @@ mod tests {
             worker.get("other/key".into()),
             Err(StorageError::Invalid)
         ));
+        drop(worker);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn applies_multiple_keys_in_one_transaction() {
+        let path = path();
+        let worker = StorageWorker::open(path.clone(), 1_048_576, 16_777_216, 2).unwrap();
+        worker
+            .apply(vec![
+                ("user/01".into(), Some(b"user".to_vec())),
+                ("client/panel".into(), Some(b"receipt".to_vec())),
+            ])
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert!(
+            worker
+                .get("user/01".into())
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            worker
+                .get("client/panel".into())
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
         drop(worker);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
