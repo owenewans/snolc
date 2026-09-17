@@ -237,6 +237,7 @@ impl LoadedModule {
 
     pub fn adapter_open(
         &self,
+        operation: u64,
         metadata: &SnolFlowMetadataV1,
         context: &mut Context<'_>,
     ) -> Poll<Result<u64, LoadError>> {
@@ -254,7 +255,7 @@ impl LoadedModule {
         };
         let mut flow = 0;
         let wake = WakeCall::new(context.waker());
-        let status = unsafe { open(instance, metadata, wake.handle(), &mut flow) };
+        let status = unsafe { open(instance, operation, metadata, wake.handle(), &mut flow) };
         match status {
             snolc_abi::STATUS_PENDING => Poll::Pending,
             snolc_abi::STATUS_OK if flow == 0 => Poll::Ready(Err(LoadError::InvalidHandle)),
@@ -916,6 +917,7 @@ mod tests {
     }
     unsafe extern "C" fn destroy(_: u64) {}
     unsafe extern "C" fn open(
+        _: u64,
         _: u64,
         _: *const SnolFlowMetadataV1,
         _: snolc_abi::SnolWakeHandle,

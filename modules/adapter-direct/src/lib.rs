@@ -193,6 +193,7 @@ static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 
 unsafe extern "C" fn open(
     instance: u64,
+    _operation: u64,
     metadata: *const abi::SnolFlowMetadataV1,
     _wake: SnolWakeHandle,
     output: *mut u64,

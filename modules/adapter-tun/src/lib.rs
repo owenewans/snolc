@@ -113,6 +113,7 @@ fn validate_config(config: &[u8], _base: &[u8]) -> Result<(), String> {
 
 unsafe extern "C" fn open(
     instance: u64,
+    _operation: u64,
     _metadata: *const abi::SnolFlowMetadataV1,
     _wake: SnolWakeHandle,
     _output: *mut u64,

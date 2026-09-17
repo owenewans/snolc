@@ -161,6 +161,7 @@ unsafe impl Sync for SnolDatagramIoV1 {}
 
 pub type AdapterOpenFn = unsafe extern "C" fn(
     SnolHandle,
+    SnolHandle,
     *const SnolFlowMetadataV1,
     SnolWakeHandle,
     *mut SnolHandle,

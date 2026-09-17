@@ -97,7 +97,8 @@ struct SnolFlowMetadataV1 {
 struct SnolAdapterApiV1 {
     uint32_t struct_size;
     uint32_t reserved;
-    SnolStatus (*open)(SnolHandle instance, const SnolFlowMetadataV1 *metadata,
+    SnolStatus (*open)(SnolHandle instance, SnolHandle operation,
+                       const SnolFlowMetadataV1 *metadata,
                        SnolWakeHandle wake, SnolHandle *flow);
     SnolStatus (*accept)(SnolHandle instance, SnolFlowMetadataV1 *metadata,
                          SnolWakeHandle wake,
