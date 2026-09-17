@@ -430,6 +430,34 @@ impl Engine {
             self.validated.config.engine.max_managed_bytes,
             self.validated.config.engine.max_ingress_packets_per_tick,
         )?;
+        let adapters: HashSet<usize> = self
+            .validated
+            .tunnels
+            .iter()
+            .flat_map(|tunnel| tunnel.adapters.iter().copied())
+            .collect();
+        let packet_io_limit = self
+            .validated
+            .tunnels
+            .iter()
+            .map(|tunnel| tunnel.core_io_limit)
+            .max()
+            .unwrap_or(0)
+            .checked_add(adapters.len())
+            .ok_or(EngineError::ResourceOverflow)?;
+        for adapter in adapters {
+            let packet_port = RegisteredDatagramIo::register(stack.packet_port(), packet_io_limit)
+                .map_err(|_| EngineError::CoreIo)?;
+            let (packet_handle, packet_table) = packet_port.raw_parts();
+            match unsafe {
+                self.validated.modules[adapter]
+                    .adapter_attach_packet_port(packet_handle, packet_table)
+            } {
+                Ok(()) => packet_port.transfer(),
+                Err(LoadError::Unsupported) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let mut tunnels: Vec<_> = self
             .validated
             .tunnels
@@ -1665,6 +1693,8 @@ pub enum EngineError {
     Module(#[from] LoadError),
     #[error(transparent)]
     Stack(#[from] StackError),
+    #[error("core I/O registry is exhausted")]
+    CoreIo,
     #[error("module instance {0} is duplicated")]
     DuplicateInstance(String),
     #[error("required module class mask {0:#x} is missing")]

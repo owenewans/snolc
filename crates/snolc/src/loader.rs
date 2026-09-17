@@ -388,6 +388,26 @@ impl LoadedModule {
         }
     }
 
+    /// # Safety
+    ///
+    /// The packet port handle and I/O table must remain valid until the adapter closes them.
+    pub unsafe fn adapter_attach_packet_port(
+        &self,
+        packet_port: u64,
+        packet_port_io: *const SnolDatagramIoV1,
+    ) -> Result<(), LoadError> {
+        let instance = self.instance.ok_or(LoadError::NotCreated)?;
+        let adapter = unsafe { self.descriptor().adapter.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))?;
+        let attach = adapter.attach_packet_port.ok_or(LoadError::Unsupported)?;
+        let status = unsafe { attach(instance, packet_port, packet_port_io) };
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(LoadError::ModuleStatus(status))
+        }
+    }
+
     pub fn adapter_complete_flow(
         &self,
         flow: u64,
@@ -1126,6 +1146,7 @@ mod tests {
         complete: Some(snolc_sdk::module::unsupported_adapter_complete),
         close_flow: Some(snolc_sdk::module::unsupported_adapter_close),
         attach_datagram: None,
+        attach_packet_port: None,
     };
 
     static CLOSED: AtomicBool = AtomicBool::new(false);

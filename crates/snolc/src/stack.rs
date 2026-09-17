@@ -87,6 +87,12 @@ pub struct UdpDatagramPort {
     wake: Rc<PortWake>,
 }
 
+pub struct PacketPort {
+    bridge: Weak<RefCell<StackBridge>>,
+    wake: Rc<PortWake>,
+    closed: bool,
+}
+
 struct TcpFlowLease {
     bridge: Weak<RefCell<StackBridge>>,
     handle: TcpFlowHandle,
@@ -182,6 +188,16 @@ impl SharedStackBridge {
         ))
     }
 
+    pub fn packet_port(&self) -> PacketPort {
+        let wake = Rc::new(PortWake::default());
+        self.wakes.borrow_mut().push(Rc::downgrade(&wake));
+        PacketPort {
+            bridge: Rc::downgrade(&self.inner),
+            wake,
+            closed: false,
+        }
+    }
+
     pub fn poll(&self) {
         self.inner.borrow_mut().poll();
         self.wakes.borrow_mut().retain(|wake| {
@@ -197,6 +213,83 @@ impl SharedStackBridge {
 
     pub fn managed_bytes(&self) -> usize {
         self.inner.borrow().managed_bytes()
+    }
+}
+
+impl PacketPort {
+    fn pending<T>(&self, context: &Context<'_>) -> Poll<io::Result<T>> {
+        *self.wake.waker.borrow_mut() = Some(context.waker().clone());
+        Poll::Pending
+    }
+
+    fn bridge(&self) -> io::Result<Rc<RefCell<StackBridge>>> {
+        self.bridge
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stack is stopped"))
+    }
+}
+
+impl DatagramIo for PacketPort {
+    fn poll_recv_datagram(
+        &mut self,
+        context: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<DatagramRecv>> {
+        if self.closed {
+            return Poll::Ready(Ok(DatagramRecv::Closed));
+        }
+        let bridge = match self.bridge() {
+            Ok(bridge) => bridge,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let mut bridge = bridge.borrow_mut();
+        let Some(required) = bridge.device.egress.front().map(Vec::len) else {
+            drop(bridge);
+            return self.pending(context);
+        };
+        if output.len() < required {
+            return Poll::Ready(Ok(DatagramRecv::BufferTooSmall(required)));
+        }
+        let packet = bridge.device.egress.pop_front().expect("front checked");
+        bridge.device.bytes -= packet.len();
+        output[..packet.len()].copy_from_slice(&packet);
+        Poll::Ready(Ok(DatagramRecv::Datagram(packet.len())))
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        context: &mut Context<'_>,
+        packet: &[u8],
+    ) -> Poll<io::Result<()>> {
+        if self.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "packet port is closed",
+            )));
+        }
+        if packet.is_empty() || packet.len() > u16::MAX as usize || !valid_ip_packet(packet) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet port input is invalid",
+            )));
+        }
+        let bridge = match self.bridge() {
+            Ok(bridge) => bridge,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let mut bridge = bridge.borrow_mut();
+        if bridge.device.bytes.saturating_add(packet.len()) > bridge.device.byte_limit {
+            drop(bridge);
+            return self.pending(context);
+        }
+        bridge.device.bytes += packet.len();
+        bridge.device.ingress.push_back(packet.to_vec());
+        Poll::Ready(Ok(()))
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        self.closed = true;
+        Ok(())
     }
 }
 
@@ -923,7 +1016,8 @@ impl PortPool {
 }
 
 struct BoundedDevice {
-    queue: VecDeque<Vec<u8>>,
+    ingress: VecDeque<Vec<u8>>,
+    egress: VecDeque<Vec<u8>>,
     bytes: usize,
     byte_limit: usize,
     mtu: usize,
@@ -934,7 +1028,8 @@ struct BoundedDevice {
 impl BoundedDevice {
     fn new(mtu: usize, byte_limit: usize) -> Self {
         Self {
-            queue: VecDeque::new(),
+            ingress: VecDeque::new(),
+            egress: VecDeque::new(),
             bytes: 0,
             byte_limit,
             mtu,
@@ -949,7 +1044,8 @@ struct BoundedRxToken {
 }
 
 struct BoundedTxToken<'a> {
-    queue: &'a mut VecDeque<Vec<u8>>,
+    ingress: &'a mut VecDeque<Vec<u8>>,
+    egress: &'a mut VecDeque<Vec<u8>>,
     bytes: &'a mut usize,
     byte_limit: usize,
     dropped: &'a mut usize,
@@ -963,12 +1059,13 @@ impl Device for BoundedDevice {
         if self.stopped {
             return None;
         }
-        let packet = self.queue.pop_front()?;
+        let packet = self.ingress.pop_front()?;
         self.bytes -= packet.len();
         Some((
             BoundedRxToken { packet },
             BoundedTxToken {
-                queue: &mut self.queue,
+                ingress: &mut self.ingress,
+                egress: &mut self.egress,
                 bytes: &mut self.bytes,
                 byte_limit: self.byte_limit,
                 dropped: &mut self.dropped,
@@ -981,7 +1078,8 @@ impl Device for BoundedDevice {
             return None;
         }
         Some(BoundedTxToken {
-            queue: &mut self.queue,
+            ingress: &mut self.ingress,
+            egress: &mut self.egress,
             bytes: &mut self.bytes,
             byte_limit: self.byte_limit,
             dropped: &mut self.dropped,
@@ -1015,11 +1113,31 @@ impl TxToken for BoundedTxToken<'_> {
         let result = function(&mut packet);
         if self.bytes.saturating_add(length) <= self.byte_limit {
             *self.bytes += length;
-            self.queue.push_back(packet);
+            if virtual_loopback_destination(&packet) {
+                self.ingress.push_back(packet);
+            } else {
+                self.egress.push_back(packet);
+            }
         } else {
             *self.dropped += 1;
         }
         result
+    }
+}
+
+fn valid_ip_packet(packet: &[u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => packet.len() >= 20,
+        Some(6) => packet.len() >= 40,
+        _ => false,
+    }
+}
+
+fn virtual_loopback_destination(packet: &[u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => packet.get(16).is_some_and(|first| *first == 127),
+        Some(6) => packet.get(24..40) == Some(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        _ => false,
     }
 }
 
@@ -1149,6 +1267,57 @@ mod tests {
         let second = bridge.open_tcp(metadata()).unwrap();
         assert_ne!(first, second);
         assert!(matches!(bridge.tcp_metadata(first), Err(StackError::Stale)));
+    }
+
+    #[test]
+    fn bounded_device_routes_loopback_and_external_packets_separately() {
+        let mut device = BoundedDevice::new(1280, 4096);
+        let mut external = vec![0; 20];
+        external[0] = 0x45;
+        external[16..20].copy_from_slice(&[203, 0, 113, 1]);
+        device
+            .transmit(Instant::from_millis(0))
+            .unwrap()
+            .consume(external.len(), |packet| packet.copy_from_slice(&external));
+        assert_eq!(device.egress.pop_front(), Some(external));
+        let mut loopback = vec![0; 20];
+        loopback[0] = 0x45;
+        loopback[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        device
+            .transmit(Instant::from_millis(0))
+            .unwrap()
+            .consume(loopback.len(), |packet| packet.copy_from_slice(&loopback));
+        assert_eq!(device.ingress.pop_front(), Some(loopback));
+    }
+
+    #[test]
+    fn packet_port_preserves_packet_boundaries_and_required_length() {
+        let bridge = shared_bridge();
+        let mut port = bridge.packet_port();
+        let mut context = Context::from_waker(Waker::noop());
+        let mut packet = vec![0; 20];
+        packet[0] = 0x45;
+        packet[16..20].copy_from_slice(&[203, 0, 113, 1]);
+        assert!(matches!(
+            port.poll_send_datagram(&mut context, &packet),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(bridge.inner.borrow().device.ingress.front(), Some(&packet));
+        {
+            let mut inner = bridge.inner.borrow_mut();
+            inner.device.egress.push_back(packet.clone());
+            inner.device.bytes += packet.len();
+        }
+        assert!(matches!(
+            port.poll_recv_datagram(&mut context, &mut [0; 19]),
+            Poll::Ready(Ok(DatagramRecv::BufferTooSmall(20)))
+        ));
+        let mut output = [0; 20];
+        assert!(matches!(
+            port.poll_recv_datagram(&mut context, &mut output),
+            Poll::Ready(Ok(DatagramRecv::Datagram(20)))
+        ));
+        assert_eq!(output.as_slice(), packet);
     }
 
     #[test]

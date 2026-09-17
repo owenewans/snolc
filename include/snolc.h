@@ -110,8 +110,11 @@ struct SnolAdapterApiV1 {
                            uint32_t status, SnolBytes reason);
     SnolStatus (*close_flow)(SnolHandle instance, SnolHandle flow);
     SnolStatus (*attach_datagram)(SnolHandle instance, SnolHandle flow,
-                                  SnolHandle stack_socket,
-                                  const SnolDatagramIoV1 *stack_socket_io);
+                                   SnolHandle stack_socket,
+                                   const SnolDatagramIoV1 *stack_socket_io);
+    SnolStatus (*attach_packet_port)(SnolHandle instance,
+                                     SnolHandle packet_port,
+                                     const SnolDatagramIoV1 *packet_port_io);
 };
 
 struct SnolProtectionApiV1 {
