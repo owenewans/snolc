@@ -389,6 +389,16 @@ impl Profile {
 }
 
 impl ProvisionProfile {
+    fn from_profile(profile: &Profile) -> Self {
+        Self {
+            wire_version: profile.wire_version,
+            server_id: profile.server_id.clone(),
+            endpoint: profile.endpoint.clone(),
+            modules: profile.modules.clone(),
+            server_pin: profile.server_pin.clone(),
+        }
+    }
+
     pub fn parse_toml(input: &str) -> Result<Self, ProfileError> {
         if input.is_empty() || input.len() > MAX_PROFILE_BYTES {
             return Err(ProfileError::Size);
@@ -402,13 +412,17 @@ impl ProvisionProfile {
     }
 
     fn with_credential(self, credential: &str) -> Result<Profile, ProfileError> {
+        self.with_secret(Secret::new(credential.to_owned()))
+    }
+
+    fn with_secret(self, credential: Secret) -> Result<Profile, ProfileError> {
         let profile = Profile {
             wire_version: self.wire_version,
             server_id: self.server_id,
             endpoint: self.endpoint,
             modules: self.modules,
             server_pin: self.server_pin,
-            credential: Secret::new(credential.to_owned()),
+            credential,
         };
         profile.validate()?;
         Ok(profile)
@@ -1158,6 +1172,16 @@ mod tests {
     #[test]
     fn secret_debug_is_redacted() {
         assert_eq!(format!("{:?}", profile().credential), "[redacted]");
+    }
+
+    #[test]
+    fn provision_profile_serialization_excludes_the_credential() {
+        let profile = profile();
+        let metadata = ProvisionProfile::from_profile(&profile);
+        let encoded = toml::to_string(&metadata).unwrap();
+        assert!(!encoded.contains(profile.credential.expose()));
+        assert!(!encoded.contains("credential"));
+        assert_eq!(ProvisionProfile::parse_toml(&encoded).unwrap(), metadata);
     }
 
     #[test]

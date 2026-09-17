@@ -1,7 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::{ffi::CStr, path::PathBuf};
 
-use jni::objects::JObject;
+use jni::objects::{JByteArray, JObject};
 use jni::{JValue, JavaVM, jni_sig, jni_str};
 use winit::event_loop::EventLoopProxy;
 use winit::platform::android::activity::AndroidApp;
@@ -20,10 +20,14 @@ fn android_main(app: AndroidApp) {
     };
     let request_app = app.clone();
     let protect_app = app.clone();
+    let store_app = app.clone();
+    let load_app = app.clone();
     let platform = PlatformHooks::android(
         native_library_directory,
         move || request_vpn(&request_app),
         move |socket| protect_socket(&protect_app, socket),
+        move |server_id, credential| store_credential(&store_app, server_id, credential),
+        move |server_id| load_credential(&load_app, server_id),
     );
     let _ = crate::native_ui::run_android(app, root, platform, |proxy| {
         let slot = EVENT_PROXY.get_or_init(|| Mutex::new(None));
@@ -75,6 +79,43 @@ fn protect_socket(app: &AndroidApp, socket: i64) -> bool {
         .z()
     })
     .unwrap_or(false)
+}
+
+fn store_credential(app: &AndroidApp, server_id: &str, credential: &str) -> bool {
+    with_activity(app, |env, activity| {
+        let server_id = env.new_string(server_id)?;
+        let credential = env.byte_array_from_slice(credential.as_bytes())?;
+        env.call_method(
+            activity,
+            jni_str!("storeCredential"),
+            jni_sig!("(Ljava/lang/String;[B)Z"),
+            &[JValue::from(&server_id), JValue::from(&credential)],
+        )?
+        .z()
+    })
+    .unwrap_or(false)
+}
+
+fn load_credential(app: &AndroidApp, server_id: &str) -> Option<String> {
+    with_activity(app, |env, activity| {
+        let server_id = env.new_string(server_id)?;
+        let output = env
+            .call_method(
+                activity,
+                jni_str!("loadCredential"),
+                jni_sig!("(Ljava/lang/String;)[B"),
+                &[JValue::from(&server_id)],
+            )?
+            .l()?;
+        if output.is_null() {
+            return Ok(None);
+        }
+        let output = unsafe { JByteArray::from_raw(env, output.into_raw() as jni::sys::jarray) };
+        let output = env.convert_byte_array(&output)?;
+        Ok(String::from_utf8(output).ok())
+    })
+    .ok()
+    .flatten()
 }
 
 fn with_activity<T>(

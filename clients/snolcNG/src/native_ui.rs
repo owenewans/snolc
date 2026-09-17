@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use crate::runtime::{ClientEvent, EngineRuntime};
 use crate::ui::{self, UiAction, UiDraft};
 use crate::{
-    AppState, ConnectionState, ModuleClass, Profile, generate_client_config, persist_client_config,
+    AppState, ConnectionState, ModuleClass, Profile, ProvisionProfile, Secret,
+    generate_client_config, persist_client_config,
 };
 use glutin::context::PossiblyCurrentContext;
 use glutin::display::Display;
@@ -120,10 +121,15 @@ pub enum UserEvent {
     Platform(NativeEvent),
 }
 
+type StoreCredential = dyn Fn(&str, &str) -> bool + Send + Sync;
+type LoadCredential = dyn Fn(&str) -> Option<String> + Send + Sync;
+
 pub struct PlatformHooks {
     android: bool,
     request_vpn: Arc<dyn Fn() -> bool + Send + Sync>,
     protect_socket: Arc<dyn Fn(i64) -> bool + Send + Sync>,
+    store_credential: Arc<StoreCredential>,
+    load_credential: Arc<LoadCredential>,
     native_library_directory: Option<PathBuf>,
 }
 
@@ -133,6 +139,8 @@ impl PlatformHooks {
             android: false,
             request_vpn: Arc::new(|| false),
             protect_socket: Arc::new(|_| true),
+            store_credential: Arc::new(|_, _| true),
+            load_credential: Arc::new(|_| None),
             native_library_directory: None,
         }
     }
@@ -142,11 +150,15 @@ impl PlatformHooks {
         native_library_directory: PathBuf,
         request_vpn: impl Fn() -> bool + Send + Sync + 'static,
         protect_socket: impl Fn(i64) -> bool + Send + Sync + 'static,
+        store_credential: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
+        load_credential: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
     ) -> Self {
         Self {
             android: true,
             request_vpn: Arc::new(request_vpn),
             protect_socket: Arc::new(protect_socket),
+            store_credential: Arc::new(store_credential),
+            load_credential: Arc::new(load_credential),
             native_library_directory: Some(native_library_directory),
         }
     }
@@ -173,7 +185,7 @@ impl DesktopApp {
     ) -> Self {
         let runtime_proxy = proxy.clone();
         let protect_socket = Arc::clone(&platform.protect_socket);
-        Self {
+        let mut application = Self {
             proxy,
             gl_window: None,
             gl: None,
@@ -189,16 +201,18 @@ impl DesktopApp {
             ),
             platform,
             vpn_fd: None,
-        }
+        };
+        application.restore_android_profiles();
+        application
     }
 
     fn apply(&mut self, action: UiAction) {
         match action {
             UiAction::SetScreen(screen) => self.state.set_screen(screen),
             UiAction::Import(uri) => {
-                let _ = self
-                    .state
-                    .import_profile(&uri, "manual import".into(), &BTreeSet::new());
+                if let Err(error) = self.import_profile(&uri) {
+                    self.state.denied(error);
+                }
             }
             UiAction::Select(index) => {
                 let _ = self.state.select(index);
@@ -250,6 +264,12 @@ impl DesktopApp {
     }
 
     fn start_profile(&mut self, mut profile: Profile) -> Result<(), String> {
+        if self.platform.android {
+            let credential = (self.platform.load_credential)(&profile.server_id)
+                .ok_or_else(|| "credential is unavailable in Android Keystore".to_owned())?;
+            profile.credential = Secret::new(credential);
+            profile.validate().map_err(|error| error.to_string())?;
+        }
         if let Some(fd) = self.vpn_fd {
             for module in &mut profile.modules {
                 if module.class == ModuleClass::Adapter
@@ -282,6 +302,68 @@ impl DesktopApp {
         self.runtime
             .start_with_cleanup(&path, cleanup)
             .map_err(|error| error.to_string())
+    }
+
+    fn import_profile(&mut self, uri: &str) -> Result<(), String> {
+        let profile = Profile::from_uri(uri).map_err(|error| error.to_string())?;
+        if self.platform.android {
+            if self
+                .state
+                .profiles
+                .iter()
+                .any(|existing| existing.profile.server_id == profile.server_id)
+            {
+                return Err("server_id is already imported".into());
+            }
+            if !(self.platform.store_credential)(&profile.server_id, profile.credential.expose()) {
+                return Err("Android Keystore rejected the credential".into());
+            }
+            let metadata = ProvisionProfile::from_profile(&profile);
+            let contents = toml::to_string(&metadata).map_err(|error| error.to_string())?;
+            let path = self
+                .root
+                .join("profiles")
+                .join(format!("{}.toml", profile.server_id));
+            crate::atomic_write(&path, contents.as_bytes()).map_err(|error| error.to_string())?;
+        }
+        self.state
+            .import_profile(uri, "manual import".into(), &BTreeSet::new())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn restore_android_profiles(&mut self) {
+        if !self.platform.android {
+            return;
+        }
+        let directory = self.root.join("profiles");
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten().take(crate::MAX_SUBSCRIPTION_PROFILES) {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(metadata) = ProvisionProfile::parse_toml(&contents) else {
+                continue;
+            };
+            let Some(credential) = (self.platform.load_credential)(&metadata.server_id) else {
+                continue;
+            };
+            let Ok(profile) = metadata.with_secret(Secret::new(credential)) else {
+                continue;
+            };
+            let Ok(uri) = profile.to_uri() else {
+                continue;
+            };
+            let _ = self
+                .state
+                .import_profile(&uri, "Android Keystore".into(), &BTreeSet::new());
+        }
     }
 
     fn platform_event(&mut self, event: NativeEvent) {
