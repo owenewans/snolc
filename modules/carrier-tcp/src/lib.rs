@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
@@ -12,6 +14,7 @@ use std::task::{Context, Poll, Waker};
 use async_io::Async;
 use futures::io::{AsyncRead, AsyncWrite};
 use serde::Deserialize;
+use snolc_sdk::HostApi;
 use snolc_sdk::abi::{
     self, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolCarrierApiV1, SnolIoResult,
     SnolModuleDescriptor, SnolWakeHandle,
@@ -56,6 +59,7 @@ impl Options {
 }
 
 struct InstanceState {
+    host: HostApi,
     mode: Mode,
     max_connections: usize,
     active_connections: usize,
@@ -167,7 +171,7 @@ unsafe extern "C" fn validate_config(
 unsafe extern "C" fn create(
     config: SnolBytes,
     _base: SnolBytes,
-    _host: *const abi::SnolHostApiV1,
+    host: *const abi::SnolHostApiV1,
     output: *mut u64,
 ) -> u32 {
     snolc_sdk::catch_status(|| {
@@ -181,6 +185,10 @@ unsafe extern "C" fn create(
         };
         let Some(output) = (unsafe { output.as_mut() }) else {
             return abi::STATUS_INVALID;
+        };
+        let host = match unsafe { HostApi::from_raw(host) } {
+            Ok(host) => host,
+            Err(status) => return status,
         };
         let (mode, max_connections, nodelay) = match options {
             Options::Connect {
@@ -208,6 +216,7 @@ unsafe extern "C" fn create(
             instances.borrow_mut().insert(
                 handle,
                 InstanceState {
+                    host,
                     mode,
                     max_connections,
                     active_connections: 0,
@@ -335,12 +344,102 @@ unsafe extern "C" fn connect(
                 };
             }
             if state.pending_connect.is_none() {
-                state.pending_connect = Some(Box::pin(Async::<TcpStream>::connect(endpoint)));
+                state.pending_connect = Some(Box::pin(protected_connect(endpoint, state.host)));
             }
             state.connect_wake.replace(wake);
             abi::STATUS_PENDING
         })
     })
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+async fn protected_connect(endpoint: SocketAddr, host: HostApi) -> io::Result<Async<TcpStream>> {
+    let domain = match endpoint {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    let raw = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_TCP,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { TcpStream::from_raw_fd(raw) };
+    host.protect_socket(i64::from(stream.as_raw_fd()))
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "socket protect failed"))?;
+    let result = match endpoint {
+        SocketAddr::V4(endpoint) => {
+            let [a, b, c, d] = endpoint.ip().octets();
+            let address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: endpoint.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([a, b, c, d]),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::connect(
+                    stream.as_raw_fd(),
+                    (&raw const address).cast::<libc::sockaddr>(),
+                    size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(endpoint) => {
+            let address = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: endpoint.port().to_be(),
+                sin6_flowinfo: endpoint.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: endpoint.ip().octets(),
+                },
+                sin6_scope_id: endpoint.scope_id(),
+            };
+            unsafe {
+                libc::connect(
+                    stream.as_raw_fd(),
+                    (&raw const address).cast::<libc::sockaddr>(),
+                    size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error);
+        }
+    }
+    let stream = Async::new(stream)?;
+    stream.writable().await?;
+    if let Some(error) = stream.get_ref().take_error()? {
+        return Err(error);
+    }
+    Ok(stream)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+async fn protected_connect(endpoint: SocketAddr, host: HostApi) -> io::Result<Async<TcpStream>> {
+    let stream = Async::<TcpStream>::connect(endpoint).await?;
+    #[cfg(unix)]
+    let socket = {
+        use std::os::fd::AsRawFd;
+        i64::from(stream.get_ref().as_raw_fd())
+    };
+    #[cfg(windows)]
+    let socket = {
+        use std::os::windows::io::AsRawSocket;
+        i64::try_from(stream.get_ref().as_raw_socket())
+            .map_err(|_| io::Error::other("socket handle does not fit i64"))?
+    };
+    host.protect_socket(socket)
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "socket protect failed"))?;
+    Ok(stream)
 }
 
 unsafe extern "C" fn accept(instance: u64, wake: SnolWakeHandle, output: *mut u64) -> u32 {
@@ -552,7 +651,39 @@ pub extern "C" fn snolc_module_entry() -> *const SnolModuleDescriptor {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
     use super::*;
+
+    struct ProtectState {
+        allow: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    unsafe extern "C" fn protect(context: *mut c_void, _socket: i64) -> u32 {
+        let state = unsafe { &*(context as *const ProtectState) };
+        state.calls.fetch_add(1, Ordering::Relaxed);
+        if state.allow.load(Ordering::Relaxed) {
+            abi::STATUS_OK
+        } else {
+            abi::STATUS_DENIED
+        }
+    }
+
+    fn host_api(state: &ProtectState) -> abi::SnolHostApiV1 {
+        abi::SnolHostApiV1 {
+            struct_size: size_of::<abi::SnolHostApiV1>() as u32,
+            reserved: 0,
+            context: (state as *const ProtectState).cast_mut().cast(),
+            now_monotonic_nanos: None,
+            set_timer: None,
+            emit_event: None,
+            context_get: None,
+            context_set: None,
+            protect_socket: Some(protect),
+        }
+    }
 
     #[test]
     fn strict_modes_require_explicit_limits() {
@@ -583,5 +714,32 @@ mod tests {
             server.read_exact(&mut output).await.unwrap();
             assert_eq!(&output, b"snolc");
         });
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn socket_protection_runs_before_connect_and_denial_closes_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let state = ProtectState {
+            allow: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        };
+        let raw = host_api(&state);
+        let host = unsafe { HostApi::from_raw(&raw) }.unwrap();
+        let error = async_io::block_on(protected_connect(listener.local_addr().unwrap(), host))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+
+        state.allow.store(true, Ordering::Relaxed);
+        let stream =
+            async_io::block_on(protected_connect(listener.local_addr().unwrap(), host)).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        assert_eq!(state.calls.load(Ordering::Relaxed), 2);
+        drop(stream);
     }
 }
