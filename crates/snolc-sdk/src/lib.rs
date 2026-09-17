@@ -14,6 +14,35 @@ pub use snolc_abi as abi;
 
 use std::task::{Context, Poll};
 
+#[derive(Clone, Copy)]
+pub struct HostApi(*const abi::SnolHostApiV1);
+
+impl HostApi {
+    /// # Safety
+    ///
+    /// `host` must remain valid while this wrapper is used.
+    pub unsafe fn from_raw(host: *const abi::SnolHostApiV1) -> Result<Self, u32> {
+        let Some(host) = (unsafe { host.as_ref() }) else {
+            return Err(abi::STATUS_INVALID);
+        };
+        if host.struct_size < size_of::<abi::SnolHostApiV1>() as u32 || host.reserved != 0 {
+            return Err(abi::STATUS_INVALID);
+        }
+        Ok(Self(host))
+    }
+
+    pub fn protect_socket(self, socket: i64) -> Result<(), u32> {
+        let host = unsafe { &*self.0 };
+        let protect = host.protect_socket.ok_or(abi::STATUS_UNSUPPORTED)?;
+        let status = unsafe { protect(host.context, socket) };
+        if status == abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+}
+
 pub struct StackSocket<T>(pub T);
 pub struct MuxStream<T>(pub T);
 
@@ -71,4 +100,38 @@ pub fn catch_status(function: impl FnOnce() -> u32) -> u32 {
 pub fn catch_io(function: impl FnOnce() -> abi::SnolIoResult) -> abi::SnolIoResult {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(function))
         .unwrap_or_else(|_| abi::SnolIoResult::error(abi::STATUS_INTERNAL))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+
+    use super::*;
+
+    unsafe extern "C" fn protect(context: *mut c_void, socket: i64) -> u32 {
+        let expected = context as usize as i64;
+        if socket == expected {
+            abi::STATUS_OK
+        } else {
+            abi::STATUS_DENIED
+        }
+    }
+
+    #[test]
+    fn host_api_forwards_socket_protection_status() {
+        let raw = abi::SnolHostApiV1 {
+            struct_size: size_of::<abi::SnolHostApiV1>() as u32,
+            reserved: 0,
+            context: 42usize as *mut c_void,
+            now_monotonic_nanos: None,
+            set_timer: None,
+            emit_event: None,
+            context_get: None,
+            context_set: None,
+            protect_socket: Some(protect),
+        };
+        let host = unsafe { HostApi::from_raw(&raw) }.unwrap();
+        assert_eq!(host.protect_socket(42), Ok(()));
+        assert_eq!(host.protect_socket(41), Err(abi::STATUS_DENIED));
+    }
 }

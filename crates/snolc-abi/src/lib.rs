@@ -284,6 +284,7 @@ pub type ContextGetFn = unsafe extern "C" fn(
 ) -> SnolStatus;
 pub type ContextSetFn =
     unsafe extern "C" fn(*mut c_void, SnolHandle, SnolBytes, SnolBytes) -> SnolStatus;
+pub type ProtectSocketFn = unsafe extern "C" fn(*mut c_void, i64) -> SnolStatus;
 
 #[repr(C)]
 pub struct SnolHostApiV1 {
@@ -295,6 +296,7 @@ pub struct SnolHostApiV1 {
     pub emit_event: Option<EmitEventFn>,
     pub context_get: Option<ContextGetFn>,
     pub context_set: Option<ContextSetFn>,
+    pub protect_socket: Option<ProtectSocketFn>,
 }
 
 unsafe impl Sync for SnolHostApiV1 {}

@@ -166,7 +166,8 @@ struct SnolHostApiV1 {
     SnolStatus (*context_get)(void *context, SnolHandle session, SnolBytes name,
                               SnolBytesMut output, size_t *written);
     SnolStatus (*context_set)(void *context, SnolHandle session, SnolBytes name,
-                              SnolBytes value);
+                               SnolBytes value);
+    SnolStatus (*protect_socket)(void *context, int64_t socket);
 };
 
 typedef struct SnolModuleDescriptor {

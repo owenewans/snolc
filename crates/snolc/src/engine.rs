@@ -38,6 +38,10 @@ type ControlSender = oneshot::Sender<Result<Vec<u8>, EngineError>>;
 
 pub trait Host: Send + Sync + 'static {
     fn engine_event(&self, event: &Event);
+
+    fn protect_socket(&self, _socket: i64) -> bool {
+        !cfg!(target_os = "android")
+    }
 }
 
 pub struct ValidatedConfig {
@@ -268,6 +272,7 @@ struct WakeState {
 }
 
 struct HostBridge {
+    host: Arc<dyn Host>,
     started: Instant,
     event_limit: usize,
     events: RefCell<VecDeque<Vec<u8>>>,
@@ -387,10 +392,12 @@ impl Engine {
             events: Arc::new(Mutex::new(Some(event_rx))),
             snapshot: Arc::clone(&snapshot),
         };
+        let host: Arc<dyn Host> = Arc::new(host);
         let engine = Self {
             validated,
-            host: Arc::new(host),
+            host: Arc::clone(&host),
             bridge: Box::new(HostBridge {
+                host,
                 started: Instant::now(),
                 event_limit: HOST_EVENT_LIMIT,
                 events: RefCell::new(VecDeque::new()),
@@ -418,7 +425,7 @@ impl Engine {
 
     async fn run_loop(mut self) -> Result<(), EngineError> {
         self.emit(Event::Lifecycle(Lifecycle::Starting));
-        let host_api = self.host_api();
+        let host_api = Box::new(self.host_api());
         for module in &mut self.validated.modules {
             if let Err(error) = module.create(&host_api) {
                 self.snapshot
@@ -710,6 +717,7 @@ impl Engine {
             emit_event: Some(host_emit_event),
             context_get: Some(host_context_get),
             context_set: Some(host_context_set),
+            protect_socket: Some(host_protect_socket),
         }
     }
 }
@@ -1772,6 +1780,20 @@ unsafe extern "C" fn host_context_set(
         .borrow_mut()
         .insert((session, name.to_vec()), value.to_vec());
     snolc_abi::STATUS_OK
+}
+
+unsafe extern "C" fn host_protect_socket(context: *mut c_void, socket: i64) -> u32 {
+    let Some(bridge) = (unsafe { (context as *const HostBridge).as_ref() }) else {
+        return snolc_abi::STATUS_INVALID;
+    };
+    if socket < 0 {
+        return snolc_abi::STATUS_INVALID;
+    }
+    if bridge.host.protect_socket(socket) {
+        snolc_abi::STATUS_OK
+    } else {
+        snolc_abi::STATUS_DENIED
+    }
 }
 
 unsafe fn read_bytes<'a>(bytes: snolc_abi::SnolBytes) -> Option<&'a [u8]> {
