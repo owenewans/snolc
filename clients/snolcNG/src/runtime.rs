@@ -205,6 +205,7 @@ fn run_engine(
         send(&events, &wake, RuntimeEvent::Ready(handle));
         engine.run().map_err(|error| error.to_string())
     })();
+    cleanup.remove();
     match result {
         Ok(()) => send(&events, &wake, RuntimeEvent::Stopped),
         Err(error) => send(&events, &wake, RuntimeEvent::Failed(error)),
