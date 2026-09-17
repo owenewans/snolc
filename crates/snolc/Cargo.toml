@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
 snolc-abi = { path = "../snolc-abi" }
 snolc-sdk = { path = "../snolc-sdk" }
 thiserror.workspace = true
+toml.workspace = true
