@@ -1017,8 +1017,14 @@ count = 16
         assert_eq!(usage["used_bytes"].as_integer(), Some(0));
         assert_eq!(usage["limit_bytes"].as_integer(), Some(1_000_000));
 
+        let credential_add = format!(
+            "method = \"credential.add\"\nclient_id = \"panel\"\nseq = 2\nuser_id = \"{user_id}\"\ncredential_sha256 = \"{}\"\n",
+            "aa".repeat(32)
+        );
+        let credential_response = drive_control(instance, credential_add.as_bytes());
+
         let skipped = format!(
-            "method = \"user.disable\"\nclient_id = \"panel\"\nseq = 3\nuser_id = \"{user_id}\"\nexpected_revision = 1\n"
+            "method = \"user.disable\"\nclient_id = \"panel\"\nseq = 4\nuser_id = \"{user_id}\"\nexpected_revision = 1\n"
         );
         assert!(matches!(
             control_instance(instance, skipped.as_bytes()),
@@ -1026,11 +1032,22 @@ count = 16
         ));
         shutdown_instance(instance);
         initialize(instance, options.as_bytes(), b"/tmp", std::ptr::null()).unwrap();
-        assert_eq!(drive_control(instance, create), response);
+        assert_eq!(
+            drive_control(instance, credential_add.as_bytes()),
+            credential_response
+        );
         let restored_usage = drive_control(instance, usage_request(user_id).as_bytes());
         let restored_usage: toml::Value =
             toml::from_str(std::str::from_utf8(&restored_usage).unwrap()).unwrap();
         assert_eq!(restored_usage["limit_bytes"].as_integer(), Some(1_000_000));
+        let revoke = format!(
+            "method = \"credential.revoke\"\nclient_id = \"panel\"\nseq = 3\ncredential_sha256 = \"{}\"\n",
+            "aa".repeat(32)
+        );
+        let revoke_response = drive_control(instance, revoke.as_bytes());
+        let revoke_response: toml::Value =
+            toml::from_str(std::str::from_utf8(&revoke_response).unwrap()).unwrap();
+        assert_eq!(revoke_response["status"].as_str(), Some("ok"));
         shutdown_instance(instance);
         fs::remove_dir_all(root).unwrap();
     }
