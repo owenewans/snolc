@@ -142,8 +142,20 @@ fn initialize(
         options.storage.queue_capacity,
     )
     .map_err(|_| abi::STATUS_IO)?;
-    let sequencer =
+    let mut sequencer =
         AdminSequencer::new(options.max_admin_clients).map_err(|_| abi::STATUS_INVALID)?;
+    let receipts = storage
+        .scan("client/".into(), options.max_admin_clients)
+        .map_err(storage_status)?
+        .recv()
+        .map_err(|_| abi::STATUS_IO)?
+        .map_err(storage_status)?;
+    for (key, receipt) in receipts {
+        let client_id = key.strip_prefix("client/").ok_or(abi::STATUS_INTERNAL)?;
+        sequencer
+            .restore(client_id.to_owned(), &receipt)
+            .map_err(admin_status)?;
+    }
     STATES.with(|states| {
         states.borrow_mut().insert(
             instance,
@@ -883,6 +895,9 @@ count = 16
             control_instance(instance, skipped.as_bytes()),
             Err(abi::STATUS_DENIED)
         ));
+        shutdown_instance(instance);
+        initialize(instance, options.as_bytes(), b"/tmp", std::ptr::null()).unwrap();
+        assert_eq!(drive_control(instance, create), response);
         shutdown_instance(instance);
         fs::remove_dir_all(root).unwrap();
     }
