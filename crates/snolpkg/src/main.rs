@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use snolpkg::{ExtractLimits, InstallOptions, install_binary};
+use snolpkg::{ExtractLimits, InstallOptions, install_binary, install_source};
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -39,8 +39,26 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
             println!("{}", result.package);
             Ok(())
         }
-        [command, mode, ..] if command == "add" && mode == "-s" => {
-            Err("source installation is unavailable".into())
+        [command, mode, git, module] if command == "add" && mode == "-s" => {
+            let root = package_root()?;
+            let config: InstallerConfig = toml::from_str(
+                &fs::read_to_string(root.join("snolpkg.toml"))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let result = install_source(
+                git,
+                module,
+                &InstallOptions {
+                    root,
+                    target: env!("SNOLPKG_TARGET").into(),
+                    limits: config.limits(),
+                    offline: config.offline,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            println!("{}", result.package);
+            Ok(())
         }
         _ => Err(usage().into()),
     }

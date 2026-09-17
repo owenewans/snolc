@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -116,6 +117,7 @@ pub struct Artifact {
     pub url: String,
     pub byte_size: u64,
     pub sha256: String,
+    pub build_output: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -200,6 +202,7 @@ impl PublicationManifest {
         let mut targets = BTreeSet::new();
         for artifact in &self.artifacts {
             validate_sha256(&artifact.sha256)?;
+            validate_relative_path(&artifact.build_output)?;
             if artifact.target.is_empty()
                 || artifact.minimum_isa.is_empty()
                 || artifact.byte_size == 0
@@ -472,6 +475,104 @@ pub fn install_binary(
     install_extracted(&publication.manifest, source, artifact, &content, options)
 }
 
+pub fn install_source(
+    git: &str,
+    module_name: &str,
+    options: &InstallOptions,
+) -> Result<InstallResult, PackageError> {
+    if !options.root.is_absolute() || options.target.is_empty() {
+        return Err(PackageError::InstallOptions);
+    }
+    options.limits.validate()?;
+    fs::create_dir_all(&options.root)?;
+    let install_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(options.root.join(".install.lock"))?;
+    install_lock.lock()?;
+    let sources = Sources::parse(&fs::read_to_string(options.root.join("sources.toml"))?)?;
+    let source = sources.find(git)?;
+    let staging = Staging::new(&options.root)?;
+    if options.offline && git.starts_with("https://") {
+        return Err(PackageError::OfflineNetwork);
+    }
+    let publication = load_publication(git, module_name, &staging.path.join("publication"))?;
+    if source.trust == TrustMode::Signed {
+        verify_manifest(
+            &publication.manifest_bytes,
+            &publication.signature_bytes,
+            source,
+        )?;
+    }
+    let package_module = publication
+        .manifest
+        .name
+        .split_once('/')
+        .map(|(_, module)| module)
+        .ok_or(PackageError::ManifestValue)?;
+    if package_module != module_name {
+        return Err(PackageError::ManifestValue);
+    }
+    let artifact = publication
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.target == options.target)
+        .ok_or(PackageError::Target)?;
+    let source_tree = staging.path.join("source");
+    checkout_revision(git, &publication.manifest.source.revision, &source_tree)?;
+    let build_directory = staging.path.join("build");
+    let status = Command::new("rustup")
+        .arg("run")
+        .arg(&publication.manifest.toolchain)
+        .arg("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--locked")
+        .arg("--package")
+        .arg(&publication.manifest.build.package)
+        .arg("--target")
+        .arg(&artifact.target)
+        .current_dir(&source_tree)
+        .env("CARGO_TARGET_DIR", &build_directory)
+        .status()?;
+    if !status.success() {
+        return Err(PackageError::Build(status.code()));
+    }
+    let built = build_directory
+        .join(&artifact.target)
+        .join(&artifact.build_output);
+    let metadata = fs::metadata(&built)?;
+    if !metadata.is_file() || metadata.len() > options.limits.max_file_bytes {
+        return Err(PackageError::Entry);
+    }
+    let content = staging.path.join("content");
+    let entry = content.join(&publication.manifest.entry);
+    fs::create_dir_all(entry.parent().ok_or(PackageError::Path)?)?;
+    fs::copy(&built, &entry)?;
+    copy_notices(&source_tree, &content)?;
+    install_extracted(&publication.manifest, source, artifact, &content, options)
+}
+
+fn copy_notices(source: &Path, content: &Path) -> Result<(), PackageError> {
+    for name in [
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE.txt",
+        "NOTICE",
+        "NOTICE.md",
+        "NOTICE.txt",
+    ] {
+        let input = source.join(name);
+        if input.is_file() {
+            fs::copy(input, content.join(name))?;
+        }
+    }
+    Ok(())
+}
+
 fn download_artifact(artifact: &Artifact, output: &Path) -> Result<(), PackageError> {
     let mut input: Box<dyn Read> = if let Some(path) = artifact.url.strip_prefix("file://") {
         let path = Path::new(path);
@@ -552,7 +653,7 @@ fn install_extracted(
         .join(name)
         .join(&manifest.package_version)
         .join(&artifact.target)
-        .join(&artifact.sha256);
+        .join(&library_hash);
     fs::create_dir_all(store.parent().ok_or(PackageError::Path)?)?;
     if store.exists() {
         let existing = store.join(&manifest.entry);
@@ -840,6 +941,8 @@ pub enum PackageError {
     ArtifactSize,
     #[error("artifact hash does not match manifest")]
     ArtifactHash,
+    #[error("source build failed with exit code {0:?}")]
+    Build(Option<i32>),
     #[error("module entry is missing")]
     Entry,
     #[error("immutable store content conflicts")]
@@ -890,6 +993,7 @@ minimum_libc = "2.28"
 url = "https://example.invalid/carrier.tar.gz"
 byte_size = 1024
 sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+build_output = "release/libsnolc_carrier_tcp.so"
 "#;
 
     #[test]
@@ -1159,6 +1263,7 @@ minimum_libc = "2.28"
 url = "file://{}"
 byte_size = {}
 sha256 = "{}"
+build_output = "release/libtest.so"
 "#,
             env!("SNOLPKG_TARGET"),
             artifact_path.display(),
@@ -1210,6 +1315,138 @@ sha256 = "{}"
         assert_eq!(
             fs::read(result.store.join("lib/module.so")).unwrap(),
             b"native module"
+        );
+        remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn builds_pinned_source_with_locked_cargo_and_keeps_license() {
+        let root = temporary_directory("source-e2e");
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        run_git(&repository, &["init", "-q"]);
+        fs::create_dir(repository.join("src")).unwrap();
+        fs::write(
+            repository.join("Cargo.toml"),
+            r#"[package]
+name = "source-test"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            repository.join("Cargo.lock"),
+            r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "source-test"
+version = "0.0.1"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            repository.join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(repository.join("LICENSE"), "license text\n").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=snolpkg test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "source",
+            ],
+        );
+        let source_revision = git_output(&repository, &["rev-parse", "HEAD"]);
+        let manifest = format!(
+            r#"name = "owenewans/source-test"
+authors = ["Owen Ewans"]
+license = "Unlicense"
+package_version = "0.0.1"
+wire_version = 1
+classes = ["carrier"]
+family = "test"
+entry = "lib/module.so"
+toolchain = "1.98.1"
+dependencies = []
+
+[source]
+revision = "{}"
+
+[build]
+package = "source-test"
+
+[[artifacts]]
+target = "{}"
+minimum_isa = "test"
+minimum_libc = "2.28"
+url = "file:///missing-source-artifact"
+byte_size = 1
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+build_output = "release/libsource_test.so"
+"#,
+            source_revision,
+            env!("SNOLPKG_TARGET")
+        );
+        fs::create_dir(repository.join("snolpkg")).unwrap();
+        fs::write(repository.join("snolpkg/source-test.toml"), manifest).unwrap();
+        fs::write(repository.join("snolpkg/source-test.toml.sig"), [0; 64]).unwrap();
+        run_git(&repository, &["add", "snolpkg"]);
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=snolpkg test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "publication",
+            ],
+        );
+        let packages = root.join("packages");
+        fs::create_dir(&packages).unwrap();
+        fs::write(
+            packages.join("sources.toml"),
+            format!(
+                "[[sources]]\nid = \"local\"\ngit = \"{}\"\ntrust = \"local-development\"\n",
+                repository.display()
+            ),
+        )
+        .unwrap();
+        let result = install_source(
+            repository.to_str().unwrap(),
+            "source-test",
+            &InstallOptions {
+                root: packages,
+                target: env!("SNOLPKG_TARGET").into(),
+                limits: ExtractLimits {
+                    max_files: 16,
+                    max_total_bytes: 16 * 1024 * 1024,
+                    max_file_bytes: 16 * 1024 * 1024,
+                },
+                offline: true,
+            },
+        )
+        .unwrap();
+        assert!(result.store.join("lib/module.so").is_file());
+        assert_eq!(
+            fs::read_to_string(result.store.join("LICENSE")).unwrap(),
+            "license text\n"
         );
         remove_readonly_tree(&root);
     }
