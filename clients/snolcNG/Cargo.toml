@@ -32,6 +32,7 @@ egui_glow = { workspace = true, optional = true }
 glow = { workspace = true, optional = true }
 glutin = { workspace = true, optional = true }
 glutin-winit = { workspace = true, optional = true }
+getrandom.workspace = true
 libc = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
@@ -40,6 +41,7 @@ snolc = { path = "../../crates/snolc" }
 thiserror.workspace = true
 toml.workspace = true
 winit = { workspace = true, optional = true }
+zeroize.workspace = true
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 egui-winit = { workspace = true, optional = true, features = ["clipboard", "links", "wayland", "x11"] }

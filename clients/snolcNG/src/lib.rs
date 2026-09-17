@@ -11,6 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 #[cfg(all(feature = "gui", target_os = "android"))]
 mod android;
@@ -32,8 +33,18 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct Secret(String);
 
 impl Secret {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -52,6 +63,30 @@ pub struct Profile {
     pub modules: Vec<ProfileModule>,
     pub server_pin: String,
     pub credential: Secret,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionProfile {
+    pub wire_version: u32,
+    pub server_id: String,
+    pub endpoint: String,
+    pub modules: Vec<ProfileModule>,
+    pub server_pin: String,
+}
+
+pub struct AccessProvisioning {
+    profile: ProvisionProfile,
+    user_id: String,
+    secret: [u8; 32],
+    request: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvisionedAccess {
+    pub uri: String,
+    pub user_id: String,
+    pub revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -351,6 +386,119 @@ impl Profile {
         }
         Ok(())
     }
+}
+
+impl ProvisionProfile {
+    pub fn parse_toml(input: &str) -> Result<Self, ProfileError> {
+        if input.is_empty() || input.len() > MAX_PROFILE_BYTES {
+            return Err(ProfileError::Size);
+        }
+        let profile: Self = toml::from_str(input)?;
+        profile
+            .clone()
+            .with_credential("provisioning-check")?
+            .validate()?;
+        Ok(profile)
+    }
+
+    fn with_credential(self, credential: &str) -> Result<Profile, ProfileError> {
+        let profile = Profile {
+            wire_version: self.wire_version,
+            server_id: self.server_id,
+            endpoint: self.endpoint,
+            modules: self.modules,
+            server_pin: self.server_pin,
+            credential: Secret::new(credential.to_owned()),
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+}
+
+impl AccessProvisioning {
+    pub fn new(
+        profile: ProvisionProfile,
+        user_id: &str,
+        client_id: &str,
+        seq: u64,
+    ) -> Result<Self, ProfileError> {
+        profile.clone().with_credential("provisioning-check")?;
+        if user_id.len() != 32
+            || !user_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            || !valid_name(client_id)
+            || seq == 0
+        {
+            return Err(ProfileError::Provisioning);
+        }
+        let mut secret = [0; 32];
+        getrandom::fill(&mut secret).map_err(|_| ProfileError::Random)?;
+        let digest = encode_hex(&Sha256::digest(secret));
+        let request = toml::to_string(&CredentialAddRequest {
+            method: "credential.add",
+            client_id,
+            seq,
+            user_id,
+            credential_sha256: &digest,
+        })?
+        .into_bytes();
+        Ok(Self {
+            profile,
+            user_id: user_id.to_owned(),
+            secret,
+            request,
+        })
+    }
+
+    pub fn request(&self) -> &[u8] {
+        &self.request
+    }
+
+    pub fn finish(mut self, response: &[u8]) -> Result<ProvisionedAccess, ProfileError> {
+        if response.is_empty() || response.len() > 16_384 {
+            return Err(ProfileError::ControlResponse);
+        }
+        let response = std::str::from_utf8(response).map_err(|_| ProfileError::ControlResponse)?;
+        let response: CredentialAddResponse =
+            toml::from_str(response).map_err(|_| ProfileError::ControlResponse)?;
+        if response.status != "ok" || response.revision == 0 || response.user_id != self.user_id {
+            return Err(ProfileError::ControlResponse);
+        }
+        let mut credential = encode_hex(&self.secret);
+        let profile = self.profile.clone().with_credential(&credential)?;
+        credential.zeroize();
+        self.secret.zeroize();
+        let uri = profile.to_uri()?;
+        Ok(ProvisionedAccess {
+            uri,
+            user_id: response.user_id,
+            revision: response.revision,
+        })
+    }
+}
+
+impl Drop for AccessProvisioning {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+#[derive(Serialize)]
+struct CredentialAddRequest<'a> {
+    method: &'static str,
+    client_id: &'a str,
+    seq: u64,
+    user_id: &'a str,
+    credential_sha256: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialAddResponse {
+    status: String,
+    revision: u64,
+    user_id: String,
 }
 
 pub fn fetch_subscription(url: &str, bearer: &Secret) -> Result<Vec<Profile>, ProfileError> {
@@ -929,6 +1077,12 @@ pub enum ProfileError {
     PackageApproval,
     #[error("bundled native module is unavailable or invalid")]
     BundledModule,
+    #[error("credential generation failed")]
+    Random,
+    #[error("provisioning input is invalid")]
+    Provisioning,
+    #[error("policy control response is invalid")]
+    ControlResponse,
 }
 
 #[cfg(test)]
@@ -950,6 +1104,17 @@ mod tests {
             ],
             server_pin: "server-pin".into(),
             credential: Secret("credential".into()),
+        }
+    }
+
+    fn provision_profile() -> ProvisionProfile {
+        let profile = profile();
+        ProvisionProfile {
+            wire_version: profile.wire_version,
+            server_id: profile.server_id.clone(),
+            endpoint: profile.endpoint.clone(),
+            modules: profile.modules.clone(),
+            server_pin: profile.server_pin.clone(),
         }
     }
 
@@ -993,6 +1158,62 @@ mod tests {
     #[test]
     fn secret_debug_is_redacted() {
         assert_eq!(format!("{:?}", profile().credential), "[redacted]");
+    }
+
+    #[test]
+    fn provisioning_registers_only_the_digest_and_returns_one_profile() {
+        let user_id = "00112233445566778899aabbccddeeff";
+        let provisioning =
+            AccessProvisioning::new(provision_profile(), user_id, "panel", 7).unwrap();
+        let request: toml::Value =
+            toml::from_str(std::str::from_utf8(provisioning.request()).unwrap()).unwrap();
+        assert_eq!(request["method"].as_str(), Some("credential.add"));
+        assert_eq!(request["client_id"].as_str(), Some("panel"));
+        assert_eq!(request["seq"].as_integer(), Some(7));
+        assert_eq!(request["user_id"].as_str(), Some(user_id));
+        let digest = request["credential_sha256"].as_str().unwrap().to_owned();
+        assert_eq!(digest.len(), 64);
+
+        let access = provisioning
+            .finish(format!("status = \"ok\"\nrevision = 2\nuser_id = \"{user_id}\"\n").as_bytes())
+            .unwrap();
+        let profile = Profile::from_uri(&access.uri).unwrap();
+        assert_eq!(access.user_id, user_id);
+        assert_eq!(access.revision, 2);
+        assert_eq!(profile.credential.expose().len(), 64);
+        let (pairs, remainder) = profile.credential.expose().as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let credential = pairs
+            .iter()
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(pair, 16).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(encode_hex(&Sha256::digest(credential)), digest);
+        assert!(!access.uri.contains(profile.credential.expose()));
+    }
+
+    #[test]
+    fn provisioning_rejects_mismatched_or_extended_control_responses() {
+        let user_id = "00112233445566778899aabbccddeeff";
+        let provisioning =
+            AccessProvisioning::new(provision_profile(), user_id, "panel", 1).unwrap();
+        assert!(matches!(
+            provisioning.finish(
+                b"status = \"ok\"\nrevision = 2\nuser_id = \"ffeeddccbbaa99887766554433221100\"\n"
+            ),
+            Err(ProfileError::ControlResponse)
+        ));
+
+        let provisioning =
+            AccessProvisioning::new(provision_profile(), user_id, "panel", 2).unwrap();
+        assert!(matches!(
+            provisioning.finish(
+                b"status = \"ok\"\nrevision = 2\nuser_id = \"00112233445566778899aabbccddeeff\"\nsecret = \"leak\"\n"
+            ),
+            Err(ProfileError::ControlResponse)
+        ));
     }
 
     #[test]
