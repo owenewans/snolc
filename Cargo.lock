@@ -603,6 +603,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "snolc-carrier-tcp"
+version = "0.0.1"
+dependencies = [
+ "async-io",
+ "futures",
+ "serde",
+ "snolc-sdk",
+ "toml",
+]
+
+[[package]]
 name = "snolc-policy-dummy"
 version = "0.0.1"
 dependencies = [
