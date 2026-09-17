@@ -2265,6 +2265,88 @@ mod tests {
         assert_eq!(&response, b"reply");
     }
 
+    #[test]
+    fn packet_ipv6_tcp_and_udp_reach_smoltcp_sockets() {
+        let server = shared_bridge();
+        let mut client_device = BoundedDevice::new(1280, 262_144);
+        let mut client_interface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut client_device,
+            Instant::from_millis(0),
+        );
+        let client_address = Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 2);
+        client_interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::Ipv6(client_address), 64))
+                .unwrap();
+        });
+        client_interface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1))
+            .unwrap();
+        let destination_address = Ipv6Address::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 9);
+        let mut client_sockets = SocketSet::new(Vec::new());
+        let tcp_handle = client_sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 4096]),
+            tcp::SocketBuffer::new(vec![0; 4096]),
+        ));
+        let udp_handle = client_sockets.add(fixture_udp_socket());
+        {
+            let context = client_interface.context();
+            client_sockets
+                .get_mut::<tcp::Socket>(tcp_handle)
+                .connect(
+                    context,
+                    IpEndpoint::new(IpAddress::Ipv6(destination_address), 443),
+                    40_001,
+                )
+                .unwrap();
+        }
+        client_sockets
+            .get_mut::<udp::Socket>(udp_handle)
+            .bind(40_002)
+            .unwrap();
+        client_sockets
+            .get_mut::<udp::Socket>(udp_handle)
+            .send_slice(
+                b"ipv6",
+                IpEndpoint::new(IpAddress::Ipv6(destination_address), 53),
+            )
+            .unwrap();
+        for tick in 0..128 {
+            poll_fixture_client(
+                &mut client_interface,
+                &mut client_device,
+                &mut client_sockets,
+                tick,
+            );
+            move_egress_to_ingress(&mut client_device, &mut server.inner.borrow_mut().device);
+            server.poll();
+            move_egress_to_ingress(&mut server.inner.borrow_mut().device, &mut client_device);
+            if client_sockets.get::<tcp::Socket>(tcp_handle).state() == tcp::State::Established
+                && server.inner.borrow().pending_packet_udp.len() == 1
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            client_sockets.get::<tcp::Socket>(tcp_handle).state(),
+            tcp::State::Established
+        );
+        let (tcp_metadata, _tcp_port) = server.accept_packet_tcp().unwrap().unwrap();
+        let (udp_metadata, mut udp_port) = server.accept_packet_udp().unwrap().unwrap();
+        let destination: std::net::Ipv6Addr = destination_address;
+        assert_eq!(tcp_metadata.destination, Destination::Ipv6(destination));
+        assert_eq!(udp_metadata.destination, Destination::Ipv6(destination));
+        let mut context = Context::from_waker(Waker::noop());
+        let mut output = [0; 4];
+        assert!(matches!(
+            udp_port.poll_recv_datagram(&mut context, &mut output),
+            Poll::Ready(Ok(DatagramRecv::Datagram(4)))
+        ));
+        assert_eq!(&output, b"ipv6");
+    }
+
     fn fixture_udp_socket() -> udp::Socket<'static> {
         udp::Socket::new(
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
