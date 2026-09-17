@@ -1,13 +1,17 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glutin::context::PossiblyCurrentContext;
 use glutin::display::Display;
 use glutin::surface::{Surface, WindowSurface};
+use snolc::Lifecycle;
 use snolc_ng::AppState;
+use snolc_ng::runtime::{ClientEvent, EngineRuntime};
 use snolc_ng::ui::{UiAction, UiDraft};
+use snolc_ng::{generate_client_config, persist_client_config};
 use winit::raw_window_handle::HasWindowHandle;
 
 struct GlWindow {
@@ -104,6 +108,7 @@ impl GlWindow {
 
 enum UserEvent {
     Repaint(Duration),
+    Runtime,
 }
 
 struct DesktopApp {
@@ -113,10 +118,13 @@ struct DesktopApp {
     egui: Option<egui_glow::EguiGlow>,
     state: AppState,
     draft: UiDraft,
+    root: PathBuf,
+    runtime: EngineRuntime,
 }
 
 impl DesktopApp {
-    fn new(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Self {
+    fn new(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root: PathBuf) -> Self {
+        let runtime_proxy = proxy.clone();
         Self {
             proxy,
             gl_window: None,
@@ -124,6 +132,10 @@ impl DesktopApp {
             egui: None,
             state: AppState::default(),
             draft: UiDraft::default(),
+            root,
+            runtime: EngineRuntime::new(move || {
+                let _ = runtime_proxy.send_event(UserEvent::Runtime);
+            }),
         }
     }
 
@@ -142,14 +154,66 @@ impl DesktopApp {
                 let _ = self.state.approve_package(&package);
             }
             UiAction::Connect => {
-                let _ = self.state.begin_connect();
+                if let Err(error) = self.connect() {
+                    self.state.denied(error);
+                }
             }
-            UiAction::Disconnect => self.state.stopped("disconnected".into()),
+            UiAction::Disconnect => {
+                if let Err(error) = self.runtime.request_shutdown() {
+                    self.state.stopped(error.to_string());
+                }
+            }
             UiAction::Export => {
                 if let Ok(profile) = self.state.selected_profile() {
                     self.draft.advanced_config = profile.profile.to_uri().unwrap_or_default();
                 }
             }
+        }
+    }
+
+    fn connect(&mut self) -> Result<(), String> {
+        self.state
+            .begin_connect()
+            .map_err(|error| error.to_string())?;
+        let profile = self
+            .state
+            .selected_profile()
+            .map_err(|error| error.to_string())?
+            .profile
+            .clone();
+        let generated =
+            generate_client_config(&profile, &self.root).map_err(|error| error.to_string())?;
+        self.draft.advanced_config = generated.main_toml.clone();
+        let path =
+            persist_client_config(&generated, &self.root).map_err(|error| error.to_string())?;
+        self.runtime.start(&path).map_err(|error| error.to_string())
+    }
+
+    fn drain_runtime(&mut self) {
+        for event in self.runtime.drain() {
+            match event {
+                ClientEvent::Starting => {
+                    self.state.connection = snolc_ng::ConnectionState::Connecting;
+                }
+                ClientEvent::Engine(snolc::Event::Lifecycle(Lifecycle::Running)) => {
+                    self.state.connected();
+                }
+                ClientEvent::Engine(snolc::Event::Lifecycle(Lifecycle::Stopped))
+                | ClientEvent::Stopped => self.state.stopped("engine stopped".into()),
+                ClientEvent::Engine(snolc::Event::Lifecycle(Lifecycle::Failed)) => {
+                    self.state.stopped("engine failed".into());
+                }
+                ClientEvent::Engine(snolc::Event::ModuleError { message, .. }) => {
+                    self.state.stopped(message);
+                }
+                ClientEvent::Failed(error) => self.state.stopped(error),
+                ClientEvent::Engine(_) => {}
+            }
+        }
+        if self.state.take_repaint_request()
+            && let Some(window) = &self.gl_window
+        {
+            window.window.request_redraw();
         }
     }
 }
@@ -241,6 +305,7 @@ impl winit::application::ApplicationHandler<UserEvent> for DesktopApp {
                         }),
                 );
             }
+            UserEvent::Runtime => self.drain_runtime(),
         }
     }
 
@@ -257,18 +322,19 @@ impl winit::application::ApplicationHandler<UserEvent> for DesktopApp {
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        let _ = self.runtime.request_shutdown();
         if let Some(egui) = &mut self.egui {
             egui.destroy();
         }
     }
 }
 
-pub fn run() -> Result<(), String> {
+pub fn run(root: PathBuf) -> Result<(), String> {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|error| error.to_string())?;
     let proxy = event_loop.create_proxy();
     event_loop
-        .run_app(&mut DesktopApp::new(proxy))
+        .run_app(&mut DesktopApp::new(proxy, root))
         .map_err(|error| error.to_string())
 }
