@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use flate2::read::GzDecoder;
@@ -31,6 +32,14 @@ impl ExtractLimits {
 pub struct ExtractReport {
     pub files: usize,
     pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Publication {
+    pub revision: String,
+    pub manifest_bytes: Vec<u8>,
+    pub signature_bytes: Vec<u8>,
+    pub manifest: PublicationManifest,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -304,6 +313,71 @@ pub fn extract_tar_gz<R: Read>(
     Ok(ExtractReport { files, total_bytes })
 }
 
+pub fn load_publication(
+    git: &str,
+    module_name: &str,
+    clone_directory: &Path,
+) -> Result<Publication, PackageError> {
+    validate_module_name(module_name)?;
+    if git.starts_with("https://") {
+        if clone_directory.exists() {
+            return Err(PackageError::CloneDirectory);
+        }
+        let mut prepare = gix::prepare_clone_bare(git, clone_directory)
+            .map_err(|error| PackageError::Git(error.to_string()))?;
+        let interrupt = AtomicBool::new(false);
+        let (repository, _) = prepare
+            .fetch_only(gix::progress::Discard, &interrupt)
+            .map_err(|error| PackageError::Git(error.to_string()))?;
+        read_publication(&repository, module_name)
+    } else {
+        let path = Path::new(git);
+        if !path.is_absolute() {
+            return Err(PackageError::GitSource);
+        }
+        let repository = gix::open(path).map_err(|error| PackageError::Git(error.to_string()))?;
+        read_publication(&repository, module_name)
+    }
+}
+
+fn read_publication(
+    repository: &gix::Repository,
+    module_name: &str,
+) -> Result<Publication, PackageError> {
+    let commit = repository
+        .head_commit()
+        .map_err(|error| PackageError::Git(error.to_string()))?;
+    let revision = commit.id().to_string();
+    let tree = commit
+        .tree()
+        .map_err(|error| PackageError::Git(error.to_string()))?;
+    let manifest_path = PathBuf::from("snolpkg").join(format!("{module_name}.toml"));
+    let signature_path = PathBuf::from("snolpkg").join(format!("{module_name}.toml.sig"));
+    let manifest_bytes = read_blob(&tree, &manifest_path)?;
+    let signature_bytes = read_blob(&tree, &signature_path)?;
+    let manifest = PublicationManifest::parse(&manifest_bytes)?;
+    Ok(Publication {
+        revision,
+        manifest_bytes,
+        signature_bytes,
+        manifest,
+    })
+}
+
+fn read_blob(tree: &gix::Tree<'_>, path: &Path) -> Result<Vec<u8>, PackageError> {
+    let entry = tree
+        .lookup_entry_by_path(path)
+        .map_err(|error| PackageError::Git(error.to_string()))?
+        .ok_or(PackageError::PublicationFile)?;
+    let object = entry
+        .object()
+        .map_err(|error| PackageError::Git(error.to_string()))?;
+    if object.kind != gix::object::Kind::Blob || object.data.len() > MAX_MANIFEST_BYTES {
+        return Err(PackageError::PublicationFile);
+    }
+    Ok(object.data.clone())
+}
+
 pub fn decode_hex(input: &str) -> Result<Vec<u8>, PackageError> {
     if !input.len().is_multiple_of(2) || !input.is_ascii() {
         return Err(PackageError::Hex);
@@ -331,6 +405,17 @@ fn validate_package_name(name: &str) -> Result<(), PackageError> {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         })
+    {
+        return Err(PackageError::ManifestValue);
+    }
+    Ok(())
+}
+
+fn validate_module_name(name: &str) -> Result<(), PackageError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(PackageError::ManifestValue);
     }
@@ -392,12 +477,21 @@ pub enum PackageError {
     ArchiveSize,
     #[error("I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("Git operation failed: {0}")]
+    Git(String),
+    #[error("Git source must be HTTPS or an absolute local path")]
+    GitSource,
+    #[error("clone directory already exists")]
+    CloneDirectory,
+    #[error("publication file is missing or invalid")]
+    PublicationFile,
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Cursor;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -546,6 +640,39 @@ trust = "local-development"
         fs::remove_dir_all(staging).unwrap();
     }
 
+    #[test]
+    fn reads_publication_from_pinned_git_objects_without_checkout() {
+        let root = temporary_directory("git-publication");
+        run_git(&root, &["init", "-q"]);
+        fs::create_dir(root.join("snolpkg")).unwrap();
+        fs::write(root.join("snolpkg/test.toml"), MANIFEST).unwrap();
+        fs::write(root.join("snolpkg/test.toml.sig"), [9; 64]).unwrap();
+        run_git(
+            &root,
+            &["add", "snolpkg/test.toml", "snolpkg/test.toml.sig"],
+        );
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.name=snolpkg test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "publication",
+            ],
+        );
+        let clone = root.join("unused-clone");
+        let publication = load_publication(root.to_str().unwrap(), "test", &clone).unwrap();
+        assert_eq!(publication.signature_bytes, [9; 64]);
+        assert_eq!(publication.manifest.name, "owenewans/carrier-tcp");
+        assert_eq!(publication.revision.len(), 40);
+        assert!(!clone.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn archive_with(build: impl FnOnce(&mut Builder<GzEncoder<Vec<u8>>>)) -> Vec<u8> {
         let encoder = GzEncoder::new(Vec::new(), Compression::fast());
         let mut builder = Builder::new(encoder);
@@ -580,5 +707,14 @@ trust = "local-development"
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    fn run_git(directory: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
