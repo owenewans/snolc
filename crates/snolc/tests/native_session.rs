@@ -230,6 +230,82 @@ fn native_socks_tcp_payload_crosses_stack_mux_and_direct_adapter() {
 }
 
 #[test]
+fn native_http_connect_preserves_early_payload() {
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_endpoint = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        let (mut stream, _) = target.accept().unwrap();
+        let mut input = [0; 10];
+        stream.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"http-early");
+        stream.write_all(b"http-reply").unwrap();
+    });
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_endpoint = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+    let policy = ("policy_dummy", b"pump_buffer_bytes = 4096\n".as_slice());
+    let server = build_side(
+        "server-http",
+        "server",
+        carrier_endpoint,
+        true,
+        ("protection_dummy", b""),
+        policy,
+    );
+    let options =
+        format!("listen = \"{proxy_endpoint}\"\nmax_connections = 4\nmax_header_bytes = 4096\n");
+    let client = build_side_with_adapter(
+        "client-http",
+        "client",
+        carrier_endpoint,
+        false,
+        ("adapter_http_connect", options.as_bytes()),
+        ("protection_dummy", b""),
+        policy,
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let client_thread = thread::spawn(move || client_engine.run());
+    wait_sessions(&server_handle, &client_handle);
+
+    let mut proxy = TcpStream::connect(proxy_endpoint).unwrap();
+    proxy
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    proxy
+        .write_all(
+            format!(
+                "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: ignored\r\n\r\nhttp-early",
+                target_endpoint.port()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        proxy.read_exact(&mut byte).unwrap();
+        response.push(byte[0]);
+        assert!(response.len() < 4096);
+    }
+    assert!(response.starts_with(b"HTTP/1.1 200 "));
+    let mut reply = [0; 10];
+    proxy.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"http-reply");
+    proxy.shutdown(Shutdown::Both).unwrap();
+    target_thread.join().unwrap();
+    client_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_policy_local_debits_before_forwarding_payload() {
     let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let carrier_endpoint = carrier_listener.local_addr().unwrap();
