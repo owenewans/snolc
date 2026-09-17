@@ -185,14 +185,21 @@ unsafe impl Sync for SnolCarrierApiV1 {}
 pub type AttachSessionFn = unsafe extern "C" fn(
     SnolHandle,
     SnolHandle,
+    *const SnolByteIoV1,
     SnolBytes,
     SnolWakeHandle,
     *mut SnolHandle,
 ) -> SnolStatus;
 pub type AdmitFlowFn =
     unsafe extern "C" fn(SnolHandle, SnolHandle, SnolBytes, SnolWakeHandle) -> SnolStatus;
-pub type AttachFlowFn =
-    unsafe extern "C" fn(SnolHandle, SnolHandle, SnolHandle, SnolHandle) -> SnolStatus;
+pub type AttachFlowFn = unsafe extern "C" fn(
+    SnolHandle,
+    SnolHandle,
+    SnolHandle,
+    *const SnolByteIoV1,
+    SnolHandle,
+    *const SnolByteIoV1,
+) -> SnolStatus;
 
 #[repr(C)]
 pub struct SnolPolicyApiV1 {

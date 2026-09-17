@@ -105,12 +105,16 @@ struct SnolPolicyApiV1 {
     uint32_t struct_size;
     uint32_t reserved;
     SnolStatus (*attach_session)(SnolHandle instance, SnolHandle policy_stream,
-                                 SnolBytes context, SnolWakeHandle wake,
-                                 SnolHandle *session);
+                                  const SnolByteIoV1 *policy_stream_io,
+                                  SnolBytes context, SnolWakeHandle wake,
+                                  SnolHandle *session);
     SnolStatus (*admit_flow)(SnolHandle instance, SnolHandle session,
                              SnolBytes metadata, SnolWakeHandle wake);
     SnolStatus (*attach_flow)(SnolHandle instance, SnolHandle session,
-                              SnolHandle stack_socket, SnolHandle mux_stream);
+                               SnolHandle stack_socket,
+                               const SnolByteIoV1 *stack_socket_io,
+                               SnolHandle mux_stream,
+                               const SnolByteIoV1 *mux_stream_io);
 };
 
 struct SnolHostApiV1 {
