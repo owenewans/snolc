@@ -1,7 +1,8 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 mod handles;
 mod io;
+pub mod module;
 mod pump;
 
 pub use handles::{HandleError, HandleTable, TypedHandle};

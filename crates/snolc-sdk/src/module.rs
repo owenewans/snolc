@@ -1,0 +1,246 @@
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use snolc_abi::{SnolBytes, SnolBytesMut};
+
+pub struct Instances {
+    next: AtomicU64,
+    active: OnceLock<Mutex<HashSet<u64>>>,
+}
+
+impl Instances {
+    pub const fn new() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+            active: OnceLock::new(),
+        }
+    }
+
+    pub fn create(&self) -> Result<u64, u32> {
+        let handle = self.next.fetch_add(1, Ordering::Relaxed);
+        if handle == 0 {
+            return Err(snolc_abi::STATUS_RESOURCE);
+        }
+        self.active()
+            .lock()
+            .map_err(|_| snolc_abi::STATUS_INTERNAL)?
+            .insert(handle);
+        Ok(handle)
+    }
+
+    pub fn contains(&self, handle: u64) -> bool {
+        handle != 0
+            && self
+                .active()
+                .lock()
+                .map(|active| active.contains(&handle))
+                .unwrap_or(false)
+    }
+
+    pub fn remove(&self, handle: u64) {
+        if let Ok(mut active) = self.active().lock() {
+            active.remove(&handle);
+        }
+    }
+
+    fn active(&self) -> &Mutex<HashSet<u64>> {
+        self.active.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+}
+
+impl Default for Instances {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// # Safety
+///
+/// `bytes` must reference readable memory for the returned borrow.
+pub unsafe fn input<'a>(bytes: SnolBytes) -> Result<&'a [u8], u32> {
+    if bytes.pointer.is_null() && bytes.length != 0 {
+        return Err(snolc_abi::STATUS_INVALID);
+    }
+    if bytes.length == 0 {
+        return Ok(&[]);
+    }
+    // caller guarantees the borrowed input for the duration of the call.
+    Ok(unsafe { std::slice::from_raw_parts(bytes.pointer, bytes.length) })
+}
+
+/// # Safety
+///
+/// `output` and `written` must reference writable memory for this call.
+pub unsafe fn write_output(data: &[u8], output: SnolBytesMut, written: *mut usize) -> u32 {
+    let Some(written) = (unsafe { written.as_mut() }) else {
+        return snolc_abi::STATUS_INVALID;
+    };
+    *written = data.len();
+    if output.length < data.len() {
+        return snolc_abi::STATUS_RESOURCE;
+    }
+    if output.pointer.is_null() && !data.is_empty() {
+        return snolc_abi::STATUS_INVALID;
+    }
+    if !data.is_empty() {
+        // caller guarantees writable output for output.length bytes.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), output.pointer, data.len()) };
+    }
+    snolc_abi::STATUS_OK
+}
+
+#[macro_export]
+macro_rules! declare_module {
+    (
+        name: $name:literal,
+        description: $description:literal,
+        class_mask: $class_mask:expr,
+        validate: $validate:path,
+        byte_io: $byte_io:expr,
+        datagram_io: $datagram_io:expr,
+        adapter: $adapter:expr,
+        protection: $protection:expr,
+        carrier: $carrier:expr,
+        policy: $policy:expr $(,)?
+    ) => {
+        static INSTANCES: $crate::module::Instances = $crate::module::Instances::new();
+
+        unsafe extern "C" fn describe(
+            output: $crate::abi::SnolBytesMut,
+            written: *mut usize,
+        ) -> u32 {
+            $crate::catch_status(|| unsafe {
+                $crate::module::write_output($description.as_bytes(), output, written)
+            })
+        }
+
+        unsafe extern "C" fn validate_config(
+            config: $crate::abi::SnolBytes,
+            base: $crate::abi::SnolBytes,
+            error: $crate::abi::SnolBytesMut,
+            written: *mut usize,
+        ) -> u32 {
+            $crate::catch_status(|| unsafe {
+                let config = match $crate::module::input(config) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                let base = match $crate::module::input(base) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                match $validate(config, base) {
+                    Ok(()) => $crate::module::write_output(&[], error, written),
+                    Err(message) => {
+                        let _ = $crate::module::write_output(message.as_bytes(), error, written);
+                        $crate::abi::STATUS_INVALID
+                    }
+                }
+            })
+        }
+
+        unsafe extern "C" fn create(
+            _config: $crate::abi::SnolBytes,
+            _host: *const $crate::abi::SnolHostApiV1,
+            output: *mut u64,
+        ) -> u32 {
+            $crate::catch_status(|| {
+                let Some(output) = (unsafe { output.as_mut() }) else {
+                    return $crate::abi::STATUS_INVALID;
+                };
+                match INSTANCES.create() {
+                    Ok(handle) => {
+                        *output = handle;
+                        $crate::abi::STATUS_OK
+                    }
+                    Err(status) => status,
+                }
+            })
+        }
+
+        unsafe extern "C" fn poll(instance: u64, _wake: $crate::abi::SnolWakeHandle) -> u32 {
+            $crate::catch_status(|| {
+                if INSTANCES.contains(instance) {
+                    $crate::abi::STATUS_PENDING
+                } else {
+                    $crate::abi::STATUS_INVALID
+                }
+            })
+        }
+
+        unsafe extern "C" fn control(
+            instance: u64,
+            _request: $crate::abi::SnolBytes,
+            _response: $crate::abi::SnolBytesMut,
+            written: *mut usize,
+        ) -> u32 {
+            $crate::catch_status(|| {
+                if !written.is_null() {
+                    unsafe { *written = 0 };
+                }
+                if INSTANCES.contains(instance) {
+                    $crate::abi::STATUS_UNSUPPORTED
+                } else {
+                    $crate::abi::STATUS_INVALID
+                }
+            })
+        }
+
+        unsafe extern "C" fn shutdown(instance: u64) -> u32 {
+            $crate::catch_status(|| {
+                if INSTANCES.contains(instance) {
+                    $crate::abi::STATUS_OK
+                } else {
+                    $crate::abi::STATUS_INVALID
+                }
+            })
+        }
+
+        unsafe extern "C" fn destroy(instance: u64) {
+            let _ = std::panic::catch_unwind(|| INSTANCES.remove(instance));
+        }
+
+        static DESCRIPTOR: $crate::abi::SnolModuleDescriptor = $crate::abi::SnolModuleDescriptor {
+            struct_size: core::mem::size_of::<$crate::abi::SnolModuleDescriptor>() as u32,
+            wire_version: $crate::abi::WIRE_VERSION,
+            class_mask: $class_mask,
+            reserved: 0,
+            name: concat!($name, "\0").as_ptr().cast(),
+            describe: Some(describe),
+            validate_config: Some(validate_config),
+            create: Some(create),
+            poll: Some(poll),
+            control: Some(control),
+            shutdown: Some(shutdown),
+            destroy: Some(destroy),
+            byte_io: $byte_io,
+            datagram_io: $datagram_io,
+            adapter: $adapter,
+            protection: $protection,
+            carrier: $carrier,
+            policy: $policy,
+        };
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn snolc_module_entry() -> *const $crate::abi::SnolModuleDescriptor {
+            &DESCRIPTOR
+        }
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_handles_are_not_reused() {
+        let instances = Instances::new();
+        let first = instances.create().unwrap();
+        instances.remove(first);
+        let second = instances.create().unwrap();
+        assert_ne!(first, second);
+        assert!(!instances.contains(first));
+        assert!(instances.contains(second));
+    }
+}

@@ -1,5 +1,5 @@
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use core::ffi::{c_char, c_void};
 
@@ -35,12 +35,16 @@ pub struct SnolBytes {
     pub length: usize,
 }
 
+unsafe impl Sync for SnolBytes {}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SnolBytesMut {
     pub pointer: *mut u8,
     pub length: usize,
 }
+
+unsafe impl Sync for SnolBytesMut {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +125,8 @@ pub struct SnolByteIoV1 {
     pub close: Option<CloseFn>,
 }
 
+unsafe impl Sync for SnolByteIoV1 {}
+
 #[repr(C)]
 pub struct SnolDatagramIoV1 {
     pub struct_size: u32,
@@ -129,6 +135,8 @@ pub struct SnolDatagramIoV1 {
     pub send_datagram: Option<WriteFn>,
     pub close: Option<CloseFn>,
 }
+
+unsafe impl Sync for SnolDatagramIoV1 {}
 
 pub type AdapterOpenFn =
     unsafe extern "C" fn(SnolHandle, SnolBytes, SnolWakeHandle, *mut SnolHandle) -> SnolStatus;
@@ -139,6 +147,8 @@ pub struct SnolAdapterApiV1 {
     pub reserved: u32,
     pub open: Option<AdapterOpenFn>,
 }
+
+unsafe impl Sync for SnolAdapterApiV1 {}
 
 pub type WrapFn = unsafe extern "C" fn(
     SnolHandle,
@@ -155,6 +165,8 @@ pub struct SnolProtectionApiV1 {
     pub wrap: Option<WrapFn>,
 }
 
+unsafe impl Sync for SnolProtectionApiV1 {}
+
 pub type ConnectFn =
     unsafe extern "C" fn(SnolHandle, SnolBytes, SnolWakeHandle, *mut SnolHandle) -> SnolStatus;
 pub type AcceptFn = unsafe extern "C" fn(SnolHandle, SnolWakeHandle, *mut SnolHandle) -> SnolStatus;
@@ -166,6 +178,8 @@ pub struct SnolCarrierApiV1 {
     pub connect: Option<ConnectFn>,
     pub accept: Option<AcceptFn>,
 }
+
+unsafe impl Sync for SnolCarrierApiV1 {}
 
 pub type AttachSessionFn = unsafe extern "C" fn(
     SnolHandle,
@@ -187,6 +201,8 @@ pub struct SnolPolicyApiV1 {
     pub admit_flow: Option<AdmitFlowFn>,
     pub attach_flow: Option<AttachFlowFn>,
 }
+
+unsafe impl Sync for SnolPolicyApiV1 {}
 
 pub type NowNanosFn = unsafe extern "C" fn(*mut c_void) -> u64;
 pub type SetTimerFn = unsafe extern "C" fn(*mut c_void, SnolHandle, u64) -> SnolStatus;
@@ -212,6 +228,8 @@ pub struct SnolHostApiV1 {
     pub context_get: Option<ContextGetFn>,
     pub context_set: Option<ContextSetFn>,
 }
+
+unsafe impl Sync for SnolHostApiV1 {}
 
 pub type DescribeFn = unsafe extern "C" fn(SnolBytesMut, *mut usize) -> SnolStatus;
 pub type ValidateConfigFn =
@@ -245,6 +263,8 @@ pub struct SnolModuleDescriptor {
     pub carrier: *const SnolCarrierApiV1,
     pub policy: *const SnolPolicyApiV1,
 }
+
+unsafe impl Sync for SnolModuleDescriptor {}
 
 pub type ModuleEntry = unsafe extern "C" fn() -> *const SnolModuleDescriptor;
 
