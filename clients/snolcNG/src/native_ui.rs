@@ -4,14 +4,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::runtime::{ClientEvent, EngineRuntime};
+use crate::ui::{self, UiAction, UiDraft};
+use crate::{
+    AppState, ConnectionState, ModuleClass, Profile, generate_client_config, persist_client_config,
+};
 use glutin::context::PossiblyCurrentContext;
 use glutin::display::Display;
 use glutin::surface::{Surface, WindowSurface};
 use snolc::Lifecycle;
-use snolc_ng::AppState;
-use snolc_ng::runtime::{ClientEvent, EngineRuntime};
-use snolc_ng::ui::{UiAction, UiDraft};
-use snolc_ng::{generate_client_config, persist_client_config};
 use winit::raw_window_handle::HasWindowHandle;
 
 struct GlWindow {
@@ -106,9 +107,49 @@ impl GlWindow {
     }
 }
 
-enum UserEvent {
+#[derive(Clone, Copy, Debug)]
+pub enum NativeEvent {
+    VpnReady(i32),
+    VpnPermissionRevoked,
+    NetworkChanged,
+}
+
+pub enum UserEvent {
     Repaint(Duration),
     Runtime,
+    Platform(NativeEvent),
+}
+
+pub struct PlatformHooks {
+    android: bool,
+    request_vpn: Arc<dyn Fn() -> bool + Send + Sync>,
+    protect_socket: Arc<dyn Fn(i64) -> bool + Send + Sync>,
+    native_library_directory: Option<PathBuf>,
+}
+
+impl PlatformHooks {
+    fn desktop() -> Self {
+        Self {
+            android: false,
+            request_vpn: Arc::new(|| false),
+            protect_socket: Arc::new(|_| true),
+            native_library_directory: None,
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android(
+        native_library_directory: PathBuf,
+        request_vpn: impl Fn() -> bool + Send + Sync + 'static,
+        protect_socket: impl Fn(i64) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            android: true,
+            request_vpn: Arc::new(request_vpn),
+            protect_socket: Arc::new(protect_socket),
+            native_library_directory: Some(native_library_directory),
+        }
+    }
 }
 
 struct DesktopApp {
@@ -120,11 +161,18 @@ struct DesktopApp {
     draft: UiDraft,
     root: PathBuf,
     runtime: EngineRuntime,
+    platform: PlatformHooks,
+    vpn_fd: Option<i32>,
 }
 
 impl DesktopApp {
-    fn new(proxy: winit::event_loop::EventLoopProxy<UserEvent>, root: PathBuf) -> Self {
+    fn new(
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+        root: PathBuf,
+        platform: PlatformHooks,
+    ) -> Self {
         let runtime_proxy = proxy.clone();
+        let protect_socket = Arc::clone(&platform.protect_socket);
         Self {
             proxy,
             gl_window: None,
@@ -133,9 +181,14 @@ impl DesktopApp {
             state: AppState::default(),
             draft: UiDraft::default(),
             root,
-            runtime: EngineRuntime::new(move || {
-                let _ = runtime_proxy.send_event(UserEvent::Runtime);
-            }),
+            runtime: EngineRuntime::with_socket_protector(
+                move || {
+                    let _ = runtime_proxy.send_event(UserEvent::Runtime);
+                },
+                move |socket| protect_socket(socket),
+            ),
+            platform,
+            vpn_fd: None,
         }
     }
 
@@ -181,19 +234,90 @@ impl DesktopApp {
             .map_err(|error| error.to_string())?
             .profile
             .clone();
+        if self.platform.android
+            && profile.modules.iter().any(|module| {
+                module.class == ModuleClass::Adapter
+                    && module.package.starts_with("owenewans/adapter-tun@")
+            })
+            && self.vpn_fd.is_none()
+        {
+            if (self.platform.request_vpn)() {
+                return Ok(());
+            }
+            return Err("VPN permission request failed".into());
+        }
+        self.start_profile(profile)
+    }
+
+    fn start_profile(&mut self, mut profile: Profile) -> Result<(), String> {
+        if let Some(fd) = self.vpn_fd {
+            for module in &mut profile.modules {
+                if module.class == ModuleClass::Adapter
+                    && module.package.starts_with("owenewans/adapter-tun@")
+                {
+                    module.options.insert("mode".into(), "android-fd".into());
+                    module.options.insert("fd".into(), fd.into());
+                    module.options.insert("mtu".into(), 1_280.into());
+                    module
+                        .options
+                        .insert("packet_queue_bytes".into(), 262_144.into());
+                }
+            }
+        }
+        if let Some(directory) = &self.platform.native_library_directory {
+            crate::install_bundled_modules(&profile, &self.root, directory)
+                .map_err(|error| error.to_string())?;
+        }
         let generated =
             generate_client_config(&profile, &self.root).map_err(|error| error.to_string())?;
         self.draft.advanced_config = generated.main_toml.clone();
         let path =
             persist_client_config(&generated, &self.root).map_err(|error| error.to_string())?;
-        self.runtime.start(&path).map_err(|error| error.to_string())
+        let cleanup = generated
+            .files
+            .iter()
+            .filter(|file| file.secret)
+            .map(|file| file.path.clone())
+            .collect();
+        self.runtime
+            .start_with_cleanup(&path, cleanup)
+            .map_err(|error| error.to_string())
+    }
+
+    fn platform_event(&mut self, event: NativeEvent) {
+        match event {
+            NativeEvent::VpnReady(fd) if fd >= 0 => {
+                self.vpn_fd = Some(fd);
+                let result = self
+                    .state
+                    .selected_profile()
+                    .map(|profile| profile.profile.clone())
+                    .map_err(|error| error.to_string())
+                    .and_then(|profile| self.start_profile(profile));
+                if let Err(error) = result {
+                    self.state.stopped(error);
+                }
+            }
+            NativeEvent::VpnReady(_) | NativeEvent::VpnPermissionRevoked => {
+                self.vpn_fd = None;
+                let _ = self
+                    .runtime
+                    .platform_event(snolc::PlatformEvent::VpnPermissionRevoked);
+                self.state.stopped("VPN permission revoked".into());
+            }
+            NativeEvent::NetworkChanged => {
+                let _ = self
+                    .runtime
+                    .platform_event(snolc::PlatformEvent::NetworkChanged);
+            }
+        }
     }
 
     fn drain_runtime(&mut self) {
         for event in self.runtime.drain() {
             match event {
                 ClientEvent::Starting => {
-                    self.state.connection = snolc_ng::ConnectionState::Connecting;
+                    self.state.connection = ConnectionState::Connecting;
                 }
                 ClientEvent::Ready => {}
                 ClientEvent::Engine(snolc::Event::Lifecycle(Lifecycle::Running)) => {
@@ -221,6 +345,9 @@ impl DesktopApp {
 
 impl winit::application::ApplicationHandler<UserEvent> for DesktopApp {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.gl_window.is_some() {
+            return;
+        }
         let gl_window = unsafe { GlWindow::new(event_loop) };
         let gl = unsafe {
             glow::Context::from_loader_function(|name| {
@@ -239,6 +366,14 @@ impl winit::application::ApplicationHandler<UserEvent> for DesktopApp {
         self.gl_window = Some(gl_window);
         self.gl = Some(gl);
         self.egui = Some(egui);
+    }
+
+    fn suspended(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(mut egui) = self.egui.take() {
+            egui.destroy();
+        }
+        self.gl.take();
+        self.gl_window.take();
     }
 
     fn window_event(
@@ -261,7 +396,7 @@ impl winit::application::ApplicationHandler<UserEvent> for DesktopApp {
                 .as_mut()
                 .unwrap()
                 .run(&self.gl_window.as_ref().unwrap().window, |ui| {
-                    actions = snolc_ng::ui::render(ui, &self.state, &mut self.draft)
+                    actions = ui::render(ui, &self.state, &mut self.draft)
                 });
             for action in actions {
                 self.apply(action);
@@ -307,6 +442,7 @@ impl winit::application::ApplicationHandler<UserEvent> for DesktopApp {
                 );
             }
             UserEvent::Runtime => self.drain_runtime(),
+            UserEvent::Platform(event) => self.platform_event(event),
         }
     }
 
@@ -330,12 +466,31 @@ impl winit::application::ApplicationHandler<UserEvent> for DesktopApp {
     }
 }
 
-pub fn run(root: PathBuf) -> Result<(), String> {
+pub fn run_desktop(root: PathBuf) -> Result<(), String> {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|error| error.to_string())?;
     let proxy = event_loop.create_proxy();
     event_loop
-        .run_app(&mut DesktopApp::new(proxy, root))
+        .run_app(&mut DesktopApp::new(proxy, root, PlatformHooks::desktop()))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+pub fn run_android(
+    app: winit::platform::android::activity::AndroidApp,
+    root: PathBuf,
+    platform: PlatformHooks,
+    register_proxy: impl FnOnce(winit::event_loop::EventLoopProxy<UserEvent>),
+) -> Result<(), String> {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let mut builder = winit::event_loop::EventLoop::<UserEvent>::with_user_event();
+    builder.with_android_app(app);
+    let event_loop = builder.build().map_err(|error| error.to_string())?;
+    let proxy = event_loop.create_proxy();
+    register_proxy(proxy.clone());
+    event_loop
+        .run_app(&mut DesktopApp::new(proxy, root, platform))
         .map_err(|error| error.to_string())
 }

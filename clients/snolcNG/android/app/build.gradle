@@ -1,0 +1,88 @@
+apply plugin: "com.android.application"
+
+def repoRoot = rootProject.file("../../..")
+def sdkRoot = System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")
+if (sdkRoot == null) {
+    throw new GradleException("ANDROID_SDK_ROOT or ANDROID_HOME is required")
+}
+def ndkRoot = new File(sdkRoot, "ndk/29.0.14206865")
+def toolchain = new File(ndkRoot, "toolchains/llvm/prebuilt/linux-x86_64/bin")
+def rustPackages = [
+    "snolc-ng",
+    "snolc-adapter-tun",
+    "snolc-adapter-socks5",
+    "snolc-adapter-http-connect",
+    "snolc-adapter-direct",
+    "snolc-protection-dummy",
+    "snolc-protection-noise",
+    "snolc-carrier-tcp",
+    "snolc-carrier-ssh",
+    "snolc-policy-dummy",
+    "snolc-policy-local",
+]
+
+android {
+    namespace = "org.owenewans.snolc"
+    compileSdk = 37
+    buildToolsVersion = "37.0.0"
+    ndkVersion = "29.0.14206865"
+
+    defaultConfig {
+        applicationId = "org.owenewans.snolc"
+        minSdk = 24
+        targetSdk = 37
+        versionCode = 1
+        versionName = "0.0.1"
+        ndk {
+            abiFilters += ["arm64-v8a", "armeabi-v7a"]
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = [layout.buildDirectory.dir("generated/jniLibs")]
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+def registerRustBuild = { String taskName, String target, String abi, String clangPrefix ->
+    tasks.register(taskName, Exec) {
+        workingDir repoRoot
+        def arguments = ["build", "--release", "--locked", "--target", target]
+        rustPackages.each { packageName ->
+            arguments += ["--package", packageName]
+        }
+        commandLine "cargo", *arguments
+        environment "CC_${target.replace('-', '_')}", new File(toolchain, "${clangPrefix}24-clang")
+        environment "CXX_${target.replace('-', '_')}", new File(toolchain, "${clangPrefix}24-clang++")
+        environment "AR_${target.replace('-', '_')}", new File(toolchain, "llvm-ar")
+        environment "CARGO_TARGET_${target.replace('-', '_').toUpperCase()}_LINKER", new File(toolchain, "${clangPrefix}24-clang")
+        environment "ANDROID_NDK_HOME", ndkRoot
+        doLast {
+            copy {
+                from new File(repoRoot, "target/${target}/release")
+                into layout.buildDirectory.dir("generated/jniLibs/${abi}")
+                include "libsnolc_ng.so"
+                include "libsnolc_*.so"
+            }
+        }
+    }
+}
+
+registerRustBuild("cargoArm64", "aarch64-linux-android", "arm64-v8a", "aarch64-linux-android")
+registerRustBuild("cargoArmv7", "armv7-linux-androideabi", "armeabi-v7a", "armv7a-linux-androideabi")
+
+tasks.named("preBuild").configure {
+    dependsOn("cargoArm64", "cargoArmv7")
+}

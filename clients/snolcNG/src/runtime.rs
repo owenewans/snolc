@@ -82,6 +82,14 @@ impl EngineRuntime {
     }
 
     pub fn start(&mut self, config: &Path) -> Result<(), RuntimeError> {
+        self.start_with_cleanup(config, Vec::new())
+    }
+
+    pub fn start_with_cleanup(
+        &mut self,
+        config: &Path,
+        cleanup: Vec<PathBuf>,
+    ) -> Result<(), RuntimeError> {
         self.reap();
         if self.active {
             return Err(RuntimeError::Running);
@@ -94,7 +102,7 @@ impl EngineRuntime {
         self.thread = Some(
             std::thread::Builder::new()
                 .name("snolc-engine".into())
-                .spawn(move || run_engine(config, events, wake, protect_socket))?,
+                .spawn(move || run_engine(config, cleanup, events, wake, protect_socket))?,
         );
         Ok(())
     }
@@ -175,10 +183,12 @@ impl Drop for EngineRuntime {
 
 fn run_engine(
     config: PathBuf,
+    cleanup: Vec<PathBuf>,
     events: SyncSender<RuntimeEvent>,
     wake: Arc<dyn Fn() + Send + Sync>,
     protect_socket: Arc<dyn Fn(i64) -> bool + Send + Sync>,
 ) {
+    let cleanup = CleanupPaths(cleanup);
     send(&events, &wake, RuntimeEvent::Starting);
     let result: Result<(), String> = (|| {
         let (config, modules) = Deployment::load(&config)
@@ -191,12 +201,29 @@ fn run_engine(
             protect_socket,
         };
         let (engine, handle) = Engine::build(validated, host).map_err(|error| error.to_string())?;
+        cleanup.remove();
         send(&events, &wake, RuntimeEvent::Ready(handle));
         engine.run().map_err(|error| error.to_string())
     })();
     match result {
         Ok(()) => send(&events, &wake, RuntimeEvent::Stopped),
         Err(error) => send(&events, &wake, RuntimeEvent::Failed(error)),
+    }
+}
+
+struct CleanupPaths(Vec<PathBuf>);
+
+impl CleanupPaths {
+    fn remove(&self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for CleanupPaths {
+    fn drop(&mut self) {
+        self.remove();
     }
 }
 
@@ -241,8 +268,14 @@ mod tests {
         let mut runtime = EngineRuntime::new(move || {
             wake_count.fetch_add(1, Ordering::Relaxed);
         });
+        let secret =
+            std::env::temp_dir().join(format!("snolcNG-runtime-secret-{}", std::process::id()));
+        std::fs::write(&secret, b"credential").unwrap();
         runtime
-            .start(Path::new("/missing/snolcNG-test-config.toml"))
+            .start_with_cleanup(
+                Path::new("/missing/snolcNG-test-config.toml"),
+                vec![secret.clone()],
+            )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut events = Vec::new();
@@ -264,5 +297,6 @@ mod tests {
         );
         assert!(!runtime.is_active());
         assert!(wakes.load(Ordering::Relaxed) >= 2);
+        assert!(!secret.exists());
     }
 }

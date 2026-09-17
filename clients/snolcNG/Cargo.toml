@@ -8,20 +8,33 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 base64.workspace = true
 egui.workspace = true
-egui-winit.workspace = true
 egui_glow.workspace = true
 glow.workspace = true
 glutin.workspace = true
 glutin-winit.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+sha2.workspace = true
 snolc = { path = "../../crates/snolc" }
 thiserror.workspace = true
 toml.workspace = true
 winit.workspace = true
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
+winit = { workspace = true, features = ["wayland", "wayland-dlopen", "x11"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+egui-winit = { workspace = true, features = ["android-native-activity"] }
+jni.workspace = true
+winit = { workspace = true, features = ["android-native-activity"] }
 
 [[bin]]
 name = "snolcNG"

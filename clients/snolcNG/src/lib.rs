@@ -9,8 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(target_os = "android")]
+mod android;
+pub mod native_ui;
 pub mod runtime;
 pub mod ui;
 
@@ -502,6 +506,160 @@ pub fn persist_client_config(
     Ok(generated.main_path.clone())
 }
 
+pub fn install_bundled_modules(
+    profile: &Profile,
+    root: &Path,
+    native_library_directory: &Path,
+) -> Result<(), ProfileError> {
+    profile.validate()?;
+    if !root.is_absolute() || !native_library_directory.is_absolute() {
+        return Err(ProfileError::Path);
+    }
+    let packages = root.join("packages");
+    secure_directory(&packages)?;
+    let mut installed = BTreeSet::new();
+    for module in &profile.modules {
+        if !installed.insert(module.package.clone()) {
+            continue;
+        }
+        let (identity, version) = module.package.rsplit_once('@').ok_or(ProfileError::Value)?;
+        let (owner, name) = identity.split_once('/').ok_or(ProfileError::Value)?;
+        if owner != "owenewans" {
+            continue;
+        }
+        let Some(library_name) = bundled_library_name(name) else {
+            continue;
+        };
+        let source = native_library_directory.join(library_name);
+        if !source.is_file() {
+            return Err(ProfileError::BundledModule);
+        }
+        let hash = hash_file(&source)?;
+        let store = packages
+            .join("store")
+            .join("bundled")
+            .join(owner)
+            .join(name)
+            .join(version)
+            .join(android_target())
+            .join(&hash);
+        let library = store.join(library_name);
+        if library.exists() {
+            if hash_file(&library)? != hash {
+                return Err(ProfileError::BundledModule);
+            }
+        } else {
+            atomic_copy(&source, &library)?;
+        }
+        let mut lock = toml::Table::new();
+        lock.insert("wire_version".into(), 1.into());
+        lock.insert("package".into(), module.package.clone().into());
+        lock.insert("target".into(), android_target().into());
+        lock.insert("content_sha256".into(), hash.into());
+        lock.insert("library".into(), path_value(&library)?);
+        lock.insert("store".into(), path_value(&store)?);
+        lock.insert("dependencies".into(), toml::Value::Array(Vec::new()));
+        let lock_path = packages
+            .join("locks")
+            .join(owner)
+            .join(name)
+            .join(format!("{version}.toml"));
+        atomic_write(&lock_path, toml::to_string(&lock)?.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn bundled_library_name(package: &str) -> Option<&'static str> {
+    match package {
+        "adapter-tun" => Some("libsnolc_adapter_tun.so"),
+        "adapter-socks5" => Some("libsnolc_adapter_socks5.so"),
+        "adapter-http-connect" => Some("libsnolc_adapter_http_connect.so"),
+        "adapter-direct" => Some("libsnolc_adapter_direct.so"),
+        "protection-dummy" => Some("libsnolc_protection_dummy.so"),
+        "protection-noise" => Some("libsnolc_protection_noise.so"),
+        "carrier-tcp" => Some("libsnolc_carrier_tcp.so"),
+        "carrier-ssh" => Some("libsnolc_carrier_ssh.so"),
+        "policy-dummy" => Some("libsnolc_policy_dummy.so"),
+        "policy-local" => Some("libsnolc_policy_local.so"),
+        _ => None,
+    }
+}
+
+fn android_target() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    return "aarch64-linux-android";
+    #[cfg(target_arch = "arm")]
+    return "armv7-linux-androideabi";
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+    "android-test"
+}
+
+fn atomic_copy(source: &Path, destination: &Path) -> Result<(), ProfileError> {
+    let parent = destination.parent().ok_or(ProfileError::Path)?;
+    secure_directory(parent)?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(ProfileError::Path)?;
+    let temporary = parent.join(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut input = File::open(source)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        readonly_file(destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result.map_err(ProfileError::Io)
+}
+
+fn readonly_file(path: &Path) -> Result<(), std::io::Error> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o400);
+    }
+    fs::set_permissions(path, permissions)
+}
+
+fn hash_file(path: &Path) -> Result<String, ProfileError> {
+    let mut input = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(encode_hex(&hasher.finalize()))
+}
+
+fn encode_hex(input: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(input.len() * 2);
+    for byte in input {
+        output.push(DIGITS[usize::from(byte >> 4)] as char);
+        output.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ProfileError> {
     let parent = path.parent().ok_or(ProfileError::Path)?;
     secure_directory(parent)?;
@@ -767,6 +925,8 @@ pub enum ProfileError {
     Selection,
     #[error("native package requires approval")]
     PackageApproval,
+    #[error("bundled native module is unavailable or invalid")]
+    BundledModule,
 }
 
 #[cfg(test)]
@@ -914,6 +1074,58 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(".tmp")
         }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_modules_get_content_addressed_locks() {
+        let root = std::env::temp_dir().join(format!(
+            "snolcNG-bundled-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let native = root.join("native");
+        fs::create_dir_all(&native).unwrap();
+        let mut profile = profile();
+        for (module, name) in profile.modules.iter_mut().zip([
+            "adapter-tun",
+            "protection-noise",
+            "carrier-tcp",
+            "policy-local",
+        ]) {
+            module.package = format!("owenewans/{name}@0.0.1");
+            fs::write(
+                native.join(bundled_library_name(name).unwrap()),
+                format!("module:{name}"),
+            )
+            .unwrap();
+        }
+        install_bundled_modules(&profile, &root, &native).unwrap();
+        for module in &profile.modules {
+            let (identity, version) = module.package.rsplit_once('@').unwrap();
+            let (owner, name) = identity.split_once('/').unwrap();
+            let lock = root
+                .join("packages/locks")
+                .join(owner)
+                .join(name)
+                .join(format!("{version}.toml"));
+            let lock: toml::Value = toml::from_str(&fs::read_to_string(lock).unwrap()).unwrap();
+            assert_eq!(lock["package"].as_str(), Some(module.package.as_str()));
+            assert_eq!(lock["content_sha256"].as_str().unwrap().len(), 64);
+            let library = Path::new(lock["library"].as_str().unwrap());
+            assert!(library.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(library).unwrap().permissions().mode() & 0o777,
+                    0o400
+                );
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
