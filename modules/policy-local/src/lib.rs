@@ -20,9 +20,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::TryRecvError;
 use std::task::{Context, Poll, Waker};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use snolc_sdk::abi::{self, SnolByteIoV1, SnolBytes, SnolPolicyApiV1, SnolWakeHandle};
 use snolc_sdk::{ByteIo, ForeignByteIo, Pump, PumpError, PumpReport};
 
@@ -47,9 +48,41 @@ static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 
 struct State {
     options: Options,
-    _storage: StorageWorker,
+    storage: StorageWorker,
+    admin: AdminState,
+    pending_control: Option<PendingControl>,
     sessions: HashMap<u64, ForeignByteIo>,
     flows: HashMap<u64, PolicyFlow<ForeignByteIo, ForeignByteIo>>,
+}
+
+struct AdminState {
+    sequencer: AdminSequencer,
+    users: HashMap<String, UserRecord>,
+    credentials: HashMap<String, CredentialRecord>,
+    rules: HashMap<String, String>,
+}
+
+struct PendingControl {
+    request: Vec<u8>,
+    client_id: String,
+    receipt: Vec<u8>,
+    response: Vec<u8>,
+    mutation: AdminMutation,
+    reply: storage::WriteReply,
+}
+
+#[derive(Default)]
+struct AdminMutation {
+    users: Vec<(String, Option<UserRecord>)>,
+    credentials: Vec<(String, Option<CredentialRecord>)>,
+    rules: Vec<(String, String)>,
+    disconnect: Option<u64>,
+}
+
+struct PreparedAdmin {
+    response: Vec<u8>,
+    mutation: AdminMutation,
+    changes: Vec<(String, Option<Vec<u8>>)>,
 }
 
 struct PolicyFlow<S, M> {
@@ -109,12 +142,21 @@ fn initialize(
         options.storage.queue_capacity,
     )
     .map_err(|_| abi::STATUS_IO)?;
+    let sequencer =
+        AdminSequencer::new(options.max_admin_clients).map_err(|_| abi::STATUS_INVALID)?;
     STATES.with(|states| {
         states.borrow_mut().insert(
             instance,
             State {
                 options,
-                _storage: storage,
+                admin: AdminState {
+                    sequencer,
+                    users: HashMap::new(),
+                    credentials: HashMap::new(),
+                    rules: HashMap::new(),
+                },
+                storage,
+                pending_control: None,
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
             },
@@ -262,8 +304,390 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
     })
 }
 
-fn control_instance(_instance: u64, _request: &[u8]) -> Result<Vec<u8>, u32> {
-    Err(abi::STATUS_UNSUPPORTED)
+fn control_instance(instance: u64, request: &[u8]) -> Result<Vec<u8>, u32> {
+    STATES.with(|states| {
+        let mut states = states.borrow_mut();
+        let state = states.get_mut(&instance).ok_or(abi::STATUS_INVALID)?;
+        if let Some(pending) = state.pending_control.as_mut() {
+            if pending.request != request {
+                return Err(abi::STATUS_PENDING);
+            }
+            match pending.reply.try_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    state.pending_control = None;
+                    return Err(abi::STATUS_IO);
+                }
+                Err(TryRecvError::Empty) => return Err(abi::STATUS_PENDING),
+            }
+            let pending = state.pending_control.take().ok_or(abi::STATUS_INTERNAL)?;
+            state
+                .admin
+                .sequencer
+                .apply_commit(pending.client_id, &pending.receipt)
+                .map_err(|_| abi::STATUS_INTERNAL)?;
+            apply_admin_mutation(state, pending.mutation);
+            return Ok(pending.response);
+        }
+
+        if request.len() > state.options.max_control_frame_bytes {
+            return Err(abi::STATUS_RESOURCE);
+        }
+        let parsed = ControlRequest::parse(request).map_err(|_| abi::STATUS_INVALID)?;
+        if parsed.sequence().is_none() {
+            return read_admin_state(state, parsed);
+        }
+        let (client_id, seq) = parsed.sequence().ok_or(abi::STATUS_INVALID)?;
+        let client_id = client_id.to_owned();
+        let request_hash = match state
+            .admin
+            .sequencer
+            .check(&client_id, seq, request)
+            .map_err(admin_status)?
+        {
+            AdminDecision::Replay(response) => return Ok(response),
+            AdminDecision::Execute { request_hash } => request_hash,
+        };
+        let PreparedAdmin {
+            response,
+            mutation,
+            mut changes,
+        } = prepare_admin_mutation(state, parsed)?;
+        let receipt = state
+            .admin
+            .sequencer
+            .prepare_commit(&client_id, seq, request_hash, response.clone())
+            .map_err(admin_status)?;
+        changes.push((format!("client/{client_id}"), Some(receipt.clone())));
+        let reply = state.storage.apply(changes).map_err(storage_status)?;
+        state.pending_control = Some(PendingControl {
+            request: request.to_vec(),
+            client_id,
+            receipt,
+            response,
+            mutation,
+            reply,
+        });
+        Err(abi::STATUS_PENDING)
+    })
+}
+
+fn read_admin_state(state: &State, request: ControlRequest) -> Result<Vec<u8>, u32> {
+    match request {
+        ControlRequest::UsageGet { user_id } => {
+            let user = state.admin.users.get(&user_id).ok_or(abi::STATUS_INVALID)?;
+            encode_response(&UsageResponse {
+                status: "ok",
+                user_id: &user.id,
+                revision: user.revision,
+                used_bytes: user.durable_charged_bytes,
+                limit_bytes: match user.spec.quota {
+                    ByteLimit::Unlimited => None,
+                    ByteLimit::Limited { bytes } => Some(bytes),
+                },
+                upload_bytes: user.upload_bytes,
+                download_bytes: user.download_bytes,
+            })
+        }
+        ControlRequest::SessionsList { user_id } => {
+            let sessions: Vec<u64> = if user_id.is_none() {
+                state.sessions.keys().copied().collect()
+            } else {
+                Vec::new()
+            };
+            encode_response(&SessionsResponse {
+                status: "ok",
+                sessions,
+            })
+        }
+        _ => Err(abi::STATUS_INVALID),
+    }
+}
+
+fn prepare_admin_mutation(state: &State, request: ControlRequest) -> Result<PreparedAdmin, u32> {
+    let mut mutation = AdminMutation::default();
+    let mut changes = Vec::new();
+    let (response, revision) = match request {
+        ControlRequest::UserCreate { user, .. } => {
+            if state.admin.users.len() >= state.options.max_cached_users {
+                return Err(abi::STATUS_RESOURCE);
+            }
+            let id = UserId::generate().map_err(admin_status)?.hex();
+            let record = UserRecord {
+                id: id.clone(),
+                spec: user,
+                revision: 1,
+                durable_charged_bytes: 0,
+                upload_bytes: 0,
+                download_bytes: 0,
+                max_observed_utc: 0,
+            };
+            put_user(&mut mutation, &mut changes, record)?;
+            (Some(id), 1)
+        }
+        ControlRequest::UserUpdate {
+            user_id,
+            expected_revision,
+            user,
+            ..
+        } => {
+            let mut record = checked_user(state, &user_id, expected_revision)?.clone();
+            record.spec = user;
+            record.revision = next_revision(record.revision)?;
+            let revision = record.revision;
+            put_user(&mut mutation, &mut changes, record)?;
+            (Some(user_id), revision)
+        }
+        ControlRequest::UserDisable {
+            user_id,
+            expected_revision,
+            ..
+        } => {
+            let mut record = checked_user(state, &user_id, expected_revision)?.clone();
+            record.spec.status = UserStatus::Disabled;
+            record.revision = next_revision(record.revision)?;
+            let revision = record.revision;
+            put_user(&mut mutation, &mut changes, record)?;
+            (Some(user_id), revision)
+        }
+        ControlRequest::UserDelete {
+            user_id,
+            expected_revision,
+            ..
+        } => {
+            let record = checked_user(state, &user_id, expected_revision)?;
+            let revision = next_revision(record.revision)?;
+            mutation.users.push((user_id.clone(), None));
+            changes.push((format!("user/{user_id}"), None));
+            for (digest, credential) in &state.admin.credentials {
+                if credential.user_id == user_id {
+                    mutation.credentials.push((digest.clone(), None));
+                    changes.push((format!("credential/{digest}"), None));
+                }
+            }
+            (Some(user_id), revision)
+        }
+        ControlRequest::CredentialAdd {
+            user_id,
+            credential_sha256,
+            ..
+        } => {
+            let user = state.admin.users.get(&user_id).ok_or(abi::STATUS_INVALID)?;
+            let revision = next_revision(user.revision)?;
+            if let Some(existing) = state.admin.credentials.get(&credential_sha256) {
+                if existing.user_id != user_id || existing.revoked {
+                    return Err(abi::STATUS_DENIED);
+                }
+            } else {
+                let record = CredentialRecord {
+                    digest: credential_sha256.clone(),
+                    user_id: user_id.clone(),
+                    revoked: false,
+                    revision,
+                };
+                changes.push((
+                    format!("credential/{credential_sha256}"),
+                    Some(postcard::to_allocvec(&record).map_err(|_| abi::STATUS_INTERNAL)?),
+                ));
+                mutation.credentials.push((credential_sha256, Some(record)));
+            }
+            (Some(user_id), revision)
+        }
+        ControlRequest::CredentialRevoke {
+            credential_sha256, ..
+        } => {
+            let mut record = state
+                .admin
+                .credentials
+                .get(&credential_sha256)
+                .ok_or(abi::STATUS_INVALID)?
+                .clone();
+            record.revoked = true;
+            record.revision = next_revision(record.revision)?;
+            let revision = record.revision;
+            let user_id = record.user_id.clone();
+            changes.push((
+                format!("credential/{credential_sha256}"),
+                Some(postcard::to_allocvec(&record).map_err(|_| abi::STATUS_INTERNAL)?),
+            ));
+            mutation.credentials.push((credential_sha256, Some(record)));
+            (Some(user_id), revision)
+        }
+        ControlRequest::QuotaAdd { user_id, bytes, .. } => {
+            let mut record = state
+                .admin
+                .users
+                .get(&user_id)
+                .ok_or(abi::STATUS_INVALID)?
+                .clone();
+            let ByteLimit::Limited { bytes: limit } = &mut record.spec.quota else {
+                return Err(abi::STATUS_INVALID);
+            };
+            *limit = limit.checked_add(bytes).ok_or(abi::STATUS_RESOURCE)?;
+            record.revision = next_revision(record.revision)?;
+            let revision = record.revision;
+            put_user(&mut mutation, &mut changes, record)?;
+            (Some(user_id), revision)
+        }
+        ControlRequest::QuotaNewPeriod { user_id, quota, .. } => {
+            let mut record = state
+                .admin
+                .users
+                .get(&user_id)
+                .ok_or(abi::STATUS_INVALID)?
+                .clone();
+            record.spec.quota = quota;
+            record.durable_charged_bytes = 0;
+            record.upload_bytes = 0;
+            record.download_bytes = 0;
+            record.revision = next_revision(record.revision)?;
+            let revision = record.revision;
+            put_user(&mut mutation, &mut changes, record)?;
+            (Some(user_id), revision)
+        }
+        ControlRequest::SessionsDisconnect { session_id, .. } => {
+            if !state.sessions.contains_key(&session_id) {
+                return Err(abi::STATUS_INVALID);
+            }
+            mutation.disconnect = Some(session_id);
+            (None, 0)
+        }
+        ControlRequest::RulesReplace {
+            profile,
+            rules_toml,
+            ..
+        } => {
+            toml::from_str::<config::Rules>(&rules_toml).map_err(|_| abi::STATUS_INVALID)?;
+            changes.push((
+                format!("meta/rules/{profile}"),
+                Some(rules_toml.as_bytes().to_vec()),
+            ));
+            mutation.rules.push((profile, rules_toml));
+            (None, 0)
+        }
+        ControlRequest::UsageGet { .. } | ControlRequest::SessionsList { .. } => {
+            return Err(abi::STATUS_INVALID);
+        }
+    };
+    let response = encode_response(&MutationResponse {
+        status: "ok",
+        revision,
+        user_id: response.as_deref(),
+    })?;
+    Ok(PreparedAdmin {
+        response,
+        mutation,
+        changes,
+    })
+}
+
+fn checked_user<'a>(
+    state: &'a State,
+    user_id: &str,
+    expected_revision: u64,
+) -> Result<&'a UserRecord, u32> {
+    let user = state.admin.users.get(user_id).ok_or(abi::STATUS_INVALID)?;
+    if user.revision != expected_revision {
+        return Err(abi::STATUS_DENIED);
+    }
+    Ok(user)
+}
+
+fn put_user(
+    mutation: &mut AdminMutation,
+    changes: &mut Vec<(String, Option<Vec<u8>>)>,
+    user: UserRecord,
+) -> Result<(), u32> {
+    changes.push((
+        format!("user/{}", user.id),
+        Some(postcard::to_allocvec(&user).map_err(|_| abi::STATUS_INTERNAL)?),
+    ));
+    mutation.users.push((user.id.clone(), Some(user)));
+    Ok(())
+}
+
+fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
+    for (id, user) in mutation.users {
+        match user {
+            Some(user) => {
+                state.admin.users.insert(id, user);
+            }
+            None => {
+                state.admin.users.remove(&id);
+            }
+        }
+    }
+    for (digest, credential) in mutation.credentials {
+        match credential {
+            Some(credential) => {
+                state.admin.credentials.insert(digest, credential);
+            }
+            None => {
+                state.admin.credentials.remove(&digest);
+            }
+        }
+    }
+    for (profile, rules) in mutation.rules {
+        state.admin.rules.insert(profile, rules);
+    }
+    if let Some(session) = mutation.disconnect {
+        state.sessions.remove(&session);
+    }
+}
+
+fn next_revision(revision: u64) -> Result<u64, u32> {
+    revision.checked_add(1).ok_or(abi::STATUS_RESOURCE)
+}
+
+fn admin_status(error: AdminError) -> u32 {
+    match error {
+        AdminError::ClientLimit => abi::STATUS_RESOURCE,
+        AdminError::Invalid | AdminError::Sequence | AdminError::State => abi::STATUS_DENIED,
+        AdminError::Random | AdminError::Encode => abi::STATUS_INTERNAL,
+    }
+}
+
+fn storage_status(error: StorageError) -> u32 {
+    match error {
+        StorageError::QueueFull | StorageError::Limit => abi::STATUS_RESOURCE,
+        StorageError::Invalid => abi::STATUS_INVALID,
+        StorageError::Stopped
+        | StorageError::Permissions
+        | StorageError::Io(_)
+        | StorageError::Database(_) => abi::STATUS_IO,
+    }
+}
+
+fn encode_response(response: &impl Serialize) -> Result<Vec<u8>, u32> {
+    toml::to_string(response)
+        .map(String::into_bytes)
+        .map_err(|_| abi::STATUS_INTERNAL)
+}
+
+#[derive(Serialize)]
+struct MutationResponse<'a> {
+    status: &'static str,
+    revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct UsageResponse<'a> {
+    status: &'static str,
+    user_id: &'a str,
+    revision: u64,
+    used_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_bytes: Option<u64>,
+    upload_bytes: u64,
+    download_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct SessionsResponse {
+    status: &'static str,
+    sessions: Vec<u64>,
 }
 
 fn shutdown_instance(instance: u64) -> u32 {
@@ -307,7 +731,9 @@ snolc_sdk::declare_stateful_module! {
 #[cfg(test)]
 mod module_tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::io;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -382,5 +808,93 @@ mod module_tests {
         assert_eq!(flow.stack.output, b"download");
         assert!(flow.mux.shutdown);
         assert!(flow.stack.shutdown);
+    }
+
+    #[test]
+    fn admin_control_commits_before_reply_and_replays() {
+        let root = std::env::temp_dir().join(format!(
+            "snolc-policy-control-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let database = root.join("policy.redb");
+        let template = include_str!("../../../config/templates/policy-local-server.toml");
+        let mut template: toml::Value = toml::from_str(template).unwrap();
+        template["options"]["storage"]["path"] =
+            toml::Value::String(database.to_string_lossy().into_owned());
+        let options = toml::to_string(&template["options"]).unwrap();
+        let instance = 10_001;
+        initialize(instance, options.as_bytes(), b"/tmp", std::ptr::null()).unwrap();
+
+        let create = br#"
+method = "user.create"
+client_id = "panel"
+seq = 1
+
+[user]
+status = "enabled"
+burst_bytes = 65507
+weight = 1
+group = "default"
+rule_profile = "default"
+
+[user.expiration]
+mode = "unlimited"
+[user.quota]
+mode = "limited"
+bytes = 1000000
+[user.upload_rate]
+mode = "unlimited"
+[user.download_rate]
+mode = "unlimited"
+[user.combined_rate]
+mode = "unlimited"
+[user.max_sessions]
+mode = "limited"
+count = 2
+[user.max_flows]
+mode = "limited"
+count = 16
+"#;
+        assert!(matches!(
+            control_instance(instance, create),
+            Err(abi::STATUS_PENDING)
+        ));
+        let response = drive_control(instance, create);
+        let response_text = std::str::from_utf8(&response).unwrap();
+        let response_value: toml::Value = toml::from_str(response_text).unwrap();
+        let user_id = response_value["user_id"].as_str().unwrap();
+        assert_eq!(response_value["revision"].as_integer(), Some(1));
+        assert_eq!(drive_control(instance, create), response);
+
+        let usage = format!("method = \"usage.get\"\nuser_id = \"{user_id}\"\n");
+        let usage = drive_control(instance, usage.as_bytes());
+        let usage: toml::Value = toml::from_str(std::str::from_utf8(&usage).unwrap()).unwrap();
+        assert_eq!(usage["used_bytes"].as_integer(), Some(0));
+        assert_eq!(usage["limit_bytes"].as_integer(), Some(1_000_000));
+
+        let skipped = format!(
+            "method = \"user.disable\"\nclient_id = \"panel\"\nseq = 3\nuser_id = \"{user_id}\"\nexpected_revision = 1\n"
+        );
+        assert!(matches!(
+            control_instance(instance, skipped.as_bytes()),
+            Err(abi::STATUS_DENIED)
+        ));
+        shutdown_instance(instance);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn drive_control(instance: u64, request: &[u8]) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match control_instance(instance, request) {
+                Ok(response) => return response,
+                Err(abi::STATUS_PENDING) if Instant::now() < deadline => std::thread::yield_now(),
+                result => panic!("control failed: {result:?}"),
+            }
+        }
     }
 }
