@@ -1,12 +1,14 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tar::Archive;
 use thiserror::Error;
 
@@ -40,6 +42,30 @@ pub struct Publication {
     pub manifest_bytes: Vec<u8>,
     pub signature_bytes: Vec<u8>,
     pub manifest: PublicationManifest,
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallOptions {
+    pub root: PathBuf,
+    pub target: String,
+    pub limits: ExtractLimits,
+    pub offline: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallResult {
+    pub package: String,
+    pub store: PathBuf,
+    pub lock: PathBuf,
+}
+
+#[derive(Serialize)]
+struct PackageLock<'a> {
+    wire_version: u32,
+    package: &'a str,
+    target: &'a str,
+    content_sha256: String,
+    library: &'a Path,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -168,7 +194,7 @@ impl PublicationManifest {
             if artifact.target.is_empty()
                 || artifact.minimum_isa.is_empty()
                 || artifact.byte_size == 0
-                || !artifact.url.starts_with("https://")
+                || !(artifact.url.starts_with("https://") || artifact.url.starts_with("file:///"))
                 || !targets.insert(&artifact.target)
             {
                 return Err(PackageError::ManifestValue);
@@ -340,6 +366,271 @@ pub fn load_publication(
     }
 }
 
+pub fn install_binary(
+    git: &str,
+    module_name: &str,
+    options: &InstallOptions,
+) -> Result<InstallResult, PackageError> {
+    if !options.root.is_absolute() || options.target.is_empty() {
+        return Err(PackageError::InstallOptions);
+    }
+    options.limits.validate()?;
+    fs::create_dir_all(&options.root)?;
+    let install_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(options.root.join(".install.lock"))?;
+    install_lock.lock()?;
+    let sources = Sources::parse(&fs::read_to_string(options.root.join("sources.toml"))?)?;
+    let source = sources.find(git)?;
+    let staging = Staging::new(&options.root)?;
+    if options.offline && git.starts_with("https://") {
+        return Err(PackageError::OfflineNetwork);
+    }
+    let publication = load_publication(git, module_name, &staging.path.join("repository"))?;
+    if source.trust == TrustMode::Signed {
+        verify_manifest(
+            &publication.manifest_bytes,
+            &publication.signature_bytes,
+            source,
+        )?;
+    }
+    let package_module = publication
+        .manifest
+        .name
+        .split_once('/')
+        .map(|(_, module)| module)
+        .ok_or(PackageError::ManifestValue)?;
+    if package_module != module_name {
+        return Err(PackageError::ManifestValue);
+    }
+    let artifact = publication
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.target == options.target)
+        .ok_or(PackageError::Target)?;
+    if options.offline && artifact.url.starts_with("https://") {
+        return Err(PackageError::OfflineNetwork);
+    }
+    let archive_path = staging.path.join("artifact.tar.gz");
+    download_artifact(artifact, &archive_path)?;
+    let content = staging.path.join("content");
+    extract_tar_gz(File::open(&archive_path)?, &content, options.limits)?;
+    install_extracted(&publication.manifest, source, artifact, &content, options)
+}
+
+fn download_artifact(artifact: &Artifact, output: &Path) -> Result<(), PackageError> {
+    let mut input: Box<dyn Read> = if let Some(path) = artifact.url.strip_prefix("file://") {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return Err(PackageError::Download("file URL is not absolute".into()));
+        }
+        Box::new(File::open(path)?)
+    } else {
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|error| PackageError::Download(error.to_string()))?;
+        let response = client
+            .get(&artifact.url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| PackageError::Download(error.to_string()))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length != artifact.byte_size)
+        {
+            return Err(PackageError::ArtifactSize);
+        }
+        Box::new(response)
+    };
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    let mut output = BufWriter::new(file);
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or(PackageError::ArtifactSize)?;
+        if total > artifact.byte_size {
+            return Err(PackageError::ArtifactSize);
+        }
+        hasher.update(&buffer[..read]);
+        output.write_all(&buffer[..read])?;
+    }
+    output.flush()?;
+    output.get_ref().sync_all()?;
+    if total != artifact.byte_size || encode_hex(&hasher.finalize()) != artifact.sha256 {
+        return Err(PackageError::ArtifactHash);
+    }
+    Ok(())
+}
+
+fn install_extracted(
+    manifest: &PublicationManifest,
+    source: &TrustedSource,
+    artifact: &Artifact,
+    content: &Path,
+    options: &InstallOptions,
+) -> Result<InstallResult, PackageError> {
+    let entry = content.join(&manifest.entry);
+    if !entry.is_file() {
+        return Err(PackageError::Entry);
+    }
+    let library_hash = hash_file(&entry)?;
+    let (owner, name) = manifest
+        .name
+        .split_once('/')
+        .ok_or(PackageError::ManifestValue)?;
+    let source_hash = encode_hex(&Sha256::digest(source.git.as_bytes()));
+    let store = options
+        .root
+        .join("store")
+        .join(source_hash)
+        .join(owner)
+        .join(name)
+        .join(&manifest.package_version)
+        .join(&artifact.target)
+        .join(&artifact.sha256);
+    fs::create_dir_all(store.parent().ok_or(PackageError::Path)?)?;
+    if store.exists() {
+        let existing = store.join(&manifest.entry);
+        if !existing.is_file() || hash_file(&existing)? != library_hash {
+            return Err(PackageError::StoreConflict);
+        }
+    } else {
+        fs::rename(content, &store)?;
+        make_readonly(&store)?;
+    }
+    let library = store.join(&manifest.entry).canonicalize()?;
+    let package = format!("{}@{}", manifest.name, manifest.package_version);
+    let lock = options
+        .root
+        .join("locks")
+        .join(owner)
+        .join(name)
+        .join(format!("{}.toml", manifest.package_version));
+    let lock_data = toml::to_string(&PackageLock {
+        wire_version: manifest.wire_version,
+        package: &package,
+        target: &artifact.target,
+        content_sha256: library_hash,
+        library: &library,
+    })?;
+    atomic_write(&lock, lock_data.as_bytes())?;
+    Ok(InstallResult {
+        package,
+        store,
+        lock,
+    })
+}
+
+fn hash_file(path: &Path) -> Result<String, PackageError> {
+    let mut input = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(encode_hex(&hasher.finalize()))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PackageError> {
+    let parent = path.parent().ok_or(PackageError::Path)?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(PackageError::Path)?,
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn make_readonly(path: &Path) -> Result<(), PackageError> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        if entry.file_type()?.is_dir() {
+            make_readonly(&child)?;
+        }
+        let mut permissions = fs::metadata(&child)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(child, permissions)?;
+    }
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+fn encode_hex(input: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(input.len() * 2);
+    for byte in input {
+        output.push(DIGITS[usize::from(byte >> 4)] as char);
+        output.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+struct Staging {
+    path: PathBuf,
+}
+
+impl Staging {
+    fn new(root: &Path) -> Result<Self, PackageError> {
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging)?;
+        for nonce in 0..16u8 {
+            let path = staging.join(format!(
+                "install-{}-{}-{nonce}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| PackageError::Clock)?
+                    .as_nanos()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(PackageError::StagingCreate)
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn read_publication(
     repository: &gix::Repository,
     module_name: &str,
@@ -485,6 +776,28 @@ pub enum PackageError {
     CloneDirectory,
     #[error("publication file is missing or invalid")]
     PublicationFile,
+    #[error("install options are invalid")]
+    InstallOptions,
+    #[error("target artifact is unavailable")]
+    Target,
+    #[error("offline mode forbids a network request")]
+    OfflineNetwork,
+    #[error("artifact download failed: {0}")]
+    Download(String),
+    #[error("artifact byte size does not match manifest")]
+    ArtifactSize,
+    #[error("artifact hash does not match manifest")]
+    ArtifactHash,
+    #[error("module entry is missing")]
+    Entry,
+    #[error("immutable store content conflicts")]
+    StoreConflict,
+    #[error("system clock is before the Unix epoch")]
+    Clock,
+    #[error("staging directory cannot be allocated")]
+    StagingCreate,
+    #[error("TOML serialization failed: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
 }
 
 #[cfg(test)]
@@ -670,7 +983,137 @@ trust = "local-development"
         assert_eq!(publication.manifest.name, "owenewans/carrier-tcp");
         assert_eq!(publication.revision.len(), 40);
         assert!(!clone.exists());
-        fs::remove_dir_all(root).unwrap();
+        remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn moves_verified_content_into_immutable_store_and_writes_lock() {
+        let root = temporary_directory("install-store");
+        let content = root.join("content");
+        fs::create_dir_all(content.join("lib")).unwrap();
+        fs::write(content.join("lib/libsnolc_carrier_tcp.so"), b"library").unwrap();
+        let manifest = PublicationManifest::parse(MANIFEST.as_bytes()).unwrap();
+        let source = TrustedSource {
+            id: "official".into(),
+            git: "https://example.invalid/modules.git".into(),
+            trust: TrustMode::Signed,
+            public_key: Some("11".repeat(32)),
+        };
+        let artifact = &manifest.artifacts[0];
+        let result = install_extracted(
+            &manifest,
+            &source,
+            artifact,
+            &content,
+            &InstallOptions {
+                root: root.clone(),
+                target: artifact.target.clone(),
+                limits: limits(),
+                offline: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.package, "owenewans/carrier-tcp@0.0.1");
+        assert!(result.store.join(&manifest.entry).is_file());
+        let lock = fs::read_to_string(result.lock).unwrap();
+        let lock: toml::Value = toml::from_str(&lock).unwrap();
+        assert_eq!(lock["wire_version"].as_integer(), Some(1));
+        assert_eq!(
+            lock["content_sha256"].as_str(),
+            Some("b718f1354f7247312eca086d9a024afe5fa717ddea5adeddd6f12bcf945b2e8c")
+        );
+        remove_readonly_tree(&root);
+    }
+
+    #[test]
+    fn installs_binary_from_local_git_and_file_artifact() {
+        let root = temporary_directory("install-e2e");
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        run_git(&repository, &["init", "-q"]);
+        let archive =
+            archive_with(|builder| append_file(builder, "lib/module.so", b"native module", 0o644));
+        let artifact_path = root.join("artifact.tar.gz");
+        fs::write(&artifact_path, &archive).unwrap();
+        let artifact_hash = encode_hex(&Sha256::digest(&archive));
+        let manifest = format!(
+            r#"name = "owenewans/test"
+authors = ["Owen Ewans"]
+license = "Unlicense"
+package_version = "0.0.1"
+wire_version = 1
+classes = ["carrier"]
+family = "test"
+entry = "lib/module.so"
+toolchain = "1.98.1"
+dependencies = []
+
+[source]
+revision = "0123456789abcdef"
+
+[build]
+package = "snolc-test"
+
+[[artifacts]]
+target = "{}"
+minimum_isa = "test"
+minimum_libc = "2.28"
+url = "file://{}"
+byte_size = {}
+sha256 = "{}"
+"#,
+            env!("SNOLPKG_TARGET"),
+            artifact_path.display(),
+            archive.len(),
+            artifact_hash
+        );
+        fs::create_dir(repository.join("snolpkg")).unwrap();
+        fs::write(repository.join("snolpkg/test.toml"), manifest).unwrap();
+        fs::write(repository.join("snolpkg/test.toml.sig"), [0; 64]).unwrap();
+        run_git(
+            &repository,
+            &["add", "snolpkg/test.toml", "snolpkg/test.toml.sig"],
+        );
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=snolpkg test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "publication",
+            ],
+        );
+        let packages = root.join("packages");
+        fs::create_dir(&packages).unwrap();
+        fs::write(
+            packages.join("sources.toml"),
+            format!(
+                "[[sources]]\nid = \"local\"\ngit = \"{}\"\ntrust = \"local-development\"\n",
+                repository.display()
+            ),
+        )
+        .unwrap();
+        let result = install_binary(
+            repository.to_str().unwrap(),
+            "test",
+            &InstallOptions {
+                root: packages,
+                target: env!("SNOLPKG_TARGET").into(),
+                limits: limits(),
+                offline: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.package, "owenewans/test@0.0.1");
+        assert_eq!(
+            fs::read(result.store.join("lib/module.so")).unwrap(),
+            b"native module"
+        );
+        remove_readonly_tree(&root);
     }
 
     fn archive_with(build: impl FnOnce(&mut Builder<GzEncoder<Vec<u8>>>)) -> Vec<u8> {
@@ -716,5 +1159,28 @@ trust = "local-development"
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    fn remove_readonly_tree(path: &Path) {
+        make_writable_tree(path);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn make_writable_tree(path: &Path) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                make_writable_tree(&entry.path());
+            }
+        }
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o700);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).unwrap();
     }
 }
