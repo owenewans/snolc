@@ -27,11 +27,18 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use snolc_sdk::abi::{self, SnolByteIoV1, SnolBytes, SnolPolicyApiV1, SnolWakeHandle};
-use snolc_sdk::{ByteIo, ForeignByteIo, Pump, PumpError, PumpReport};
+use snolc_sdk::abi::{
+    self, SnolByteIoV1, SnolBytes, SnolDatagramIoV1, SnolPolicyApiV1, SnolWakeHandle,
+};
+use snolc_sdk::{
+    ByteIo, DatagramIo, DatagramPump, DatagramPumpReport, ForeignByteIo, ForeignDatagramIo, Pump,
+    PumpError, PumpReport,
+};
 use zeroize::Zeroize;
 
 use service::{ClientRequest, SessionChannel};
+
+const MAX_UDP_PAYLOAD: usize = 65_507;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +79,8 @@ struct State {
     client_credential: Option<Credential>,
     sessions: HashMap<u64, PolicySession>,
     flows: HashMap<u64, PolicyFlow<ForeignByteIo, ForeignByteIo>>,
+    datagram_flows:
+        HashMap<u64, PolicyDatagramFlow<ForeignDatagramIo, ForeignDatagramIo>>,
     traffic: HashMap<String, UserTraffic>,
     flow_cursor: HashMap<String, usize>,
 }
@@ -192,6 +201,16 @@ struct PolicyFlow<S, M> {
     download: Pump,
 }
 
+struct PolicyDatagramFlow<S, M> {
+    session: u64,
+    user_id: Option<String>,
+    credential_digest: Option<String>,
+    stack: S,
+    mux: M,
+    upload: DatagramPump,
+    download: DatagramPump,
+}
+
 impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
     fn new(
         stack: S,
@@ -243,6 +262,63 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
             Poll::Pending => PumpReport::default(),
         };
         if upload == PumpReport::default() && download == PumpReport::default() {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok((upload, download)))
+        }
+    }
+}
+
+impl<S: DatagramIo, M: DatagramIo> PolicyDatagramFlow<S, M> {
+    fn new(
+        stack: S,
+        mux: M,
+        session: u64,
+        user_id: Option<String>,
+        credential_digest: Option<String>,
+    ) -> Result<Self, PumpError> {
+        Ok(Self {
+            session,
+            user_id,
+            credential_digest,
+            stack,
+            mux,
+            upload: DatagramPump::new(MAX_UDP_PAYLOAD)?,
+            download: DatagramPump::new(MAX_UDP_PAYLOAD)?,
+        })
+    }
+
+    fn poll(
+        &mut self,
+        context: &mut Context<'_>,
+        max_stack_to_mux: usize,
+        max_mux_to_stack: usize,
+        max_total: usize,
+    ) -> Poll<Result<(DatagramPumpReport, DatagramPumpReport), PumpError>> {
+        let upload = self.upload.poll(
+            context,
+            &mut self.stack,
+            &mut self.mux,
+            max_stack_to_mux.min(max_total),
+        );
+        let upload = match upload {
+            Poll::Ready(Ok(report)) => report,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => DatagramPumpReport::default(),
+        };
+        let remaining = max_total.saturating_sub(upload.sent);
+        let download = self.download.poll(
+            context,
+            &mut self.mux,
+            &mut self.stack,
+            max_mux_to_stack.min(remaining),
+        );
+        let download = match download {
+            Poll::Ready(Ok(report)) => report,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => DatagramPumpReport::default(),
+        };
+        if upload == DatagramPumpReport::default() && download == DatagramPumpReport::default() {
             Poll::Pending
         } else {
             Poll::Ready(Ok((upload, download)))
@@ -328,6 +404,7 @@ fn initialize(
                 client_credential,
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
+                datagram_flows: HashMap::new(),
                 traffic: HashMap::new(),
                 flow_cursor: HashMap::new(),
             },
@@ -534,6 +611,69 @@ unsafe extern "C" fn attach_flow(
     })
 }
 
+unsafe extern "C" fn attach_datagram_flow(
+    instance: u64,
+    session: u64,
+    stack_socket: u64,
+    stack_socket_io: *const SnolDatagramIoV1,
+    mux_stream: u64,
+    mux_stream_io: *const SnolDatagramIoV1,
+) -> u32 {
+    snolc_sdk::catch_status(|| {
+        if !INSTANCES.contains(instance)
+            || session == 0
+            || stack_socket == 0
+            || stack_socket_io.is_null()
+            || mux_stream == 0
+            || mux_stream_io.is_null()
+        {
+            return abi::STATUS_INVALID;
+        }
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let Some(state) = states.get_mut(&instance) else {
+                return abi::STATUS_INVALID;
+            };
+            let identity = match state.sessions.get_mut(&session) {
+                Some(session) if matches!(session.role, PolicyRole::Server) => {
+                    match session.pending_flows.pop_front() {
+                        Some(identity) => Some(identity),
+                        None => return abi::STATUS_DENIED,
+                    }
+                }
+                Some(_) => None,
+                None => return abi::STATUS_INVALID,
+            };
+            let stack = match unsafe {
+                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
+            } {
+                Ok(stack) => stack,
+                Err(_) => return abi::STATUS_INVALID,
+            };
+            let mux = match unsafe { ForeignDatagramIo::from_raw(mux_stream, mux_stream_io) } {
+                Ok(mux) => mux,
+                Err(_) => return abi::STATUS_INVALID,
+            };
+            let flow = match PolicyDatagramFlow::new(
+                stack,
+                mux,
+                session,
+                identity.as_ref().map(|identity| identity.user_id.clone()),
+                identity.and_then(|identity| identity.credential_digest),
+            ) {
+                Ok(flow) => flow,
+                Err(_) => return abi::STATUS_RESOURCE,
+            };
+            let handle = FLOW_NEXT.fetch_add(1, Ordering::Relaxed);
+            if handle == 0 {
+                return abi::STATUS_RESOURCE;
+            }
+            state.datagram_flows.insert(handle, flow);
+            abi::STATUS_OK
+        })
+    })
+}
+
 fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
     STATES.with(|states| {
         let mut states = states.borrow_mut();
@@ -549,12 +689,23 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
                     .as_ref()
                     .is_some_and(|id| stopped_users.contains(id))
             });
+            state.datagram_flows.retain(|_, flow| {
+                !flow
+                    .user_id
+                    .as_ref()
+                    .is_some_and(|id| stopped_users.contains(id))
+            });
         }
         let mut finished = Vec::new();
         let mut usage = Vec::new();
         let now_nanos = u64::try_from(state.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let mut user_flows: HashMap<String, Vec<u64>> = HashMap::new();
         for (handle, flow) in &state.flows {
+            if let Some(user_id) = &flow.user_id {
+                user_flows.entry(user_id.clone()).or_default().push(*handle);
+            }
+        }
+        for (handle, flow) in &state.datagram_flows {
             if let Some(user_id) = &flow.user_id {
                 user_flows.entry(user_id.clone()).or_default().push(*handle);
             }
@@ -584,19 +735,26 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         let mut grants = HashMap::new();
         for (user_id, mut flows) in scheduled {
             flows.sort_unstable();
+            let cursor = state.flow_cursor.entry(user_id.clone()).or_default();
+            let flow = select_flow(cursor, &flows);
+            let max_work = if state.datagram_flows.contains_key(&flow) {
+                MAX_UDP_PAYLOAD
+            } else {
+                state.options.sniff_bytes
+            };
             let Some(traffic) = state.traffic.get_mut(&user_id) else {
                 continue;
             };
             let quota_budget = usize::try_from(traffic.quota.credit_remaining())
                 .unwrap_or(usize::MAX)
-                .min(state.options.sniff_bytes);
+                .min(max_work);
             let weight = state
                 .admin
                 .users
                 .get(&user_id)
                 .map(|user| u64::from(user.spec.weight))
                 .unwrap_or(1);
-            let quantum = u64::try_from(state.options.sniff_bytes)
+            let quantum = u64::try_from(max_work)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(weight);
             let deficit = state.user_deficit.entry(user_id.clone()).or_default();
@@ -620,8 +778,6 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
                 if let Some(bucket) = &mut state.global_rate {
                     bucket.refund(global.saturating_sub(grant.global));
                 }
-                let cursor = state.flow_cursor.entry(user_id).or_default();
-                let flow = select_flow(cursor, &flows);
                 grants.insert(flow, grant);
             }
         }
@@ -688,6 +844,81 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         for handle in finished {
             state.flows.remove(&handle);
         }
+        let mut finished = Vec::new();
+        let mut usage = Vec::new();
+        for (handle, flow) in &mut state.datagram_flows {
+            let grant = flow
+                .user_id
+                .as_ref()
+                .and_then(|_| grants.remove(handle))
+                .unwrap_or_else(|| {
+                    if flow.user_id.is_none() {
+                        let work = MAX_UDP_PAYLOAD as u64;
+                        RateGrant {
+                            stack_to_mux: work,
+                            mux_to_stack: work,
+                            combined: work,
+                            global: work,
+                        }
+                    } else {
+                        RateGrant::default()
+                    }
+                });
+            if grant.combined == 0 {
+                continue;
+            }
+            let result = flow.poll(
+                &mut context,
+                usize::try_from(grant.stack_to_mux).unwrap_or(usize::MAX),
+                usize::try_from(grant.mux_to_stack).unwrap_or(usize::MAX),
+                usize::try_from(grant.combined).unwrap_or(usize::MAX),
+            );
+            match result {
+                Poll::Ready(Ok((upload, download))) if upload.finished && download.finished => {
+                    usage.push((*handle, flow.user_id.clone(), grant, upload, download));
+                    finished.push(*handle);
+                }
+                Poll::Ready(Ok((upload, download))) => {
+                    usage.push((*handle, flow.user_id.clone(), grant, upload, download));
+                }
+                Poll::Ready(Err(_)) => {
+                    usage.push((
+                        *handle,
+                        flow.user_id.clone(),
+                        grant,
+                        DatagramPumpReport::default(),
+                        DatagramPumpReport::default(),
+                    ));
+                    finished.push(*handle);
+                }
+                Poll::Pending => usage.push((
+                    *handle,
+                    flow.user_id.clone(),
+                    grant,
+                    DatagramPumpReport::default(),
+                    DatagramPumpReport::default(),
+                )),
+            }
+        }
+        for (handle, user_id, grant, upload, download) in usage {
+            let upload = PumpReport {
+                read: upload.received,
+                written: upload.sent,
+                finished: upload.finished,
+            };
+            let download = PumpReport {
+                read: download.received,
+                written: download.sent,
+                finished: download.finished,
+            };
+            refund_rate(state, user_id.as_deref(), grant, upload, download);
+            if charge_flow(state, user_id.as_deref(), upload, download).is_err() {
+                finished.push(handle);
+            }
+        }
+        for handle in finished {
+            state.datagram_flows.remove(&handle);
+        }
         let handles: Vec<u64> = state.sessions.keys().copied().collect();
         for handle in handles {
             let Some(mut session) = state.sessions.remove(&handle) else {
@@ -700,6 +931,9 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         let sessions = &state.sessions;
         state
             .flows
+            .retain(|_, flow| sessions.contains_key(&flow.session));
+        state
+            .datagram_flows
             .retain(|_, flow| sessions.contains_key(&flow.session));
         abi::STATUS_PENDING
     })
@@ -727,6 +961,12 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
         .flows
         .values()
         .filter_map(|flow| flow.user_id.clone())
+        .chain(
+            state
+                .datagram_flows
+                .values()
+                .filter_map(|flow| flow.user_id.clone()),
+        )
         .collect();
     let users: HashSet<String> = active_users
         .iter()
@@ -1278,7 +1518,14 @@ fn flow_limit_reached(state: &State, user: &UserRecord) -> bool {
         .flows
         .values()
         .filter(|flow| flow.user_id.as_deref() == Some(user.id.as_str()))
-        .count();
+        .count()
+        .saturating_add(
+            state
+                .datagram_flows
+                .values()
+                .filter(|flow| flow.user_id.as_deref() == Some(user.id.as_str()))
+                .count(),
+        );
     let pending = state
         .sessions
         .values()
@@ -1942,12 +2189,24 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
                 .as_ref()
                 .is_some_and(|id| stopped_users.contains(id))
         });
+        state.datagram_flows.retain(|_, flow| {
+            !flow
+                .user_id
+                .as_ref()
+                .is_some_and(|id| stopped_users.contains(id))
+        });
         state.sessions.retain(|_, session| {
             !matches!(&session.auth, AuthState::Authenticated(id) if stopped_users.contains(id))
         });
     }
     if !revoked_credentials.is_empty() {
         state.flows.retain(|_, flow| {
+            !flow
+                .credential_digest
+                .as_ref()
+                .is_some_and(|digest| revoked_credentials.contains(digest))
+        });
+        state.datagram_flows.retain(|_, flow| {
             !flow
                 .credential_digest
                 .as_ref()
@@ -2035,7 +2294,7 @@ static POLICY: SnolPolicyApiV1 = SnolPolicyApiV1 {
     attach_session: Some(attach_session),
     admit_flow: Some(admit_flow),
     attach_flow: Some(attach_flow),
-    attach_datagram_flow: None,
+    attach_datagram_flow: Some(attach_datagram_flow),
 };
 
 snolc_sdk::declare_stateful_module! {
