@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::config::{
     Config, ControlConfig, LogLevel, LogSource, LoggingConfig, Role, YamuxConfig, parse_size,
 };
+use crate::control::{ControlError, UnixControlServer};
 use crate::core_io::{MuxDatagramIo, RegisteredDatagramIo, RegisteredIo, is_registered};
 use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
@@ -237,6 +238,7 @@ pub struct Engine {
     logger: Option<EngineLogger>,
     log_errors: Arc<Mutex<VecDeque<String>>>,
     pending_controls: VecDeque<PendingControl>,
+    control_server: Option<UnixControlServer>,
 }
 
 struct EngineLogger {
@@ -357,6 +359,18 @@ impl Engine {
     ) -> Result<(Self, EngineHandle), EngineError> {
         let log_errors = Arc::new(Mutex::new(VecDeque::new()));
         let logger = configure_logging(&validated.config.logging, Arc::clone(&log_errors))?;
+        let control_server = match &validated.config.control {
+            ControlConfig::Off => None,
+            ControlConfig::Unix {
+                path,
+                max_request_bytes,
+                max_connections,
+            } => Some(UnixControlServer::bind(
+                path,
+                *max_request_bytes,
+                *max_connections,
+            )?),
+        };
         let (command_tx, command_rx) = mpsc::channel(validated.config.engine.max_commands);
         let (event_tx, event_rx) = mpsc::channel(validated.config.engine.max_events);
         let snapshot = Arc::new(AtomicSnapshot {
@@ -389,6 +403,7 @@ impl Engine {
             logger,
             log_errors,
             pending_controls: VecDeque::new(),
+            control_server,
         };
         Ok((engine, handle))
     }
@@ -451,7 +466,7 @@ impl Engine {
                 _ = timer => {
                     stack.poll();
                     self.poll_modules();
-                    self.poll_controls();
+                    self.poll_local_control();
                     self.poll_tunnels(&mut tunnels, &stack);
                     self.drain_module_events();
                     self.drain_log_errors();
@@ -521,6 +536,31 @@ impl Engine {
                 Poll::Pending => self.pending_controls.push_back(control),
             }
         }
+    }
+
+    fn poll_local_control(&mut self) {
+        let requests = self
+            .control_server
+            .as_mut()
+            .map(UnixControlServer::poll)
+            .unwrap_or_default();
+        for request in requests {
+            let (sender, receiver) = oneshot::channel();
+            match self.start_control(&request.instance, request.request, sender) {
+                Ok(()) => {
+                    if let Some(server) = &mut self.control_server {
+                        server.wait_for(request.connection, receiver);
+                    }
+                }
+                Err((error, sender)) => {
+                    drop(sender);
+                    if let Some(server) = &mut self.control_server {
+                        server.reject(request.connection, &error);
+                    }
+                }
+            }
+        }
+        self.poll_controls();
     }
 
     fn poll_modules(&mut self) {
@@ -1637,6 +1677,8 @@ pub enum EngineError {
     ResourceOverflow,
     #[error(transparent)]
     Logging(#[from] LogError),
+    #[error(transparent)]
+    Control(#[from] ControlError),
     #[error("logging environment is missing or invalid")]
     LoggingEnvironment,
     #[error("module instance {0} was not found")]

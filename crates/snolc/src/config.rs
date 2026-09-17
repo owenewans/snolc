@@ -243,7 +243,9 @@ impl Config {
             max_connections,
             ..
         } = self.control
-            && (max_request_bytes == 0 || max_connections == 0)
+            && (max_request_bytes == 0
+                || max_request_bytes > u32::MAX as usize
+                || max_connections == 0)
         {
             return Err(ConfigError::Invalid("control limits must be nonzero"));
         }

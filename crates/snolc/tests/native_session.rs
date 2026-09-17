@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use snolc::config::Config;
@@ -397,6 +397,39 @@ fn native_socks_udp_preserves_datagram_boundaries() {
 }
 
 #[test]
+fn native_unix_control_dispatches_on_engine_thread() {
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let root = std::env::temp_dir().join(format!(
+        "snolc-native-control-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let socket = root.join("snolc.sock");
+    let validated = build_side_with_control(
+        "control",
+        carrier_endpoint,
+        &socket,
+        ("protection_dummy", b""),
+        ("policy_dummy", b"pump_buffer_bytes = 4096\n"),
+    );
+    let (engine, handle) = Engine::build(validated, QuietHost).unwrap();
+    let thread = thread::spawn(move || engine.run());
+    wait_running(&handle);
+    let error =
+        snolc::control::request(&socket, "policy-control", b"unsupported", 1024).unwrap_err();
+    assert!(matches!(error, snolc::control::ControlError::Remote(_)));
+    handle.shutdown().unwrap();
+    thread.join().unwrap().unwrap();
+    assert!(!socket.exists());
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
 fn native_policy_local_debits_before_forwarding_payload() {
     let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let carrier_endpoint = carrier_listener.local_addr().unwrap();
@@ -737,12 +770,50 @@ fn build_side_with_adapter(
     protection: (&str, &[u8]),
     policy: (&str, &[u8]),
 ) -> snolc::ValidatedConfig {
+    build_side_with_adapter_and_control(
+        identity, role, endpoint, listen, adapter, protection, policy, None,
+    )
+}
+
+fn build_side_with_control(
+    identity: &str,
+    endpoint: std::net::SocketAddr,
+    socket: &Path,
+    protection: (&str, &[u8]),
+    policy: (&str, &[u8]),
+) -> snolc::ValidatedConfig {
+    build_side_with_adapter_and_control(
+        identity,
+        "server",
+        endpoint,
+        true,
+        (
+            "adapter_direct",
+            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+        ),
+        protection,
+        policy,
+        Some(socket),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_side_with_adapter_and_control(
+    identity: &str,
+    role: &str,
+    endpoint: std::net::SocketAddr,
+    listen: bool,
+    adapter: (&str, &[u8]),
+    protection: (&str, &[u8]),
+    policy: (&str, &[u8]),
+    control: Option<&Path>,
+) -> snolc::ValidatedConfig {
     let root = PathBuf::from(format!("/tmp/snolc-native-session-{identity}"));
     let adapter_config = root.join("adapter.toml");
     let protection_config = root.join("protection.toml");
     let carrier_config = root.join("carrier.toml");
     let policy_config = root.join("policy.toml");
-    let config = Config::parse(
+    let mut config = Config::parse(
         &main_config(
             role,
             &adapter_config,
@@ -753,6 +824,13 @@ fn build_side_with_adapter(
         Path::new("/"),
     )
     .unwrap();
+    if let Some(path) = control {
+        config.control = snolc::config::ControlConfig::Unix {
+            path: path.to_path_buf(),
+            max_request_bytes: 65_536,
+            max_connections: 4,
+        };
+    }
     let carrier_mode = if listen { "listen" } else { "connect" };
     let modules = vec![
         load(

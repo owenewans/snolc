@@ -1014,6 +1014,7 @@ dependencies = [
  "async-io",
  "crossbeam-queue",
  "futures",
+ "libc",
  "libloading",
  "serde",
  "sha2",
