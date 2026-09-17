@@ -354,6 +354,7 @@ static POLICY: SnolPolicyApiV1 = SnolPolicyApiV1 {
     admit_flow: Some(admit_flow),
     attach_flow: Some(attach_flow),
     attach_datagram_flow: Some(attach_datagram_flow),
+    admit_resolved: Some(admit_flow),
 };
 
 snolc_sdk::declare_stateful_module! {

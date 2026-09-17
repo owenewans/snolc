@@ -68,6 +68,7 @@ int main(void) {
     FIELD(SnolAdapterApiV1, close_flow);
     FIELD(SnolAdapterApiV1, attach_datagram);
     FIELD(SnolAdapterApiV1, attach_packet_port);
+    FIELD(SnolAdapterApiV1, resolve);
     putchar('\n');
 
     printf("SnolProtectionApiV1 %zu", sizeof(SnolProtectionApiV1));
@@ -90,6 +91,7 @@ int main(void) {
     FIELD(SnolPolicyApiV1, admit_flow);
     FIELD(SnolPolicyApiV1, attach_flow);
     FIELD(SnolPolicyApiV1, attach_datagram_flow);
+    FIELD(SnolPolicyApiV1, admit_resolved);
     putchar('\n');
 
     printf("SnolHostApiV1 %zu", sizeof(SnolHostApiV1));

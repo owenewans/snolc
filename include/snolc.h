@@ -115,6 +115,10 @@ struct SnolAdapterApiV1 {
     SnolStatus (*attach_packet_port)(SnolHandle instance,
                                      SnolHandle packet_port,
                                      const SnolDatagramIoV1 *packet_port_io);
+    SnolStatus (*resolve)(SnolHandle instance, SnolHandle operation,
+                          const SnolFlowMetadataV1 *metadata,
+                          SnolWakeHandle wake, SnolBytesMut output,
+                          size_t *written);
 };
 
 struct SnolProtectionApiV1 {
@@ -153,6 +157,9 @@ struct SnolPolicyApiV1 {
         SnolHandle instance, SnolHandle session, SnolHandle stack_socket,
         const SnolDatagramIoV1 *stack_socket_io, SnolHandle mux_stream,
         const SnolDatagramIoV1 *mux_stream_io);
+    SnolStatus (*admit_resolved)(SnolHandle instance, SnolHandle session,
+                                 const SnolFlowMetadataV1 *metadata,
+                                 SnolWakeHandle wake);
 };
 
 struct SnolHostApiV1 {

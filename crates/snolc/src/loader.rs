@@ -796,6 +796,7 @@ fn validate_class_tables(descriptor: &SnolModuleDescriptor) -> Result<(), LoadEr
             || policy.reserved != 0
             || policy.attach_session.is_none()
             || policy.admit_flow.is_none()
+            || policy.admit_resolved.is_none()
             || policy.attach_flow.is_none()
         {
             return Err(LoadError::ClassTable(snolc_abi::CLASS_POLICY));
@@ -1152,6 +1153,7 @@ mod tests {
         close_flow: Some(snolc_sdk::module::unsupported_adapter_close),
         attach_datagram: None,
         attach_packet_port: None,
+        resolve: None,
     };
 
     static CLOSED: AtomicBool = AtomicBool::new(false);

@@ -129,6 +129,7 @@ fn c_header_matches_rust_layout() {
             offset_of!(SnolAdapterApiV1, close_flow),
             offset_of!(SnolAdapterApiV1, attach_datagram),
             offset_of!(SnolAdapterApiV1, attach_packet_port),
+            offset_of!(SnolAdapterApiV1, resolve),
         ],
     );
     assert_layout::<SnolProtectionApiV1>(
@@ -160,6 +161,7 @@ fn c_header_matches_rust_layout() {
             offset_of!(SnolPolicyApiV1, admit_flow),
             offset_of!(SnolPolicyApiV1, attach_flow),
             offset_of!(SnolPolicyApiV1, attach_datagram_flow),
+            offset_of!(SnolPolicyApiV1, admit_resolved),
         ],
     );
     assert_layout::<SnolHostApiV1>(

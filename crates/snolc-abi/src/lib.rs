@@ -181,6 +181,14 @@ pub type AdapterAttachPacketPortFn =
 pub type AdapterCompleteFn =
     unsafe extern "C" fn(SnolHandle, SnolHandle, u32, SnolBytes) -> SnolStatus;
 pub type AdapterCloseFlowFn = unsafe extern "C" fn(SnolHandle, SnolHandle) -> SnolStatus;
+pub type AdapterResolveFn = unsafe extern "C" fn(
+    SnolHandle,
+    SnolHandle,
+    *const SnolFlowMetadataV1,
+    SnolWakeHandle,
+    SnolBytesMut,
+    *mut usize,
+) -> SnolStatus;
 
 #[repr(C)]
 pub struct SnolAdapterApiV1 {
@@ -193,6 +201,7 @@ pub struct SnolAdapterApiV1 {
     pub close_flow: Option<AdapterCloseFlowFn>,
     pub attach_datagram: Option<AdapterAttachDatagramFn>,
     pub attach_packet_port: Option<AdapterAttachPacketPortFn>,
+    pub resolve: Option<AdapterResolveFn>,
 }
 
 unsafe impl Sync for SnolAdapterApiV1 {}
@@ -268,6 +277,7 @@ pub struct SnolPolicyApiV1 {
     pub admit_flow: Option<AdmitFlowFn>,
     pub attach_flow: Option<AttachFlowFn>,
     pub attach_datagram_flow: Option<AttachDatagramFlowFn>,
+    pub admit_resolved: Option<AdmitFlowFn>,
 }
 
 unsafe impl Sync for SnolPolicyApiV1 {}
