@@ -201,6 +201,7 @@ struct AdminMutation {
     users: Vec<(String, Option<UserRecord>)>,
     credentials: Vec<(String, Option<CredentialRecord>)>,
     rules: Vec<(String, String)>,
+    active_rule_profiles: Vec<String>,
     disconnect: Option<u64>,
 }
 
@@ -2315,6 +2316,7 @@ fn prepare_admin_mutation(state: &State, request: ControlRequest) -> Result<Prep
         }
         ControlRequest::RulesReplace {
             profile,
+            apply,
             rules_toml,
             ..
         } => {
@@ -2326,6 +2328,9 @@ fn prepare_admin_mutation(state: &State, request: ControlRequest) -> Result<Prep
                 format!("meta/rules/{profile}"),
                 Some(rules_toml.as_bytes().to_vec()),
             ));
+            if apply == RuleApply::Active {
+                mutation.active_rule_profiles.push(profile.clone());
+            }
             mutation.rules.push((profile, rules_toml));
             (None, 0)
         }
@@ -2371,6 +2376,7 @@ fn put_user(
 }
 
 fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
+    let active_rule_profiles: HashSet<String> = mutation.active_rule_profiles.into_iter().collect();
     let stopped_users: HashSet<String> = mutation
         .users
         .iter()
@@ -2420,6 +2426,27 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
     }
     for (profile, rules) in mutation.rules {
         state.admin.rules.insert(profile, rules);
+    }
+    if !active_rule_profiles.is_empty() {
+        let affected_users: HashSet<String> = state
+            .admin
+            .users
+            .values()
+            .filter(|user| active_rule_profiles.contains(&user.spec.rule_profile))
+            .map(|user| user.id.clone())
+            .collect();
+        state.flows.retain(|_, flow| {
+            !flow
+                .user_id
+                .as_ref()
+                .is_some_and(|id| affected_users.contains(id))
+        });
+        state.datagram_flows.retain(|_, flow| {
+            !flow
+                .user_id
+                .as_ref()
+                .is_some_and(|id| affected_users.contains(id))
+        });
     }
     if let Some(session) = mutation.disconnect {
         state.sessions.remove(&session);
