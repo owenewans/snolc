@@ -106,7 +106,7 @@ macro_rules! declare_module {
     ) => {
         static INSTANCES: $crate::module::Instances = $crate::module::Instances::new();
 
-        unsafe extern "C" fn describe(
+        unsafe extern "C" fn ffi_describe(
             output: $crate::abi::SnolBytesMut,
             written: *mut usize,
         ) -> u32 {
@@ -115,7 +115,7 @@ macro_rules! declare_module {
             })
         }
 
-        unsafe extern "C" fn validate_config(
+        unsafe extern "C" fn ffi_validate_config(
             config: $crate::abi::SnolBytes,
             base: $crate::abi::SnolBytes,
             error: $crate::abi::SnolBytesMut,
@@ -140,7 +140,7 @@ macro_rules! declare_module {
             })
         }
 
-        unsafe extern "C" fn create(
+        unsafe extern "C" fn ffi_create(
             _config: $crate::abi::SnolBytes,
             _host: *const $crate::abi::SnolHostApiV1,
             output: *mut u64,
@@ -159,7 +159,7 @@ macro_rules! declare_module {
             })
         }
 
-        unsafe extern "C" fn poll(instance: u64, _wake: $crate::abi::SnolWakeHandle) -> u32 {
+        unsafe extern "C" fn ffi_poll(instance: u64, _wake: $crate::abi::SnolWakeHandle) -> u32 {
             $crate::catch_status(|| {
                 if INSTANCES.contains(instance) {
                     $crate::abi::STATUS_PENDING
@@ -169,7 +169,7 @@ macro_rules! declare_module {
             })
         }
 
-        unsafe extern "C" fn control(
+        unsafe extern "C" fn ffi_control(
             instance: u64,
             _request: $crate::abi::SnolBytes,
             _response: $crate::abi::SnolBytesMut,
@@ -187,7 +187,7 @@ macro_rules! declare_module {
             })
         }
 
-        unsafe extern "C" fn shutdown(instance: u64) -> u32 {
+        unsafe extern "C" fn ffi_shutdown(instance: u64) -> u32 {
             $crate::catch_status(|| {
                 if INSTANCES.contains(instance) {
                     $crate::abi::STATUS_OK
@@ -197,7 +197,7 @@ macro_rules! declare_module {
             })
         }
 
-        unsafe extern "C" fn destroy(instance: u64) {
+        unsafe extern "C" fn ffi_destroy(instance: u64) {
             let _ = std::panic::catch_unwind(|| INSTANCES.remove(instance));
         }
 
@@ -207,13 +207,13 @@ macro_rules! declare_module {
             class_mask: $class_mask,
             reserved: 0,
             name: concat!($name, "\0").as_ptr().cast(),
-            describe: Some(describe),
-            validate_config: Some(validate_config),
-            create: Some(create),
-            poll: Some(poll),
-            control: Some(control),
-            shutdown: Some(shutdown),
-            destroy: Some(destroy),
+            describe: Some(ffi_describe),
+            validate_config: Some(ffi_validate_config),
+            create: Some(ffi_create),
+            poll: Some(ffi_poll),
+            control: Some(ffi_control),
+            shutdown: Some(ffi_shutdown),
+            destroy: Some(ffi_destroy),
             byte_io: $byte_io,
             datagram_io: $datagram_io,
             adapter: $adapter,
