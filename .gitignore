@@ -1,0 +1,9 @@
+/target/
+/.idea/
+/.vscode/
+*.log
+*.pid
+*.sock
+*.tmp
+*.swp
+.DS_Store

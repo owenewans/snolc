@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = []
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98.1"
+authors = ["Owen Ewans <owenewans@tuta.io>"]
+license = "Unlicense"
+repository = "https://github.com/owenewans/snolc"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "unwind"
+strip = "symbols"
