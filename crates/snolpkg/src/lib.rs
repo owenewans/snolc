@@ -95,6 +95,7 @@ pub struct PublicationManifest {
     pub family: String,
     pub roles: Vec<String>,
     pub platforms: Vec<PlatformCapability>,
+    pub templates: Vec<PackageTemplate>,
     pub entry: PathBuf,
     pub dependencies: Vec<Dependency>,
     pub source: SourceRevision,
@@ -129,6 +130,13 @@ pub struct PlatformCapability {
     pub target: String,
     pub roles: Vec<String>,
     pub capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageTemplate {
+    pub role: String,
+    pub source: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -205,6 +213,7 @@ impl PublicationManifest {
         if self.classes.is_empty()
             || self.roles.is_empty()
             || self.platforms.is_empty()
+            || self.templates.is_empty()
             || self.artifacts.is_empty()
         {
             return Err(PackageError::ManifestValue);
@@ -225,6 +234,21 @@ impl PublicationManifest {
             if !roles.insert(role) {
                 return Err(PackageError::ManifestValue);
             }
+        }
+        let mut template_roles = BTreeSet::new();
+        let mut template_sources = BTreeSet::new();
+        for template in &self.templates {
+            validate_module_name(&template.role)?;
+            validate_relative_path(&template.source)?;
+            if !roles.contains(&template.role)
+                || !template_roles.insert(&template.role)
+                || !template_sources.insert(&template.source)
+            {
+                return Err(PackageError::ManifestValue);
+            }
+        }
+        if template_roles != roles {
+            return Err(PackageError::ManifestValue);
         }
         let mut platform_targets = BTreeSet::new();
         for platform in &self.platforms {
@@ -620,7 +644,36 @@ pub fn install_source(
     fs::create_dir_all(entry.parent().ok_or(PackageError::Path)?)?;
     fs::copy(&built, &entry)?;
     copy_notices(&source_tree, &content)?;
+    copy_templates(&publication.manifest, &source_tree, &content)?;
     install_extracted(&publication.manifest, source, artifact, &content, options)
+}
+
+fn copy_templates(
+    manifest: &PublicationManifest,
+    source: &Path,
+    content: &Path,
+) -> Result<(), PackageError> {
+    let source = source.canonicalize()?;
+    let output = content.join("templates");
+    fs::create_dir(&output)?;
+    for template in &manifest.templates {
+        let input = source.join(&template.source).canonicalize()?;
+        if !input.starts_with(&source) || !input.is_file() {
+            return Err(PackageError::Template);
+        }
+        let metadata = fs::metadata(&input)?;
+        if metadata.len() == 0 || metadata.len() > MAX_MANIFEST_BYTES as u64 {
+            return Err(PackageError::Template);
+        }
+        let destination = output.join(format!("{}.toml", template.role));
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        io::copy(&mut File::open(input)?, &mut destination)?;
+        destination.sync_all()?;
+    }
+    Ok(())
 }
 
 fn copy_notices(source: &Path, content: &Path) -> Result<(), PackageError> {
@@ -705,6 +758,16 @@ fn install_extracted(
     let entry = content.join(&manifest.entry);
     if !entry.is_file() {
         return Err(PackageError::Entry);
+    }
+    for template in &manifest.templates {
+        let template = content
+            .join("templates")
+            .join(format!("{}.toml", template.role));
+        let metadata = fs::metadata(&template).map_err(|_| PackageError::Template)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_MANIFEST_BYTES as u64
+        {
+            return Err(PackageError::Template);
+        }
     }
     let library_hash = hash_file(&entry)?;
     let (owner, name) = manifest
@@ -1300,6 +1363,14 @@ revision = "0123456789abcdef0123456789abcdef01234567"
 [build]
 package = "snolc-carrier-tcp"
 
+[[templates]]
+role = "client"
+source = "config/templates/modules/tcp-client.toml"
+
+[[templates]]
+role = "server"
+source = "config/templates/modules/tcp.toml"
+
 [[platforms]]
 target = "x86_64-unknown-linux-gnu"
 roles = ["client", "server"]
@@ -1514,6 +1585,7 @@ trust = "local-development"
         fs::create_dir_all(content.join("lib")).unwrap();
         fs::write(content.join("lib/libsnolc_carrier_tcp.so"), b"library").unwrap();
         fs::create_dir(content.join("templates")).unwrap();
+        fs::write(content.join("templates/client.toml"), "wire_version = 1\n").unwrap();
         fs::write(content.join("templates/server.toml"), "wire_version = 1\n").unwrap();
         let manifest = PublicationManifest::parse(MANIFEST.as_bytes()).unwrap();
         let source = TrustedSource {
@@ -1584,6 +1656,9 @@ trust = "local-development"
         let base_content = root.join("base-content");
         fs::create_dir_all(base_content.join("lib")).unwrap();
         fs::write(base_content.join("lib/libsnolc_carrier_tcp.so"), b"base").unwrap();
+        fs::create_dir(base_content.join("templates")).unwrap();
+        fs::write(base_content.join("templates/client.toml"), b"client").unwrap();
+        fs::write(base_content.join("templates/server.toml"), b"server").unwrap();
         let base_result =
             install_extracted(&base, &source, &base.artifacts[0], &base_content, &options).unwrap();
         let base_lock = read_stored_lock(&base_result.lock).unwrap();
@@ -1599,6 +1674,9 @@ trust = "local-development"
         let dependent_content = root.join("dependent-content");
         fs::create_dir_all(dependent_content.join("lib")).unwrap();
         fs::write(dependent_content.join("lib/dependent.so"), b"dependent").unwrap();
+        fs::create_dir(dependent_content.join("templates")).unwrap();
+        fs::write(dependent_content.join("templates/client.toml"), b"client").unwrap();
+        fs::write(dependent_content.join("templates/server.toml"), b"server").unwrap();
         install_extracted(
             &dependent,
             &source,
@@ -1622,8 +1700,11 @@ trust = "local-development"
         let repository = root.join("repository");
         fs::create_dir(&repository).unwrap();
         run_git(&repository, &["init", "-q"]);
-        let archive =
-            archive_with(|builder| append_file(builder, "lib/module.so", b"native module", 0o644));
+        let archive = archive_with(|builder| {
+            append_file(builder, "lib/module.so", b"native module", 0o644);
+            append_file(builder, "templates/client.toml", b"client", 0o644);
+            append_file(builder, "templates/server.toml", b"server", 0o644);
+        });
         let artifact_path = root.join("artifact.tar.gz");
         fs::write(&artifact_path, &archive).unwrap();
         let artifact_hash = encode_hex(&Sha256::digest(&archive));
@@ -1645,6 +1726,14 @@ revision = "0123456789abcdef0123456789abcdef01234567"
 
 [build]
 package = "snolc-test"
+
+[[templates]]
+role = "client"
+source = "config/client.toml"
+
+[[templates]]
+role = "server"
+source = "config/server.toml"
 
 [[platforms]]
 target = "{0}"
@@ -1854,6 +1943,9 @@ version = "0.0.1"
         )
         .unwrap();
         fs::write(repository.join("LICENSE"), "license text\n").unwrap();
+        fs::create_dir(repository.join("config")).unwrap();
+        fs::write(repository.join("config/client.toml"), "role = \"client\"\n").unwrap();
+        fs::write(repository.join("config/server.toml"), "role = \"server\"\n").unwrap();
         run_git(&repository, &["add", "."]);
         run_git(
             &repository,
@@ -1887,6 +1979,14 @@ revision = "{}"
 
 [build]
 package = "source-test"
+
+[[templates]]
+role = "client"
+source = "config/client.toml"
+
+[[templates]]
+role = "server"
+source = "config/server.toml"
 
 [[platforms]]
 target = "{1}"
@@ -1951,6 +2051,14 @@ build_output = "release/libsource_test.so"
         assert_eq!(
             fs::read_to_string(result.store.join("LICENSE")).unwrap(),
             "license text\n"
+        );
+        assert_eq!(
+            fs::read_to_string(result.store.join("templates/client.toml")).unwrap(),
+            "role = \"client\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(result.store.join("templates/server.toml")).unwrap(),
+            "role = \"server\"\n"
         );
         remove_readonly_tree(&root);
     }
