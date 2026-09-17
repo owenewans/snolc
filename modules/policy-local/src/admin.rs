@@ -393,8 +393,20 @@ impl AdminSequencer {
         request_hash: [u8; 32],
         response: Vec<u8>,
     ) -> Result<Vec<u8>, AdminError> {
-        validate_client_id(&client_id)?;
-        match self.clients.get(&client_id) {
+        let encoded = self.prepare_commit(&client_id, seq, request_hash, response)?;
+        self.apply_commit(client_id, &encoded)?;
+        Ok(encoded)
+    }
+
+    pub fn prepare_commit(
+        &self,
+        client_id: &str,
+        seq: u64,
+        request_hash: [u8; 32],
+        response: Vec<u8>,
+    ) -> Result<Vec<u8>, AdminError> {
+        validate_client_id(client_id)?;
+        match self.clients.get(client_id) {
             None if self.clients.len() >= self.max_clients => {
                 return Err(AdminError::ClientLimit);
             }
@@ -407,9 +419,19 @@ impl AdminSequencer {
             request_hash,
             response,
         };
-        let encoded = postcard::to_allocvec(&receipt).map_err(|_| AdminError::Encode)?;
+        postcard::to_allocvec(&receipt).map_err(|_| AdminError::Encode)
+    }
+
+    pub fn apply_commit(&mut self, client_id: String, encoded: &[u8]) -> Result<(), AdminError> {
+        let receipt: Receipt = postcard::from_bytes(encoded).map_err(|_| AdminError::Encode)?;
+        self.prepare_commit(
+            &client_id,
+            receipt.seq,
+            receipt.request_hash,
+            receipt.response.clone(),
+        )?;
         self.clients.insert(client_id, receipt);
-        Ok(encoded)
+        Ok(())
     }
 
     pub fn restore(&mut self, client_id: String, encoded: &[u8]) -> Result<(), AdminError> {
@@ -515,6 +537,28 @@ mod tests {
         assert!(matches!(
             sequencer.check("panel", 3, b"skip"),
             Err(AdminError::Sequence)
+        ));
+    }
+
+    #[test]
+    fn prepared_receipt_is_invisible_until_durable_commit() {
+        let mut sequencer = AdminSequencer::new(1).unwrap();
+        let request = b"user.disable";
+        let request_hash = match sequencer.check("panel", 1, request).unwrap() {
+            AdminDecision::Execute { request_hash } => request_hash,
+            AdminDecision::Replay(_) => panic!("new request replayed"),
+        };
+        let encoded = sequencer
+            .prepare_commit("panel", 1, request_hash, b"status = \"ok\"".to_vec())
+            .unwrap();
+        assert!(matches!(
+            sequencer.check("panel", 1, request).unwrap(),
+            AdminDecision::Execute { .. }
+        ));
+        sequencer.apply_commit("panel".into(), &encoded).unwrap();
+        assert!(matches!(
+            sequencer.check("panel", 1, request).unwrap(),
+            AdminDecision::Replay(_)
         ));
     }
 
