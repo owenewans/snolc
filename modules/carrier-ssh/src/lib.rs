@@ -6,6 +6,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,6 +26,7 @@ use russh::keys::{Algorithm, PublicKey, PublicKeyOrCertificate};
 use russh::server;
 use russh::{Channel, ChannelId, ChannelMsg, Disconnect, MethodKind, MethodSet, Pty};
 use serde::Deserialize;
+use snolc_sdk::HostApi;
 use snolc_sdk::abi::{
     self, SnolByteIoV1, SnolBytes, SnolBytesMut, SnolCarrierApiV1, SnolIoResult,
     SnolModuleDescriptor, SnolWakeHandle,
@@ -324,7 +329,7 @@ unsafe extern "C" fn validate_config(
 unsafe extern "C" fn create(
     config: SnolBytes,
     base: SnolBytes,
-    _host: *const abi::SnolHostApiV1,
+    host: *const abi::SnolHostApiV1,
     output: *mut u64,
 ) -> u32 {
     snolc_sdk::catch_status(|| {
@@ -343,13 +348,17 @@ unsafe extern "C" fn create(
         let Some(output) = (unsafe { output.as_mut() }) else {
             return abi::STATUS_INVALID;
         };
+        let host = match unsafe { HostApi::from_raw(host) } {
+            Ok(host) => host,
+            Err(status) => return status,
+        };
         let capacity = options.max_connections().saturating_add(1);
         let (command_tx, command_rx) = tokio::sync::mpsc::channel(capacity);
         let (event_tx, event_rx) = mpsc::sync_channel(capacity);
         let worker_options = options.clone();
         let worker = match std::thread::Builder::new()
             .name("snolc-carrier-ssh".into())
-            .spawn(move || worker_main(worker_options, command_rx, event_tx))
+            .spawn(move || worker_main(worker_options, command_rx, event_tx, host))
         {
             Ok(worker) => worker,
             Err(_) => return abi::STATUS_RESOURCE,
@@ -700,6 +709,7 @@ fn worker_main(
     options: Options,
     commands: tokio::sync::mpsc::Receiver<WorkerCommand>,
     events: SyncSender<WorkerEvent>,
+    host: HostApi,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -714,7 +724,9 @@ fn worker_main(
     let task_events = events.clone();
     let result = runtime.block_on(async move {
         match options {
-            Options::Connect { .. } => client_worker(options, commands, task_events.clone()).await,
+            Options::Connect { .. } => {
+                client_worker(options, commands, task_events.clone(), host).await
+            }
             Options::Listen { .. } => server_worker(options, commands, task_events.clone()).await,
         }
     });
@@ -727,6 +739,7 @@ async fn client_worker(
     options: Options,
     mut commands: tokio::sync::mpsc::Receiver<WorkerCommand>,
     events: SyncSender<WorkerEvent>,
+    host: HostApi,
 ) -> Result<(), ()> {
     let mut sessions = JoinSet::new();
     loop {
@@ -736,7 +749,7 @@ async fn client_worker(
                     let options = options.clone();
                     let events = events.clone();
                     sessions.spawn(async move {
-                        if run_client_session(options, events.clone()).await.is_err() {
+                        if run_client_session(options, events.clone(), host).await.is_err() {
                             let _ = events.try_send(WorkerEvent::AttemptFailed);
                         }
                     });
@@ -751,7 +764,11 @@ async fn client_worker(
     }
 }
 
-async fn run_client_session(options: Options, events: SyncSender<WorkerEvent>) -> Result<(), ()> {
+async fn run_client_session(
+    options: Options,
+    events: SyncSender<WorkerEvent>,
+    host: HostApi,
+) -> Result<(), ()> {
     let Options::Connect {
         endpoint_ip,
         username,
@@ -771,7 +788,8 @@ async fn run_client_session(options: Options, events: SyncSender<WorkerEvent>) -
         nodelay: true,
         ..Default::default()
     });
-    let mut session = client::connect(config, endpoint_ip, ClientHandler { trusted })
+    let socket = protected_socket(endpoint_ip, host).await?;
+    let mut session = client::connect_stream(config, socket, ClientHandler { trusted })
         .await
         .map_err(|_| ())?;
     let authenticated = match auth {
@@ -815,6 +833,26 @@ async fn run_client_session(options: Options, events: SyncSender<WorkerEvent>) -
         .disconnect(Disconnect::ByApplication, "snolc closed", "en")
         .await;
     Ok(())
+}
+
+async fn protected_socket(
+    endpoint: SocketAddr,
+    host: HostApi,
+) -> Result<tokio::net::TcpStream, ()> {
+    let socket = if endpoint.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }
+    .map_err(|_| ())?;
+    #[cfg(unix)]
+    let raw = i64::from(socket.as_raw_fd());
+    #[cfg(windows)]
+    let raw = i64::try_from(socket.as_raw_socket()).map_err(|_| ())?;
+    host.protect_socket(raw).map_err(|_| ())?;
+    let stream = socket.connect(endpoint).await.map_err(|_| ())?;
+    stream.set_nodelay(true).map_err(|_| ())?;
+    Ok(stream)
 }
 
 struct ClientHandler {
@@ -1091,14 +1129,45 @@ pub extern "C" fn snolc_module_entry() -> *const SnolModuleDescriptor {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
     use std::fs;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use futures::io::{AsyncReadExt, AsyncWriteExt};
     use russh::keys::ssh_key::LineEnding;
 
     use super::*;
+
+    struct ProtectState {
+        allow: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    unsafe extern "C" fn protect(context: *mut c_void, _socket: i64) -> u32 {
+        let state = unsafe { &*(context as *const ProtectState) };
+        state.calls.fetch_add(1, Ordering::Relaxed);
+        if state.allow.load(Ordering::Relaxed) {
+            abi::STATUS_OK
+        } else {
+            abi::STATUS_DENIED
+        }
+    }
+
+    fn host_api(state: &ProtectState) -> abi::SnolHostApiV1 {
+        abi::SnolHostApiV1 {
+            struct_size: size_of::<abi::SnolHostApiV1>() as u32,
+            reserved: 0,
+            context: (state as *const ProtectState).cast_mut().cast(),
+            now_monotonic_nanos: None,
+            set_timer: None,
+            emit_event: None,
+            context_get: None,
+            context_set: None,
+            protect_socket: Some(protect),
+        }
+    }
 
     #[test]
     fn ssh_subsystem_moves_bytes_with_password_auth() {
@@ -1152,18 +1221,24 @@ mod tests {
         };
         let (server_commands, server_rx) = tokio::sync::mpsc::channel(2);
         let (server_events, server_event_rx) = mpsc::sync_channel(2);
+        let protect_state = ProtectState {
+            allow: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        };
+        let raw_host = host_api(&protect_state);
+        let host = unsafe { HostApi::from_raw(&raw_host) }.unwrap();
         let server_thread = std::thread::spawn(move || {
-            worker_main(server, server_rx, server_events);
+            worker_main(server, server_rx, server_events, host);
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while TcpListener::bind(endpoint).is_ok() {
             assert!(Instant::now() < deadline, "SSH listener did not bind");
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
         let (client_commands, client_rx) = tokio::sync::mpsc::channel(2);
         let (client_events, client_event_rx) = mpsc::sync_channel(2);
         let client_thread = std::thread::spawn(move || {
-            worker_main(client, client_rx, client_events);
+            worker_main(client, client_rx, client_events, host);
         });
         client_commands.try_send(WorkerCommand::Connect).unwrap();
 
@@ -1196,6 +1271,32 @@ mod tests {
         server_commands.try_send(WorkerCommand::Shutdown).unwrap();
         client_thread.join().unwrap();
         server_thread.join().unwrap();
+        assert_eq!(protect_state.calls.load(Ordering::Relaxed), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protect_denial_prevents_ssh_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let state = ProtectState {
+            allow: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        };
+        let raw = host_api(&state);
+        let host = unsafe { HostApi::from_raw(&raw) }.unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            runtime
+                .block_on(protected_socket(listener.local_addr().unwrap(), host))
+                .is_err()
+        );
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
     }
 }

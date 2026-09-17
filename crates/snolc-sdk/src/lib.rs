@@ -17,6 +17,10 @@ use std::task::{Context, Poll};
 #[derive(Clone, Copy)]
 pub struct HostApi(*const abi::SnolHostApiV1);
 
+// host tables are immutable and protect_socket is the only worker-thread call exposed here.
+unsafe impl Send for HostApi {}
+unsafe impl Sync for HostApi {}
+
 impl HostApi {
     /// # Safety
     ///
