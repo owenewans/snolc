@@ -3,22 +3,25 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::task::{Context, Poll, Waker};
 
 use serde::Deserialize;
 use snolc_sdk::abi::{
-    self, SnolAdapterApiV1, SnolByteIoV1, SnolBytes, SnolFlowMetadataV1, SnolWakeHandle,
+    self, SnolAdapterApiV1, SnolByteIoV1, SnolBytes, SnolDatagramIoV1, SnolFlowMetadataV1,
+    SnolWakeHandle,
 };
-use snolc_sdk::{ByteIo, ForeignByteIo, Pump};
+use snolc_sdk::{ByteIo, DatagramIo, DatagramRecv, ForeignByteIo, ForeignDatagramIo, Pump};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+const MAX_UDP_PAYLOAD: usize = 65_507;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     Connect,
     UdpAssociate,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Address {
     Ipv4(Ipv4Addr),
     Ipv6(Ipv6Addr),
@@ -49,7 +52,7 @@ pub fn parse_request(input: &[u8]) -> Result<Request, ParseError> {
         3 => Command::UdpAssociate,
         _ => return Err(ParseError::Command),
     };
-    let (address, port, consumed) = parse_address(&input[3..])?;
+    let (address, port, consumed) = parse_address(&input[3..], command == Command::UdpAssociate)?;
     if consumed + 3 != input.len() {
         return Err(ParseError::TrailingBytes);
     }
@@ -67,7 +70,7 @@ pub fn parse_udp(input: &[u8]) -> Result<UdpPacket<'_>, ParseError> {
     if input[2] != 0 {
         return Err(ParseError::FragmentUnsupported);
     }
-    let (address, port, consumed) = parse_address(&input[3..])?;
+    let (address, port, consumed) = parse_address(&input[3..], false)?;
     Ok(UdpPacket {
         address,
         port,
@@ -75,7 +78,7 @@ pub fn parse_udp(input: &[u8]) -> Result<UdpPacket<'_>, ParseError> {
     })
 }
 
-fn parse_address(input: &[u8]) -> Result<(Address, u16, usize), ParseError> {
+fn parse_address(input: &[u8], allow_zero_port: bool) -> Result<(Address, u16, usize), ParseError> {
     let kind = *input.first().ok_or(ParseError::Incomplete)?;
     let (address, offset) = match kind {
         1 => {
@@ -114,7 +117,7 @@ fn parse_address(input: &[u8]) -> Result<(Address, u16, usize), ParseError> {
         .try_into()
         .map_err(|_| ParseError::Incomplete)?;
     let port = u16::from_be_bytes(port_bytes);
-    if port == 0 {
+    if port == 0 && !allow_zero_port {
         return Err(ParseError::Port);
     }
     Ok((address, port, offset + 2))
@@ -359,6 +362,29 @@ struct ClientFlow {
     accepted: Option<bool>,
 }
 
+struct UdpAssociation {
+    control: ClientConnection,
+    socket: UdpSocket,
+    client: Option<SocketAddr>,
+    destinations: HashMap<(Address, u16), u64>,
+    receive_buffer: Vec<u8>,
+}
+
+struct UdpClientFlow {
+    socket: UdpSocket,
+    client: SocketAddr,
+    address: Address,
+    address_type: u32,
+    address_bytes: Vec<u8>,
+    port: u16,
+    announced: bool,
+    stack: Option<ForeignDatagramIo>,
+    pending_upload: Option<Vec<u8>>,
+    pending_reply: Option<Vec<u8>>,
+    receive_buffer: Vec<u8>,
+    accepted: Option<bool>,
+}
+
 impl ClientFlow {
     fn new(connection: ClientConnection, request: Request) -> Result<Self, u32> {
         let (address_type, address) = match request.address {
@@ -423,11 +449,115 @@ impl ClientFlow {
     }
 }
 
+impl UdpClientFlow {
+    fn new(
+        socket: UdpSocket,
+        client: SocketAddr,
+        address: Address,
+        port: u16,
+        payload: Vec<u8>,
+    ) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        let (address_type, address_bytes) = match &address {
+            Address::Ipv4(address) => (abi::ADDRESS_IPV4, address.octets().to_vec()),
+            Address::Ipv6(address) => (abi::ADDRESS_IPV6, address.octets().to_vec()),
+            Address::Domain(address) => (abi::ADDRESS_DOMAIN, address.as_bytes().to_vec()),
+        };
+        Ok(Self {
+            socket,
+            client,
+            address,
+            address_type,
+            address_bytes,
+            port,
+            announced: false,
+            stack: None,
+            pending_upload: Some(payload),
+            pending_reply: None,
+            receive_buffer: vec![0; MAX_UDP_PAYLOAD],
+            accepted: None,
+        })
+    }
+
+    fn poll(&mut self, context: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        if self.accepted == Some(false) {
+            return Poll::Ready(Ok(true));
+        }
+        if self.accepted != Some(true) {
+            return Poll::Pending;
+        }
+        let Some(stack) = &mut self.stack else {
+            return Poll::Pending;
+        };
+        if let Some(payload) = &self.pending_upload {
+            match stack.poll_send_datagram(context, payload) {
+                Poll::Ready(Ok(())) => self.pending_upload = None,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if let Some(reply) = &self.pending_reply {
+            match self.socket.send_to(reply, self.client) {
+                Ok(length) if length == reply.len() => self.pending_reply = None,
+                Ok(_) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+        match stack.poll_recv_datagram(context, &mut self.receive_buffer) {
+            Poll::Ready(Ok(DatagramRecv::Datagram(length))) => {
+                let mut reply = encode_udp_header(&self.address, self.port)?;
+                reply.extend_from_slice(&self.receive_buffer[..length]);
+                match self.socket.send_to(&reply, self.client) {
+                    Ok(written) if written == reply.len() => Poll::Ready(Ok(false)),
+                    Ok(_) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        self.pending_reply = Some(reply);
+                        Poll::Pending
+                    }
+                    Err(error) => Poll::Ready(Err(error)),
+                }
+            }
+            Poll::Ready(Ok(DatagramRecv::BufferTooSmall(_))) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stack returned oversized UDP payload",
+            ))),
+            Poll::Ready(Ok(DatagramRecv::Closed)) => Poll::Ready(Ok(true)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn encode_udp_header(address: &Address, port: u16) -> io::Result<Vec<u8>> {
+    let mut output = vec![0, 0, 0];
+    match address {
+        Address::Ipv4(address) => {
+            output.push(1);
+            output.extend_from_slice(&address.octets());
+        }
+        Address::Ipv6(address) => {
+            output.push(4);
+            output.extend_from_slice(&address.octets());
+        }
+        Address::Domain(address) => {
+            let length = u8::try_from(address.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "domain is too long"))?;
+            output.extend_from_slice(&[3, length]);
+            output.extend_from_slice(address.as_bytes());
+        }
+    }
+    output.extend_from_slice(&port.to_be_bytes());
+    Ok(output)
+}
+
 struct State {
     listener: TcpListener,
     options: Options,
     clients: Vec<ClientConnection>,
     flows: HashMap<u64, ClientFlow>,
+    associations: Vec<UdpAssociation>,
+    udp_flows: HashMap<u64, UdpClientFlow>,
     next_flow: u64,
 }
 
@@ -452,6 +582,8 @@ fn initialize(
                 options,
                 clients: Vec::new(),
                 flows: HashMap::new(),
+                associations: Vec::new(),
+                udp_flows: HashMap::new(),
                 next_flow: 1,
             },
         );
@@ -495,31 +627,59 @@ unsafe extern "C" fn accept(
                 return abi::STATUS_INVALID;
             };
             poll_state(state);
-            let Some((handle, flow)) = state.flows.iter_mut().find(|(_, flow)| !flow.announced)
-            else {
-                return abi::STATUS_PENDING;
-            };
-            flow.announced = true;
-            *metadata = SnolFlowMetadataV1 {
-                struct_size: size_of::<SnolFlowMetadataV1>() as u32,
-                kind: abi::FLOW_TCP,
-                address_type: flow.address_type,
-                reserved: 0,
-                address: SnolBytes {
-                    pointer: flow.address.as_ptr(),
-                    length: flow.address.len(),
-                },
-                port: flow.port,
-                reserved2: [0; 6],
-                metadata: SnolBytes {
-                    pointer: std::ptr::null(),
-                    length: 0,
-                },
-            };
-            *output = *handle;
-            abi::STATUS_OK
+            if let Some((handle, flow)) = state.flows.iter_mut().find(|(_, flow)| !flow.announced) {
+                flow.announced = true;
+                *metadata = flow_metadata(
+                    abi::FLOW_TCP,
+                    flow.address_type,
+                    &flow.address,
+                    flow.port,
+                );
+                *output = *handle;
+                return abi::STATUS_OK;
+            }
+            if let Some((handle, flow)) = state
+                .udp_flows
+                .iter_mut()
+                .find(|(_, flow)| !flow.announced)
+            {
+                flow.announced = true;
+                *metadata = flow_metadata(
+                    abi::FLOW_UDP,
+                    flow.address_type,
+                    &flow.address_bytes,
+                    flow.port,
+                );
+                *output = *handle;
+                return abi::STATUS_OK;
+            }
+            abi::STATUS_PENDING
         })
     })
+}
+
+fn flow_metadata(
+    kind: u32,
+    address_type: u32,
+    address: &[u8],
+    port: u16,
+) -> SnolFlowMetadataV1 {
+    SnolFlowMetadataV1 {
+        struct_size: size_of::<SnolFlowMetadataV1>() as u32,
+        kind,
+        address_type,
+        reserved: 0,
+        address: SnolBytes {
+            pointer: address.as_ptr(),
+            length: address.len(),
+        },
+        port,
+        reserved2: [0; 6],
+        metadata: SnolBytes {
+            pointer: std::ptr::null(),
+            length: 0,
+        },
+    }
 }
 
 unsafe extern "C" fn attach(
@@ -552,6 +712,38 @@ unsafe extern "C" fn attach(
     })
 }
 
+unsafe extern "C" fn attach_datagram(
+    instance: u64,
+    flow: u64,
+    stack_socket: u64,
+    stack_socket_io: *const SnolDatagramIoV1,
+) -> u32 {
+    snolc_sdk::catch_status(|| {
+        if !INSTANCES.contains(instance) || flow == 0 || stack_socket == 0 {
+            return abi::STATUS_INVALID;
+        }
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let Some(flow) = states
+                .get_mut(&instance)
+                .and_then(|state| state.udp_flows.get_mut(&flow))
+            else {
+                return abi::STATUS_INVALID;
+            };
+            if flow.stack.is_some() {
+                return abi::STATUS_INVALID;
+            }
+            flow.stack = match unsafe {
+                ForeignDatagramIo::from_raw(stack_socket, stack_socket_io)
+            } {
+                Ok(stack) => Some(stack),
+                Err(_) => return abi::STATUS_INVALID,
+            };
+            abi::STATUS_OK
+        })
+    })
+}
+
 unsafe extern "C" fn complete(instance: u64, flow: u64, status: u32, reason: SnolBytes) -> u32 {
     snolc_sdk::catch_status(|| {
         if !INSTANCES.contains(instance) || flow == 0 || reason.length > 256 {
@@ -559,10 +751,7 @@ unsafe extern "C" fn complete(instance: u64, flow: u64, status: u32, reason: Sno
         }
         STATES.with(|states| {
             let mut states = states.borrow_mut();
-            let Some(flow) = states
-                .get_mut(&instance)
-                .and_then(|state| state.flows.get_mut(&flow))
-            else {
+            let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
             let reply = match status {
@@ -572,9 +761,15 @@ unsafe extern "C" fn complete(instance: u64, flow: u64, status: u32, reason: Sno
                 abi::STATUS_IO => 5,
                 _ => 1,
             };
-            flow.response = socks_response(reply).to_vec();
-            flow.response_offset = 0;
-            flow.accepted = Some(status == abi::STATUS_OK);
+            if let Some(flow) = state.flows.get_mut(&flow) {
+                flow.response = socks_response(reply).to_vec();
+                flow.response_offset = 0;
+                flow.accepted = Some(status == abi::STATUS_OK);
+            } else if let Some(flow) = state.udp_flows.get_mut(&flow) {
+                flow.accepted = Some(status == abi::STATUS_OK);
+            } else {
+                return abi::STATUS_INVALID;
+            }
             abi::STATUS_OK
         })
     })
@@ -586,11 +781,9 @@ unsafe extern "C" fn close_flow(instance: u64, flow: u64) -> u32 {
             return abi::STATUS_INVALID;
         }
         if STATES.with(|states| {
-            states
-                .borrow_mut()
-                .get_mut(&instance)
-                .and_then(|state| state.flows.remove(&flow))
-                .is_some()
+            states.borrow_mut().get_mut(&instance).is_some_and(|state| {
+                state.flows.remove(&flow).is_some() | state.udp_flows.remove(&flow).is_some()
+            })
         }) {
             abi::STATUS_OK
         } else {
@@ -603,8 +796,27 @@ fn socks_response(reply: u8) -> [u8; 10] {
     [5, reply, 0, 1, 0, 0, 0, 0, 0, 0]
 }
 
+fn socks_bound_response(address: SocketAddr) -> Vec<u8> {
+    let mut output = vec![5, 0, 0];
+    match address {
+        SocketAddr::V4(address) => {
+            output.push(1);
+            output.extend_from_slice(&address.ip().octets());
+            output.extend_from_slice(&address.port().to_be_bytes());
+        }
+        SocketAddr::V6(address) => {
+            output.push(4);
+            output.extend_from_slice(&address.ip().octets());
+            output.extend_from_slice(&address.port().to_be_bytes());
+        }
+    }
+    output
+}
+
 fn poll_state(state: &mut State) {
-    while state.clients.len() + state.flows.len() < state.options.max_connections {
+    while state.clients.len() + state.flows.len() + state.associations.len()
+        < state.options.max_connections
+    {
         match state.listener.accept() {
             Ok((stream, _)) => match ClientConnection::new(stream) {
                 Ok(client) => state.clients.push(client),
@@ -628,17 +840,46 @@ fn poll_state(state: &mut State) {
         let ClientPhase::Ready(request) = &connection.phase else {
             continue;
         };
-        if request.command != Command::Connect {
-            continue;
-        }
         let request = request.clone();
-        let handle = state.next_flow;
-        let Some(next) = handle.checked_add(1) else {
-            continue;
-        };
-        state.next_flow = next;
-        if let Ok(flow) = ClientFlow::new(connection, request) {
-            state.flows.insert(handle, flow);
+        match request.command {
+            Command::Connect => {
+                let handle = state.next_flow;
+                let Some(next) = handle.checked_add(1) else {
+                    continue;
+                };
+                state.next_flow = next;
+                if let Ok(flow) = ClientFlow::new(connection, request) {
+                    state.flows.insert(handle, flow);
+                }
+            }
+            Command::UdpAssociate if state.associations.len() < state.options.max_udp_associations => {
+                let listen: SocketAddr = match state.options.listen.parse() {
+                    Ok(listen) => listen,
+                    Err(_) => continue,
+                };
+                let bind = SocketAddr::new(listen.ip(), 0);
+                let socket = match UdpSocket::bind(bind) {
+                    Ok(socket) => socket,
+                    Err(_) => continue,
+                };
+                if socket.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                let mut connection = connection;
+                let response = match socket.local_addr() {
+                    Ok(address) => socks_bound_response(address),
+                    Err(_) => continue,
+                };
+                connection.queue(&response);
+                state.associations.push(UdpAssociation {
+                    control: connection,
+                    socket,
+                    client: None,
+                    destinations: HashMap::new(),
+                    receive_buffer: vec![0; u16::MAX as usize],
+                });
+            }
+            Command::UdpAssociate => {}
         }
     }
     state
@@ -655,6 +896,97 @@ fn poll_state(state: &mut State) {
     }
     for handle in finished {
         state.flows.remove(&handle);
+    }
+
+    poll_udp_associations(state, &mut context);
+}
+
+fn poll_udp_associations(state: &mut State, context: &mut Context<'_>) {
+    let mut packets = Vec::new();
+    let mut closed = Vec::new();
+    for (index, association) in state.associations.iter_mut().enumerate() {
+        if association.control.write_pending().is_err() {
+            closed.push(index);
+            continue;
+        }
+        let mut probe = [0; 1];
+        match association.control.stream.peek(&mut probe) {
+            Ok(0) => {
+                closed.push(index);
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                closed.push(index);
+                continue;
+            }
+        }
+        match association.socket.recv_from(&mut association.receive_buffer) {
+            Ok((length, source)) => {
+                if association.client.is_some_and(|client| client != source) {
+                    continue;
+                }
+                association.client = Some(source);
+                if let Ok(packet) = parse_udp(&association.receive_buffer[..length]) {
+                    packets.push((
+                        index,
+                        source,
+                        packet.address,
+                        packet.port,
+                        packet.payload.to_vec(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => closed.push(index),
+        }
+    }
+    for (index, source, address, port, payload) in packets {
+        let key = (address.clone(), port);
+        let existing = state.associations[index].destinations.get(&key).copied();
+        if let Some(handle) = existing
+            && let Some(flow) = state.udp_flows.get_mut(&handle)
+        {
+            if flow.pending_upload.is_none() {
+                flow.pending_upload = Some(payload);
+            }
+            continue;
+        }
+        state.associations[index].destinations.remove(&key);
+        if state.flows.len() + state.udp_flows.len() >= state.options.max_connections {
+            continue;
+        }
+        let handle = state.next_flow;
+        let Some(next) = handle.checked_add(1) else {
+            continue;
+        };
+        let socket = match state.associations[index].socket.try_clone() {
+            Ok(socket) => socket,
+            Err(_) => continue,
+        };
+        let flow = match UdpClientFlow::new(socket, source, address, port, payload) {
+            Ok(flow) => flow,
+            Err(_) => continue,
+        };
+        state.next_flow = next;
+        state.associations[index].destinations.insert(key, handle);
+        state.udp_flows.insert(handle, flow);
+    }
+    let mut finished = Vec::new();
+    for (handle, flow) in &mut state.udp_flows {
+        match flow.poll(context) {
+            Poll::Ready(Ok(true)) | Poll::Ready(Err(_)) => finished.push(*handle),
+            Poll::Ready(Ok(false)) | Poll::Pending => {}
+        }
+    }
+    for handle in finished {
+        state.udp_flows.remove(&handle);
+    }
+    closed.sort_unstable();
+    closed.dedup();
+    for index in closed.into_iter().rev() {
+        state.associations.swap_remove(index);
     }
 }
 
@@ -693,7 +1025,7 @@ static ADAPTER: SnolAdapterApiV1 = SnolAdapterApiV1 {
     attach: Some(attach),
     complete: Some(complete),
     close_flow: Some(close_flow),
-    attach_datagram: None,
+    attach_datagram: Some(attach_datagram),
 };
 
 snolc_sdk::declare_stateful_module! {
