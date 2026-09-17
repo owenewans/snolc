@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/snolc-abi", "crates/snolc-sdk", "crates/snolc"]
+members = [
+  "crates/snolc-abi",
+  "crates/snolc-sdk",
+  "crates/snolc",
+  "modules/adapter-socks5",
+  "modules/adapter-http-connect",
+]
 
 [workspace.package]
 version = "0.0.1"
