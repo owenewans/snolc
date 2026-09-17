@@ -221,6 +221,10 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
     })
 }
 
+fn control_instance(_instance: u64, _request: &[u8]) -> Result<Vec<u8>, u32> {
+    Err(abi::STATUS_UNSUPPORTED)
+}
+
 fn shutdown_instance(instance: u64) -> u32 {
     if STATES.with(|states| states.borrow_mut().remove(&instance).is_some()) {
         abi::STATUS_OK
@@ -248,6 +252,7 @@ snolc_sdk::declare_stateful_module! {
     validate: validate_config,
     initialize: initialize,
     poll: poll_instance,
+    control: control_instance,
     shutdown: shutdown_instance,
     destroy: destroy_instance,
     byte_io: std::ptr::null(),

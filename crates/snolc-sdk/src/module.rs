@@ -239,6 +239,7 @@ macro_rules! declare_stateful_module {
         validate: $validate:path,
         initialize: $initialize:path,
         poll: $poll:path,
+        control: $control:path,
         shutdown: $shutdown:path,
         destroy: $destroy:path,
         byte_io: $byte_io:expr,
@@ -331,18 +332,26 @@ macro_rules! declare_stateful_module {
 
         unsafe extern "C" fn ffi_control(
             instance: u64,
-            _request: $crate::abi::SnolBytes,
-            _response: $crate::abi::SnolBytesMut,
+            request: $crate::abi::SnolBytes,
+            response: $crate::abi::SnolBytesMut,
             written: *mut usize,
         ) -> u32 {
-            $crate::catch_status(|| {
-                if !written.is_null() {
-                    unsafe { *written = 0 };
+            $crate::catch_status(|| unsafe {
+                if !INSTANCES.contains(instance) {
+                    return $crate::abi::STATUS_INVALID;
                 }
-                if INSTANCES.contains(instance) {
-                    $crate::abi::STATUS_UNSUPPORTED
-                } else {
-                    $crate::abi::STATUS_INVALID
+                let request = match $crate::module::input(request) {
+                    Ok(value) => value,
+                    Err(status) => return status,
+                };
+                match $control(instance, request) {
+                    Ok(output) => $crate::module::write_output(&output, response, written),
+                    Err(status) => {
+                        if let Some(written) = written.as_mut() {
+                            *written = 0;
+                        }
+                        status
+                    }
                 }
             })
         }
