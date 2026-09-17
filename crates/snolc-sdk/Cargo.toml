@@ -1,0 +1,13 @@
+[package]
+name = "snolc-sdk"
+description = "safe native module SDK for snolc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+snolc-abi = { path = "../snolc-abi" }
+thiserror.workspace = true
