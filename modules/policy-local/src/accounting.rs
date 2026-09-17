@@ -6,6 +6,7 @@ pub struct QuotaAccount {
     credit_remaining: u64,
     block_bytes: u64,
     debit_pending: bool,
+    refund_pending: bool,
 }
 
 impl QuotaAccount {
@@ -23,11 +24,12 @@ impl QuotaAccount {
             credit_remaining: 0,
             block_bytes,
             debit_pending: false,
+            refund_pending: false,
         })
     }
 
     pub fn request_credit(&mut self) -> Result<u64, QuotaError> {
-        if self.credit_remaining != 0 || self.debit_pending {
+        if self.credit_remaining != 0 || self.debit_pending || self.refund_pending {
             return Err(QuotaError::State);
         }
         let available = self
@@ -73,16 +75,39 @@ impl QuotaAccount {
     }
 
     pub fn checkpoint_refund(&mut self) -> Result<u64, QuotaError> {
-        if self.debit_pending {
+        let refund = self.request_refund()?;
+        self.commit_refund(refund)?;
+        Ok(refund)
+    }
+
+    pub fn request_refund(&mut self) -> Result<u64, QuotaError> {
+        if self.debit_pending || self.refund_pending {
             return Err(QuotaError::State);
         }
         let refund = self.credit_remaining;
+        if refund == 0 {
+            return Err(QuotaError::State);
+        }
+        self.refund_pending = true;
+        Ok(refund)
+    }
+
+    pub fn commit_refund(&mut self, refund: u64) -> Result<(), QuotaError> {
+        if !self.refund_pending || refund == 0 || refund != self.credit_remaining {
+            return Err(QuotaError::State);
+        }
         self.durable_charged = self
             .durable_charged
             .checked_sub(refund)
             .ok_or(QuotaError::State)?;
         self.credit_remaining = 0;
-        Ok(refund)
+        self.refund_pending = false;
+        Ok(())
+    }
+
+    pub fn fail_refund(&mut self) {
+        self.refund_pending = false;
+        self.credit_remaining = 0;
     }
 
     pub fn durable_charged(&self) -> u64 {
@@ -197,6 +222,20 @@ mod tests {
         assert_eq!(account.durable_charged(), 1_048_576);
         assert_eq!(account.checkpoint_refund().unwrap(), 1_000_000);
         assert_eq!(account.durable_charged(), 48_576);
+    }
+
+    #[test]
+    fn refund_changes_state_only_after_commit() {
+        let mut account = QuotaAccount::new(Some(2_000_000), 0, 1_048_576).unwrap();
+        let debit = account.request_credit().unwrap();
+        account.commit_credit(debit).unwrap();
+        account.charge(48_576).unwrap();
+        let refund = account.request_refund().unwrap();
+        assert_eq!(account.durable_charged(), 1_048_576);
+        assert_eq!(account.credit_remaining(), 1_000_000);
+        account.commit_refund(refund).unwrap();
+        assert_eq!(account.durable_charged(), 48_576);
+        assert_eq!(account.credit_remaining(), 0);
     }
 
     #[test]
