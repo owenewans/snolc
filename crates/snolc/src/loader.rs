@@ -264,6 +264,58 @@ impl LoadedModule {
         }
     }
 
+    /// # Safety
+    ///
+    /// The stack handle and I/O table must remain valid until the adapter closes them.
+    pub unsafe fn adapter_attach_flow(
+        &self,
+        flow: u64,
+        stack_handle: u64,
+        stack_io: *const SnolByteIoV1,
+    ) -> Result<(), LoadError> {
+        let instance = self.instance.ok_or(LoadError::NotCreated)?;
+        let adapter = unsafe { self.descriptor().adapter.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))?;
+        let attach = adapter.attach.ok_or(LoadError::MissingFunction)?;
+        let status = unsafe { attach(instance, flow, stack_handle, stack_io) };
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(LoadError::ModuleStatus(status))
+        }
+    }
+
+    pub fn adapter_complete_flow(
+        &self,
+        flow: u64,
+        status: u32,
+        reason: &[u8],
+    ) -> Result<(), LoadError> {
+        let instance = self.instance.ok_or(LoadError::NotCreated)?;
+        let adapter = unsafe { self.descriptor().adapter.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))?;
+        let complete = adapter.complete.ok_or(LoadError::MissingFunction)?;
+        let status = unsafe { complete(instance, flow, status, bytes(reason)) };
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(LoadError::ModuleStatus(status))
+        }
+    }
+
+    pub fn adapter_close_flow(&self, flow: u64) -> Result<(), LoadError> {
+        let instance = self.instance.ok_or(LoadError::NotCreated)?;
+        let adapter = unsafe { self.descriptor().adapter.as_ref() }
+            .ok_or(LoadError::ClassTable(snolc_abi::CLASS_ADAPTER))?;
+        let close = adapter.close_flow.ok_or(LoadError::MissingFunction)?;
+        let status = unsafe { close(instance, flow) };
+        if status == snolc_abi::STATUS_OK {
+            Ok(())
+        } else {
+            Err(LoadError::ModuleStatus(status))
+        }
+    }
+
     pub fn protection_wrap(
         &self,
         lower: &mut Option<ModuleByteIo>,
