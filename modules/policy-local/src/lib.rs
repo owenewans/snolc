@@ -62,6 +62,9 @@ static FLOW_NEXT: AtomicU64 = AtomicU64::new(1);
 
 struct State {
     started: Instant,
+    global_rate: Option<TokenBucket>,
+    user_deficit: HashMap<String, u64>,
+    user_cursor: usize,
     options: Options,
     storage: StorageWorker,
     admin: AdminState,
@@ -100,6 +103,7 @@ struct RateGrant {
     stack_to_mux: u64,
     mux_to_stack: u64,
     combined: u64,
+    global: u64,
 }
 
 struct PolicySession {
@@ -246,6 +250,17 @@ fn initialize(
 ) -> Result<(), u32> {
     let base = std::str::from_utf8(base).map_err(|_| abi::STATUS_INVALID)?;
     let options = Options::parse(config, Path::new(base)).map_err(|_| abi::STATUS_INVALID)?;
+    let started = Instant::now();
+    let global_rate = match &options.global_rate {
+        config::GlobalRate::Unlimited => None,
+        config::GlobalRate::Limited {
+            bytes_per_second,
+            burst_bytes,
+        } => Some(
+            TokenBucket::new(*bytes_per_second, *burst_bytes, 0)
+                .map_err(|_| abi::STATUS_INVALID)?,
+        ),
+    };
     let storage = StorageWorker::open(
         options.storage.path.clone(),
         options.storage.cache_bytes,
@@ -283,7 +298,10 @@ fn initialize(
         states.borrow_mut().insert(
             instance,
             State {
-                started: Instant::now(),
+                started,
+                global_rate,
+                user_deficit: HashMap::new(),
+                user_cursor: 0,
                 options,
                 admin: AdminState {
                     sequencer,
@@ -514,16 +532,67 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
                 user_flows.entry(user_id.clone()).or_default().push(*handle);
             }
         }
+        let mut scheduled: Vec<_> = user_flows.into_iter().collect();
+        scheduled.sort_by(|left, right| left.0.cmp(&right.0));
+        if !scheduled.is_empty() {
+            let offset = state.user_cursor % scheduled.len();
+            scheduled.rotate_left(offset);
+            state.user_cursor = state.user_cursor.wrapping_add(1);
+        }
+        let total_weight = scheduled
+            .iter()
+            .map(|(user_id, _)| {
+                state
+                    .admin
+                    .users
+                    .get(user_id)
+                    .map(|user| u64::from(user.spec.weight))
+                    .unwrap_or(1)
+            })
+            .fold(0_u64, u64::saturating_add);
+        let global_available = state
+            .global_rate
+            .as_mut()
+            .and_then(|bucket| bucket.available(now_nanos).ok());
         let mut grants = HashMap::new();
-        for (user_id, mut flows) in user_flows {
+        for (user_id, mut flows) in scheduled {
             flows.sort_unstable();
             let Some(traffic) = state.traffic.get_mut(&user_id) else {
                 continue;
             };
-            let budget = usize::try_from(traffic.quota.credit_remaining())
+            let quota_budget = usize::try_from(traffic.quota.credit_remaining())
                 .unwrap_or(usize::MAX)
                 .min(state.options.sniff_bytes);
-            if let Ok(grant) = take_rate_grant(traffic, budget, now_nanos) {
+            let weight = state
+                .admin
+                .users
+                .get(&user_id)
+                .map(|user| u64::from(user.spec.weight))
+                .unwrap_or(1);
+            let quantum = u64::try_from(state.options.sniff_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(weight);
+            let deficit = state.user_deficit.entry(user_id.clone()).or_default();
+            *deficit = deficit.saturating_add(quantum);
+            let weighted = global_available
+                .map(|available| weighted_share(available, weight, total_weight))
+                .unwrap_or(u64::MAX);
+            let budget = quota_budget
+                .min(usize::try_from(*deficit).unwrap_or(usize::MAX))
+                .min(usize::try_from(weighted).unwrap_or(usize::MAX));
+            let global = match &mut state.global_rate {
+                Some(bucket) => bucket.take(budget as u64, now_nanos).unwrap_or(0),
+                None => budget as u64,
+            };
+            if let Ok(mut grant) = take_rate_grant(
+                traffic,
+                usize::try_from(global).unwrap_or(usize::MAX),
+                now_nanos,
+            ) {
+                grant.global = grant.combined;
+                if let Some(bucket) = &mut state.global_rate {
+                    bucket.refund(global.saturating_sub(grant.global));
+                }
                 let cursor = state.flow_cursor.entry(user_id).or_default();
                 let flow = select_flow(cursor, &flows);
                 grants.insert(flow, grant);
@@ -541,6 +610,7 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
                             stack_to_mux: work,
                             mux_to_stack: work,
                             combined: work,
+                            global: work,
                         }
                     } else {
                         RateGrant::default()
@@ -608,6 +678,17 @@ fn select_flow(cursor: &mut usize, flows: &[u64]) -> u64 {
     let flow = flows[*cursor % flows.len()];
     *cursor = cursor.wrapping_add(1);
     flow
+}
+
+fn weighted_share(available: u64, weight: u64, total_weight: u64) -> u64 {
+    if total_weight == 0 {
+        return 0;
+    }
+    u128::from(available)
+        .saturating_mul(u128::from(weight))
+        .checked_div(u128::from(total_weight))
+        .and_then(|share| u64::try_from(share).ok())
+        .unwrap_or(u64::MAX)
 }
 
 fn advance_quota(state: &mut State) -> HashSet<String> {
@@ -855,6 +936,7 @@ fn advance_quota(state: &mut State) -> HashSet<String> {
     for user_id in remove_traffic {
         state.traffic.remove(&user_id);
         state.flow_cursor.remove(&user_id);
+        state.user_deficit.remove(&user_id);
     }
     stopped
 }
@@ -894,6 +976,7 @@ fn take_rate_grant(
         stack_to_mux: user_download,
         mux_to_stack: user_upload,
         combined,
+        global: combined,
     })
 }
 
@@ -924,6 +1007,13 @@ fn refund_rate(
                 .combined
                 .saturating_sub(stack_written.saturating_add(mux_written)),
         );
+    }
+    let written = stack_written.saturating_add(mux_written);
+    if let Some(bucket) = &mut state.global_rate {
+        bucket.refund(grant.global.saturating_sub(written));
+    }
+    if let Some(deficit) = state.user_deficit.get_mut(user_id) {
+        *deficit = deficit.saturating_sub(written);
     }
 }
 
@@ -1678,6 +1768,9 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
         state
             .flow_cursor
             .retain(|id, _| !stopped_users.contains(id));
+        state
+            .user_deficit
+            .retain(|id, _| !stopped_users.contains(id));
         state.flows.retain(|_, flow| {
             !flow
                 .user_id
@@ -1923,6 +2016,13 @@ mod module_tests {
         assert_eq!(select_flow(&mut cursor, &flows), 7);
         assert_eq!(select_flow(&mut cursor, &flows), 11);
         assert_eq!(select_flow(&mut cursor, &flows), 3);
+    }
+
+    #[test]
+    fn global_rate_share_respects_user_weight() {
+        assert_eq!(weighted_share(4_000, 1, 4), 1_000);
+        assert_eq!(weighted_share(4_000, 3, 4), 3_000);
+        assert_eq!(weighted_share(1, 1, 2), 0);
     }
 
     #[test]
