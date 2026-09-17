@@ -68,6 +68,26 @@ struct State {
     client_credential: Option<Credential>,
     sessions: HashMap<u64, PolicySession>,
     flows: HashMap<u64, PolicyFlow<ForeignByteIo, ForeignByteIo>>,
+    traffic: HashMap<String, UserTraffic>,
+}
+
+struct UserTraffic {
+    quota: QuotaAccount,
+    debit: Option<PendingDebit>,
+    refund: Option<PendingRefund>,
+    failed: bool,
+}
+
+struct PendingDebit {
+    amount: u64,
+    record: UserRecord,
+    reply: storage::WriteReply,
+}
+
+struct PendingRefund {
+    amount: u64,
+    record: UserRecord,
+    reply: storage::WriteReply,
 }
 
 struct PolicySession {
@@ -172,15 +192,24 @@ impl<S: ByteIo, M: ByteIo> PolicyFlow<S, M> {
         let upload = self
             .upload
             .poll(context, &mut self.stack, &mut self.mux, max_work);
+        let upload = match upload {
+            Poll::Ready(Ok(report)) => report,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => PumpReport::default(),
+        };
+        let remaining = max_work.saturating_sub(upload.written);
         let download = self
             .download
-            .poll(context, &mut self.mux, &mut self.stack, max_work);
-        match (upload, download) {
-            (Poll::Ready(Ok(upload)), Poll::Ready(Ok(download))) => {
-                Poll::Ready(Ok((upload, download)))
-            }
-            (Poll::Ready(Err(error)), _) | (_, Poll::Ready(Err(error))) => Poll::Ready(Err(error)),
-            _ => Poll::Pending,
+            .poll(context, &mut self.mux, &mut self.stack, remaining);
+        let download = match download {
+            Poll::Ready(Ok(report)) => report,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => PumpReport::default(),
+        };
+        if upload == PumpReport::default() && download == PumpReport::default() {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok((upload, download)))
         }
     }
 }
@@ -248,6 +277,7 @@ fn initialize(
                 client_credential,
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
+                traffic: HashMap::new(),
             },
         );
     });
@@ -355,12 +385,16 @@ unsafe extern "C" fn admit_flow(
             let Some(state) = states.get_mut(&instance) else {
                 return abi::STATUS_INVALID;
             };
-            let user_id = match state.sessions.get(&session).map(|session| &session.auth) {
-                Some(AuthState::Authenticated(user_id)) => user_id.clone(),
+            let (role, user_id) = match state.sessions.get(&session) {
+                Some(PolicySession {
+                    role,
+                    auth: AuthState::Authenticated(user_id),
+                    ..
+                }) => (*role, user_id.clone()),
                 Some(_) => return abi::STATUS_PENDING,
                 None => return abi::STATUS_INVALID,
             };
-            if user_id == "remote" {
+            if matches!(role, PolicyRole::Client) {
                 return abi::STATUS_OK;
             }
             let Some(user) = state.admin.users.get(&user_id) else {
@@ -440,14 +474,46 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
             return abi::STATUS_INVALID;
         };
         let mut context = Context::from_waker(Waker::noop());
+        let stopped_users = advance_quota(state);
+        if !stopped_users.is_empty() {
+            state.flows.retain(|_, flow| {
+                !flow
+                    .user_id
+                    .as_ref()
+                    .is_some_and(|id| stopped_users.contains(id))
+            });
+        }
         let mut finished = Vec::new();
+        let mut usage = Vec::new();
         for (handle, flow) in &mut state.flows {
-            match flow.poll(&mut context, state.options.sniff_bytes) {
+            let budget = flow
+                .user_id
+                .as_ref()
+                .and_then(|id| state.traffic.get(id))
+                .map(|traffic| {
+                    usize::try_from(traffic.quota.credit_remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(state.options.sniff_bytes)
+                })
+                .unwrap_or(state.options.sniff_bytes);
+            if budget == 0 {
+                continue;
+            }
+            match flow.poll(&mut context, budget) {
                 Poll::Ready(Ok((upload, download))) if upload.finished && download.finished => {
+                    usage.push((*handle, flow.user_id.clone(), upload, download));
                     finished.push(*handle);
                 }
+                Poll::Ready(Ok((upload, download))) => {
+                    usage.push((*handle, flow.user_id.clone(), upload, download));
+                }
                 Poll::Ready(Err(_)) => finished.push(*handle),
-                Poll::Ready(Ok(_)) | Poll::Pending => {}
+                Poll::Pending => {}
+            }
+        }
+        for (handle, user_id, upload, download) in usage {
+            if charge_flow(state, user_id.as_deref(), upload, download).is_err() {
+                finished.push(handle);
             }
         }
         for handle in finished {
@@ -464,6 +530,258 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
         }
         abi::STATUS_PENDING
     })
+}
+
+fn advance_quota(state: &mut State) -> HashSet<String> {
+    let active_users: HashSet<String> = state
+        .flows
+        .values()
+        .filter_map(|flow| flow.user_id.clone())
+        .collect();
+    let users: HashSet<String> = active_users
+        .iter()
+        .cloned()
+        .chain(state.traffic.keys().cloned())
+        .collect();
+    let mut stopped = HashSet::new();
+    let mut remove_traffic = Vec::new();
+    for user_id in users {
+        let active = active_users.contains(&user_id);
+        if !state.traffic.contains_key(&user_id) {
+            if !active {
+                continue;
+            }
+            let Some(user) = state.admin.users.get(&user_id) else {
+                stopped.insert(user_id);
+                continue;
+            };
+            let limit = match user.spec.quota {
+                ByteLimit::Unlimited => None,
+                ByteLimit::Limited { bytes } => Some(bytes),
+            };
+            let quota = match QuotaAccount::new(
+                limit,
+                user.durable_charged_bytes,
+                state.options.storage.accounting_block_bytes,
+            ) {
+                Ok(quota) => quota,
+                Err(_) => {
+                    stopped.insert(user_id);
+                    continue;
+                }
+            };
+            state.traffic.insert(
+                user_id.clone(),
+                UserTraffic {
+                    quota,
+                    debit: None,
+                    refund: None,
+                    failed: false,
+                },
+            );
+        }
+        let Some(traffic) = state.traffic.get_mut(&user_id) else {
+            stopped.insert(user_id);
+            continue;
+        };
+        if traffic.failed {
+            if active {
+                stopped.insert(user_id);
+            } else {
+                remove_traffic.push(user_id);
+            }
+            continue;
+        }
+        if let Some(pending) = traffic.debit.take() {
+            match pending.reply.try_recv() {
+                Ok(Ok(())) => {
+                    if traffic.quota.commit_credit(pending.amount).is_err() {
+                        traffic.failed = true;
+                        stopped.insert(user_id.clone());
+                        continue;
+                    }
+                    state.admin.users.insert(user_id.clone(), pending.record);
+                }
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    traffic.quota.fail_credit();
+                    traffic.failed = true;
+                    stopped.insert(user_id.clone());
+                    continue;
+                }
+                Err(TryRecvError::Empty) => {
+                    traffic.debit = Some(pending);
+                    continue;
+                }
+            }
+        }
+        if let Some(pending) = traffic.refund.take() {
+            match pending.reply.try_recv() {
+                Ok(Ok(())) => {
+                    if traffic.quota.commit_refund(pending.amount).is_err() {
+                        traffic.failed = true;
+                        if active {
+                            stopped.insert(user_id.clone());
+                        }
+                        continue;
+                    }
+                    state.admin.users.insert(user_id.clone(), pending.record);
+                    if !active {
+                        remove_traffic.push(user_id.clone());
+                        continue;
+                    }
+                }
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    traffic.quota.fail_refund();
+                    traffic.failed = true;
+                    if active {
+                        stopped.insert(user_id.clone());
+                    }
+                    continue;
+                }
+                Err(TryRecvError::Empty) => {
+                    traffic.refund = Some(pending);
+                    continue;
+                }
+            }
+        }
+        if !active {
+            let amount = match traffic.quota.request_refund() {
+                Ok(amount) => amount,
+                Err(_) if traffic.quota.credit_remaining() == 0 => {
+                    remove_traffic.push(user_id.clone());
+                    continue;
+                }
+                Err(_) => {
+                    traffic.failed = true;
+                    continue;
+                }
+            };
+            let Some(mut record) = state.admin.users.get(&user_id).cloned() else {
+                traffic.quota.fail_refund();
+                traffic.failed = true;
+                continue;
+            };
+            record.durable_charged_bytes = match record.durable_charged_bytes.checked_sub(amount) {
+                Some(charged) => charged,
+                None => {
+                    traffic.quota.fail_refund();
+                    traffic.failed = true;
+                    continue;
+                }
+            };
+            let value = match encode_user_record(&record) {
+                Ok(value) => value,
+                Err(_) => {
+                    traffic.quota.fail_refund();
+                    traffic.failed = true;
+                    continue;
+                }
+            };
+            match state.storage.put(format!("user/{user_id}"), value) {
+                Ok(reply) => {
+                    traffic.refund = Some(PendingRefund {
+                        amount,
+                        record,
+                        reply,
+                    });
+                }
+                Err(_) => {
+                    traffic.quota.fail_refund();
+                    traffic.failed = true;
+                }
+            }
+            continue;
+        }
+        if traffic.quota.credit_remaining() != 0 {
+            continue;
+        }
+        let amount = match traffic.quota.request_credit() {
+            Ok(amount) => amount,
+            Err(QuotaError::Exhausted) => {
+                stopped.insert(user_id.clone());
+                continue;
+            }
+            Err(_) => {
+                traffic.failed = true;
+                stopped.insert(user_id.clone());
+                continue;
+            }
+        };
+        let Some(mut record) = state.admin.users.get(&user_id).cloned() else {
+            traffic.quota.fail_credit();
+            traffic.failed = true;
+            stopped.insert(user_id.clone());
+            continue;
+        };
+        record.durable_charged_bytes = match record.durable_charged_bytes.checked_add(amount) {
+            Some(charged) => charged,
+            None => {
+                traffic.quota.fail_credit();
+                traffic.failed = true;
+                stopped.insert(user_id.clone());
+                continue;
+            }
+        };
+        let value = match encode_user_record(&record) {
+            Ok(value) => value,
+            Err(_) => {
+                traffic.quota.fail_credit();
+                traffic.failed = true;
+                stopped.insert(user_id.clone());
+                continue;
+            }
+        };
+        match state.storage.put(format!("user/{user_id}"), value) {
+            Ok(reply) => {
+                traffic.debit = Some(PendingDebit {
+                    amount,
+                    record,
+                    reply,
+                });
+            }
+            Err(_) => {
+                traffic.quota.fail_credit();
+                traffic.failed = true;
+                stopped.insert(user_id);
+            }
+        }
+    }
+    for user_id in remove_traffic {
+        state.traffic.remove(&user_id);
+    }
+    stopped
+}
+
+fn charge_flow(
+    state: &mut State,
+    user_id: Option<&str>,
+    upload: PumpReport,
+    download: PumpReport,
+) -> Result<(), QuotaError> {
+    let Some(user_id) = user_id else {
+        return Ok(());
+    };
+    let accepted = upload
+        .written
+        .checked_add(download.written)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(QuotaError::Overflow)?;
+    let traffic = state.traffic.get_mut(user_id).ok_or(QuotaError::State)?;
+    traffic.quota.charge(accepted)?;
+    let user = state
+        .admin
+        .users
+        .get_mut(user_id)
+        .ok_or(QuotaError::State)?;
+    user.upload_bytes = user
+        .upload_bytes
+        .checked_add(u64::try_from(download.written).map_err(|_| QuotaError::Overflow)?)
+        .ok_or(QuotaError::Overflow)?;
+    user.download_bytes = user
+        .download_bytes
+        .checked_add(u64::try_from(upload.written).map_err(|_| QuotaError::Overflow)?)
+        .ok_or(QuotaError::Overflow)?;
+    Ok(())
 }
 
 fn poll_policy_session(
@@ -1181,6 +1499,7 @@ fn apply_admin_mutation(state: &mut State, mutation: AdminMutation) {
         state.sessions.remove(&session);
     }
     if !stopped_users.is_empty() {
+        state.traffic.retain(|id, _| !stopped_users.contains(id));
         state.flows.retain(|_, flow| {
             !flow
                 .user_id
