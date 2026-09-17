@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -34,7 +35,26 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         [command, path] if command == "run" => run_engine(Path::new(path)),
-        _ => Err("usage: snolc version | validate <snolc.toml> | run <snolc.toml>".into()),
+        [command, socket, instance, request] if command == "control" => {
+            let request = fs::read(request).map_err(|error| error.to_string())?;
+            if request.len() > 65_536 {
+                return Err("control request exceeds 65536 bytes".into());
+            }
+            let response = snolc::control::request(
+                Path::new(socket),
+                instance,
+                &request,
+                65_536,
+            )
+            .map_err(|error| error.to_string())?;
+            std::io::stdout()
+                .write_all(&response)
+                .map_err(|error| error.to_string())
+        }
+        _ => Err(
+            "usage: snolc version | validate <snolc.toml> | run <snolc.toml> | control <socket> <instance> <request.toml>"
+                .into(),
+        ),
     }
 }
 
