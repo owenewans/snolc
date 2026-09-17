@@ -5,11 +5,16 @@ mod io;
 pub mod module;
 mod module_io;
 mod pump;
+mod resolved;
 
 pub use handles::{HandleError, HandleTable, TypedHandle};
 pub use io::{ByteIo, DatagramIo, DatagramRecv};
 pub use module_io::{ForeignByteIo, ForeignDatagramIo, ForeignIoError};
 pub use pump::{DatagramPump, DatagramPumpReport, Pump, PumpError, PumpReport};
+pub use resolved::{
+    MAX_RESOLVED_ADDRESSES, ResolvedAddressError, decode_resolved_addresses,
+    encode_resolved_addresses, resolved_addresses_size,
+};
 pub use snolc_abi as abi;
 
 use std::task::{Context, Poll};
