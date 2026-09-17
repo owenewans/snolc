@@ -236,7 +236,7 @@ pub type DescribeFn = unsafe extern "C" fn(SnolBytesMut, *mut usize) -> SnolStat
 pub type ValidateConfigFn =
     unsafe extern "C" fn(SnolBytes, SnolBytes, SnolBytesMut, *mut usize) -> SnolStatus;
 pub type CreateFn =
-    unsafe extern "C" fn(SnolBytes, *const SnolHostApiV1, *mut SnolHandle) -> SnolStatus;
+    unsafe extern "C" fn(SnolBytes, SnolBytes, *const SnolHostApiV1, *mut SnolHandle) -> SnolStatus;
 pub type PollFn = unsafe extern "C" fn(SnolHandle, SnolWakeHandle) -> SnolStatus;
 pub type ControlFn =
     unsafe extern "C" fn(SnolHandle, SnolBytes, SnolBytesMut, *mut usize) -> SnolStatus;

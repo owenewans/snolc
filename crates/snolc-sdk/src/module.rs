@@ -142,6 +142,7 @@ macro_rules! declare_module {
 
         unsafe extern "C" fn ffi_create(
             _config: $crate::abi::SnolBytes,
+            _base: $crate::abi::SnolBytes,
             _host: *const $crate::abi::SnolHostApiV1,
             output: *mut u64,
         ) -> u32 {

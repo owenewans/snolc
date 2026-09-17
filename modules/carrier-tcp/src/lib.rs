@@ -166,6 +166,7 @@ unsafe extern "C" fn validate_config(
 
 unsafe extern "C" fn create(
     config: SnolBytes,
+    _base: SnolBytes,
     _host: *const abi::SnolHostApiV1,
     output: *mut u64,
 ) -> u32 {

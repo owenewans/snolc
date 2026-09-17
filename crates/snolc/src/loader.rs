@@ -97,7 +97,14 @@ impl LoadedModule {
         let function = self.descriptor().create.ok_or(LoadError::MissingFunction)?;
         let mut instance = 0;
         // config and host pointers remain valid for the call; modules copy retained data.
-        let status = unsafe { function(bytes(&self.config), host, &mut instance) };
+        let status = unsafe {
+            function(
+                bytes(&self.config),
+                bytes(&self.base_directory),
+                host,
+                &mut instance,
+            )
+        };
         if status != snolc_abi::STATUS_OK {
             return Err(LoadError::ModuleStatus(status));
         }
@@ -354,7 +361,12 @@ mod tests {
         unsafe { *written = 0 };
         snolc_abi::STATUS_OK
     }
-    unsafe extern "C" fn create(_: SnolBytes, _: *const SnolHostApiV1, _: *mut u64) -> u32 {
+    unsafe extern "C" fn create(
+        _: SnolBytes,
+        _: SnolBytes,
+        _: *const SnolHostApiV1,
+        _: *mut u64,
+    ) -> u32 {
         snolc_abi::STATUS_OK
     }
     unsafe extern "C" fn poll(_: u64, _: snolc_abi::SnolWakeHandle) -> u32 {

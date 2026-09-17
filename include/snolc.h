@@ -136,8 +136,8 @@ typedef struct SnolModuleDescriptor {
     SnolStatus (*describe)(SnolBytesMut output, size_t *written);
     SnolStatus (*validate_config)(SnolBytes config, SnolBytes base_directory,
                                   SnolBytesMut error, size_t *written);
-    SnolStatus (*create)(SnolBytes config, const SnolHostApiV1 *host,
-                         SnolHandle *instance);
+    SnolStatus (*create)(SnolBytes config, SnolBytes base_directory,
+                         const SnolHostApiV1 *host, SnolHandle *instance);
     SnolStatus (*poll)(SnolHandle instance, SnolWakeHandle wake);
     SnolStatus (*control)(SnolHandle instance, SnolBytes request,
                           SnolBytesMut response, size_t *written);
