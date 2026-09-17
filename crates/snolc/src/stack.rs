@@ -14,7 +14,7 @@ use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxT
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
-use snolc_sdk::{HandleTable, TypedHandle};
+use snolc_sdk::{DatagramIo, DatagramRecv, HandleTable, TypedHandle};
 use thiserror::Error;
 
 use crate::config::StackConfig;
@@ -80,9 +80,21 @@ pub struct TcpStreamPort {
     write_shutdown: bool,
 }
 
+pub struct UdpDatagramPort {
+    bridge: Weak<RefCell<StackBridge>>,
+    lease: Rc<UdpFlowLease>,
+    side: Side,
+    wake: Rc<PortWake>,
+}
+
 struct TcpFlowLease {
     bridge: Weak<RefCell<StackBridge>>,
     handle: TcpFlowHandle,
+}
+
+struct UdpFlowLease {
+    bridge: Weak<RefCell<StackBridge>>,
+    handle: UdpFlowHandle,
 }
 
 #[derive(Default)]
@@ -136,6 +148,36 @@ impl SharedStackBridge {
                 side: Side::Policy,
                 wake: policy_wake,
                 write_shutdown: false,
+            },
+        ))
+    }
+
+    pub fn open_udp(
+        &self,
+        metadata: FlowMetadata,
+    ) -> Result<(UdpDatagramPort, UdpDatagramPort), StackError> {
+        let handle = self.inner.borrow_mut().open_udp(metadata)?;
+        let lease = Rc::new(UdpFlowLease {
+            bridge: Rc::downgrade(&self.inner),
+            handle,
+        });
+        let adapter_wake = Rc::new(PortWake::default());
+        let policy_wake = Rc::new(PortWake::default());
+        self.wakes
+            .borrow_mut()
+            .extend([Rc::downgrade(&adapter_wake), Rc::downgrade(&policy_wake)]);
+        Ok((
+            UdpDatagramPort {
+                bridge: Rc::downgrade(&self.inner),
+                lease: Rc::clone(&lease),
+                side: Side::Adapter,
+                wake: adapter_wake,
+            },
+            UdpDatagramPort {
+                bridge: Rc::downgrade(&self.inner),
+                lease,
+                side: Side::Policy,
+                wake: policy_wake,
             },
         ))
     }
@@ -277,6 +319,95 @@ impl Drop for TcpFlowLease {
     fn drop(&mut self) {
         if let Some(bridge) = self.bridge.upgrade() {
             let _ = bridge.borrow_mut().close_tcp(self.handle);
+        }
+    }
+}
+
+impl UdpDatagramPort {
+    pub fn metadata(&self) -> Result<FlowMetadata, StackError> {
+        let bridge = self.bridge.upgrade().ok_or(StackError::Stopped)?;
+        Ok(bridge.borrow().udp_metadata(self.lease.handle)?.clone())
+    }
+
+    fn pending<T>(&self, context: &Context<'_>) -> Poll<io::Result<T>> {
+        *self.wake.waker.borrow_mut() = Some(context.waker().clone());
+        Poll::Pending
+    }
+
+    fn bridge(&self) -> io::Result<Rc<RefCell<StackBridge>>> {
+        self.bridge
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stack is stopped"))
+    }
+}
+
+impl DatagramIo for UdpDatagramPort {
+    fn poll_recv_datagram(
+        &mut self,
+        context: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<DatagramRecv>> {
+        let bridge = match self.bridge() {
+            Ok(bridge) => bridge,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let result = {
+            let mut bridge = bridge.borrow_mut();
+            match self.side {
+                Side::Adapter => bridge.udp_recv_adapter(self.lease.handle, output),
+                Side::Policy => bridge.udp_recv_policy(self.lease.handle, output),
+            }
+        };
+        match result {
+            Ok(DatagramRead::Empty) => self.pending(context),
+            Ok(DatagramRead::Datagram(length)) => {
+                Poll::Ready(Ok(DatagramRecv::Datagram(length)))
+            }
+            Ok(DatagramRead::BufferTooSmall(required)) => {
+                Poll::Ready(Ok(DatagramRecv::BufferTooSmall(required)))
+            }
+            Err(error) => Poll::Ready(Err(stack_io_error(error))),
+        }
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        context: &mut Context<'_>,
+        datagram: &[u8],
+    ) -> Poll<io::Result<()>> {
+        if datagram.len() > crate::wire::MAX_UDP_PAYLOAD {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP payload exceeds wire limit",
+            )));
+        }
+        let bridge = match self.bridge() {
+            Ok(bridge) => bridge,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let result = {
+            let mut bridge = bridge.borrow_mut();
+            match self.side {
+                Side::Adapter => bridge.udp_send_adapter(self.lease.handle, datagram),
+                Side::Policy => bridge.udp_send_policy(self.lease.handle, datagram),
+            }
+        };
+        match result {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(StackError::Udp) => self.pending(context),
+            Err(error) => Poll::Ready(Err(stack_io_error(error))),
+        }
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for UdpFlowLease {
+    fn drop(&mut self) {
+        if let Some(bridge) = self.bridge.upgrade() {
+            let _ = bridge.borrow_mut().close_udp(self.handle);
         }
     }
 }
@@ -1042,6 +1173,38 @@ mod tests {
             }
         }
         assert_eq!(&output, b"through-stack");
+        assert_eq!(adapter.metadata().unwrap(), metadata());
+        drop(adapter);
+        assert_eq!(bridge.managed_bytes(), allocated);
+        drop(policy);
+        assert_eq!(bridge.managed_bytes(), 0);
+    }
+
+    #[test]
+    fn async_udp_ports_preserve_atomic_datagrams_and_release_flow() {
+        let bridge = shared_bridge();
+        let (mut adapter, mut policy) = bridge.open_udp(metadata()).unwrap();
+        let allocated = bridge.managed_bytes();
+        let mut context = Context::from_waker(Waker::noop());
+        for payload in [Vec::new(), vec![1], vec![7; crate::wire::MAX_UDP_PAYLOAD]] {
+            assert!(matches!(
+                adapter.poll_send_datagram(&mut context, &payload),
+                Poll::Ready(Ok(()))
+            ));
+            let mut output = vec![0; crate::wire::MAX_UDP_PAYLOAD];
+            let mut received = None;
+            for _ in 0..128 {
+                bridge.poll();
+                if let Poll::Ready(Ok(DatagramRecv::Datagram(length))) =
+                    policy.poll_recv_datagram(&mut context, &mut output)
+                {
+                    received = Some(length);
+                    break;
+                }
+            }
+            assert_eq!(received, Some(payload.len()));
+            assert_eq!(&output[..payload.len()], payload);
+        }
         assert_eq!(adapter.metadata().unwrap(), metadata());
         drop(adapter);
         assert_eq!(bridge.managed_bytes(), allocated);
