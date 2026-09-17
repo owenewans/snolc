@@ -356,24 +356,16 @@ unsafe extern "C" fn accept(instance: u64, wake: SnolWakeHandle, output: *mut u6
             let Mode::Listen(listener) = &state.mode else {
                 return abi::STATUS_UNSUPPORTED;
             };
-            let mut context = Context::from_waker(Waker::noop());
-            match listener.poll_readable(&mut context) {
-                Poll::Ready(Ok(())) => match listener.get_ref().accept() {
-                    Ok((stream, _)) => match Async::new(stream) {
-                        Ok(stream) => finish_stream(instance, stream, state, output),
-                        Err(_) => abi::STATUS_IO,
-                    },
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        state.accept_wake.replace(wake);
-                        abi::STATUS_PENDING
-                    }
+            match listener.get_ref().accept() {
+                Ok((stream, _)) => match Async::new(stream) {
+                    Ok(stream) => finish_stream(instance, stream, state, output),
                     Err(_) => abi::STATUS_IO,
                 },
-                Poll::Ready(Err(_)) => abi::STATUS_IO,
-                Poll::Pending => {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     state.accept_wake.replace(wake);
                     abi::STATUS_PENDING
                 }
+                Err(_) => abi::STATUS_IO,
             }
         })
     })
