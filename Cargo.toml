@@ -9,6 +9,7 @@ members = [
   "modules/adapter-direct",
   "modules/adapter-tun",
   "modules/protection-dummy",
+  "modules/policy-dummy",
 ]
 
 [workspace.package]

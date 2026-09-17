@@ -603,6 +603,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "snolc-policy-dummy"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "snolc-sdk",
+ "toml",
+]
+
+[[package]]
 name = "snolc-protection-dummy"
 version = "0.0.1"
 dependencies = [
