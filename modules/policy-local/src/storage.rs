@@ -1,9 +1,13 @@
-use std::fs;
+use std::fmt;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 
-use redb::{Database, Durability, ReadableDatabase, TableDefinition};
+use redb::{BackendError, Database, Durability, ReadableDatabase, StorageBackend, TableDefinition};
 use thiserror::Error;
 
 const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("policy");
@@ -47,10 +51,12 @@ impl StorageWorker {
             return Err(StorageError::Invalid);
         }
         prepare_path(&path)?;
+        let backend = LockedFileBackend::open(&path, max_database_bytes)?;
         let mut builder = Database::builder();
         builder.set_cache_size(cache_bytes);
-        let database = builder.create(&path).map_err(database_error)?;
-        set_file_permissions(&path)?;
+        let database = builder
+            .create_with_backend(backend)
+            .map_err(database_error)?;
         {
             let mut transaction = database.begin_write().map_err(transaction_error)?;
             transaction
@@ -62,7 +68,7 @@ impl StorageWorker {
         let (sender, receiver) = sync_channel(queue_capacity);
         let worker = thread::Builder::new()
             .name("snolc-policy-storage".into())
-            .spawn(move || run(database, path, max_database_bytes, receiver))?;
+            .spawn(move || run(database, receiver))?;
         Ok(Self {
             sender,
             worker: Some(worker),
@@ -135,7 +141,7 @@ impl Drop for StorageWorker {
     }
 }
 
-fn run(database: Database, path: PathBuf, max_bytes: u64, receiver: Receiver<Command>) {
+fn run(database: Database, receiver: Receiver<Command>) {
     while let Ok(command) = receiver.recv() {
         match command {
             Command::Get { key, response } => {
@@ -146,20 +152,14 @@ fn run(database: Database, path: PathBuf, max_bytes: u64, receiver: Receiver<Com
                 value,
                 response,
             } => {
-                let result = enforce_size(&path, max_bytes, key.len(), value.len())
-                    .and_then(|()| put_value(&database, &key, &value));
+                let result = put_value(&database, &key, &value);
                 let _ = response.send(result);
             }
             Command::Delete { key, response } => {
                 let _ = response.send(delete_value(&database, &key));
             }
             Command::Apply { changes, response } => {
-                let added: usize = changes
-                    .iter()
-                    .filter_map(|(key, value)| value.as_ref().map(|value| key.len() + value.len()))
-                    .sum();
-                let result = enforce_size(&path, max_bytes, 0, added)
-                    .and_then(|()| apply_values(&database, &changes));
+                let result = apply_values(&database, &changes);
                 let _ = response.send(result);
             }
             Command::Stop => break,
@@ -221,17 +221,6 @@ fn apply_values(
     transaction.commit().map_err(commit_error)
 }
 
-fn enforce_size(path: &Path, max_bytes: u64, key: usize, value: usize) -> Result<(), StorageError> {
-    let current = fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let addition = u64::try_from(key.saturating_add(value)).map_err(|_| StorageError::Limit)?;
-    if current.saturating_add(addition) > max_bytes {
-        return Err(StorageError::Limit);
-    }
-    Ok(())
-}
-
 fn validate_key(key: &str) -> Result<(), StorageError> {
     if key.is_empty()
         || key.len() > 512
@@ -262,14 +251,216 @@ fn prepare_path(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn set_file_permissions(path: &Path) -> Result<(), StorageError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+struct LockedFileBackend {
+    file: File,
+    max_bytes: u64,
+    locked: AtomicBool,
+}
+
+impl LockedFileBackend {
+    fn open(path: &Path, max_bytes: u64) -> Result<Self, StorageError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() & 0o077 != 0 {
+                return Err(StorageError::Permissions);
+            }
+        }
+        if file.metadata()?.len() > max_bytes {
+            return Err(StorageError::Limit);
+        }
+        Ok(Self {
+            file,
+            max_bytes,
+            locked: AtomicBool::new(false),
+        })
+    }
+
+    fn whole_range(start: &Bound<u64>, end: &Bound<u64>) -> bool {
+        matches!(start, Bound::Unbounded | Bound::Included(0)) && *end == Bound::Unbounded
+    }
+
+    fn check_end(&self, offset: u64, length: usize) -> io::Result<()> {
+        let length = u64::try_from(length)
+            .map_err(|_| io::Error::new(io::ErrorKind::FileTooLarge, "database size overflow"))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::FileTooLarge, "database size overflow"))?;
+        if end > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "database size limit exhausted",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for LockedFileBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LockedFileBackend")
+            .field("max_bytes", &self.max_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StorageBackend for LockedFileBackend {
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    fn read(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
+        read_exact_at(&self.file, offset, output)
+    }
+
+    fn set_len(&self, length: u64) -> io::Result<()> {
+        self.check_end(
+            0,
+            usize::try_from(length).map_err(|_| {
+                io::Error::new(io::ErrorKind::FileTooLarge, "database size overflow")
+            })?,
+        )?;
+        self.file.set_len(length)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.check_end(offset, data.len())?;
+        write_all_at(&self.file, offset, data)
+    }
+
+    fn try_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        if !Self::whole_range(&start, &end) {
+            return Err(BackendError::Unsupported);
+        }
+        match self.file.try_lock() {
+            Ok(()) => {
+                self.locked.store(true, Ordering::Release);
+                Ok(true)
+            }
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        if !Self::whole_range(&start, &end) {
+            return Err(BackendError::Unsupported);
+        }
+        match self.file.try_lock_shared() {
+            Ok(()) => {
+                self.locked.store(true, Ordering::Release);
+                Ok(true)
+            }
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn unlock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        if !Self::whole_range(&start, &end) {
+            return Err(BackendError::Unsupported);
+        }
+        if self.locked.swap(false, Ordering::AcqRel) {
+            self.file.unlock()?;
+        }
+        Ok(())
+    }
+
+    fn close(&self) -> io::Result<()> {
+        if self.locked.swap(false, Ordering::AcqRel) {
+            self.file.unlock()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut offset: u64, mut output: &mut [u8]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !output.is_empty() {
+        match file.read_at(output, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(read) => {
+                offset += read as u64;
+                output = &mut output[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
+
+#[cfg(unix)]
+fn write_all_at(file: &File, mut offset: u64, mut data: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !data.is_empty() {
+        match file.write_at(data, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(written) => {
+                offset += written as u64;
+                data = &data[written..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut offset: u64, mut output: &mut [u8]) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !output.is_empty() {
+        match file.seek_read(output, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(read) => {
+                offset += read as u64;
+                output = &mut output[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut offset: u64, mut data: &[u8]) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !data.is_empty() {
+        match file.seek_write(data, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(written) => {
+                offset += written as u64;
+                data = &data[written..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+compile_error!("policy-local storage requires positional file I/O");
 
 fn database_error(error: redb::DatabaseError) -> StorageError {
     StorageError::Database(error.to_string())
@@ -407,6 +598,35 @@ mod tests {
                 .is_some()
         );
         drop(worker);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_second_database_owner() {
+        let path = path();
+        let first = StorageWorker::open(path.clone(), 1_048_576, 16_777_216, 2).unwrap();
+        assert!(matches!(
+            StorageWorker::open(path.clone(), 1_048_576, 16_777_216, 2),
+            Err(StorageError::Database(_))
+        ));
+        drop(first);
+        StorageWorker::open(path.clone(), 1_048_576, 16_777_216, 2).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn backend_rejects_growth_before_writing() {
+        let path = path();
+        prepare_path(&path).unwrap();
+        let backend = LockedFileBackend::open(&path, 8).unwrap();
+        backend.write(0, b"12345678").unwrap();
+        assert_eq!(backend.len().unwrap(), 8);
+        assert_eq!(
+            backend.write(8, b"9").unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        assert_eq!(backend.len().unwrap(), 8);
+        drop(backend);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
