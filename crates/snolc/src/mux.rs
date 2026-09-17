@@ -116,6 +116,18 @@ where
         Ok((request, stream))
     }
 
+    pub async fn respond_flow(
+        &mut self,
+        stream: &mut Stream,
+        response: &OpenResponse,
+    ) -> Result<(), MuxError> {
+        if self.role != Mode::Server || !self.policy_open {
+            return Err(MuxError::PolicyRequired);
+        }
+        self.drive_operation(write_open_response(stream, response))
+            .await
+    }
+
     pub fn release_flow(&mut self) {
         self.user_streams = self.user_streams.saturating_sub(1);
     }

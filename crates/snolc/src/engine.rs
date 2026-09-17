@@ -17,12 +17,13 @@ use thiserror::Error;
 use crate::config::{
     Config, ControlConfig, LogLevel, LogSource, LoggingConfig, Role, YamuxConfig, parse_size,
 };
-use crate::core_io::RegisteredIo;
+use crate::core_io::{RegisteredIo, is_registered};
 use crate::events::{Event, EventReceiver, Lifecycle, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::logging::{FileLogger, LogError};
 use crate::mux::{MuxError, MuxSession};
-use crate::stack::{SharedStackBridge, StackError};
+use crate::stack::{FlowMetadata, SharedStackBridge, StackError, TcpStreamPort};
+use crate::wire::{Destination, OpenRequest, OpenResponse, OpenStatus, StreamKind};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
 const MODULE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -45,6 +46,7 @@ pub struct ValidatedConfig {
 struct TunnelBinding {
     name: String,
     role: Role,
+    adapters: Vec<usize>,
     carrier: usize,
     protection: usize,
     policy: usize,
@@ -93,8 +95,104 @@ struct PolicyAttachState {
 }
 
 struct EstablishedSession {
-    mux: MuxSession<ModuleByteIo>,
-    _policy_session: u64,
+    mux: Option<MuxSession<ModuleByteIo>>,
+    policy_session: u64,
+    accepting: Option<AcceptFlowFuture>,
+    responding: Option<RespondFlowFuture>,
+    pending: Option<PendingServerFlow>,
+    active: Vec<ActiveServerFlow>,
+    next_operation: u64,
+}
+
+type AcceptFlowFuture = Pin<
+    Box<
+        dyn Future<
+            Output = (
+                MuxSession<ModuleByteIo>,
+                Result<(OpenRequest, yamux::Stream), MuxError>,
+            ),
+        >,
+    >,
+>;
+type RespondFlowFuture = Pin<
+    Box<
+        dyn Future<
+            Output = (
+                MuxSession<ModuleByteIo>,
+                yamux::Stream,
+                Result<(), MuxError>,
+            ),
+        >,
+    >,
+>;
+
+struct PendingServerFlow {
+    request: OpenRequest,
+    metadata: OwnedFlowMetadata,
+    stream: Option<yamux::Stream>,
+    operation: u64,
+    admitted: bool,
+    adapter_cursor: usize,
+    adapter_flow: Option<(usize, u64)>,
+    ports: Option<(TcpStreamPort, TcpStreamPort)>,
+    response_sent: bool,
+    accepted: bool,
+}
+
+struct ActiveServerFlow {
+    adapter: usize,
+    adapter_flow: u64,
+    mux_handle: u64,
+}
+
+struct OwnedFlowMetadata {
+    kind: u32,
+    address_type: u32,
+    address: Vec<u8>,
+    port: u16,
+    opaque: Vec<u8>,
+}
+
+impl OwnedFlowMetadata {
+    fn from_request(request: &OpenRequest) -> Self {
+        let (address_type, address) = match &request.destination {
+            Destination::Ipv4(address) => (snolc_abi::ADDRESS_IPV4, address.octets().to_vec()),
+            Destination::Ipv6(address) => (snolc_abi::ADDRESS_IPV6, address.octets().to_vec()),
+            Destination::Domain(address) => {
+                (snolc_abi::ADDRESS_DOMAIN, address.as_bytes().to_vec())
+            }
+        };
+        Self {
+            kind: match request.kind {
+                StreamKind::Tcp => snolc_abi::FLOW_TCP,
+                StreamKind::Udp => snolc_abi::FLOW_UDP,
+                StreamKind::Policy => 0,
+            },
+            address_type,
+            address,
+            port: request.port,
+            opaque: request.metadata.clone(),
+        }
+    }
+
+    fn abi(&self) -> snolc_abi::SnolFlowMetadataV1 {
+        snolc_abi::SnolFlowMetadataV1 {
+            struct_size: size_of::<snolc_abi::SnolFlowMetadataV1>() as u32,
+            kind: self.kind,
+            address_type: self.address_type,
+            reserved: 0,
+            address: snolc_abi::SnolBytes {
+                pointer: self.address.as_ptr(),
+                length: self.address.len(),
+            },
+            port: self.port,
+            reserved2: [0; 6],
+            metadata: snolc_abi::SnolBytes {
+                pointer: self.opaque.as_ptr(),
+                length: self.opaque.len(),
+            },
+        }
+    }
 }
 
 pub struct Engine {
@@ -184,9 +282,11 @@ impl Engine {
         }
         let mut tunnels = Vec::with_capacity(config.tunnels.len());
         for tunnel in &config.tunnels {
-            for adapter in &tunnel.adapters {
-                find_module(&modules, adapter, snolc_abi::CLASS_ADAPTER)?;
-            }
+            let adapters = tunnel
+                .adapters
+                .iter()
+                .map(|adapter| find_module(&modules, adapter, snolc_abi::CLASS_ADAPTER))
+                .collect::<Result<Vec<_>, _>>()?;
             let protection =
                 find_module(&modules, &tunnel.protection, snolc_abi::CLASS_PROTECTION)?;
             let carrier = find_module(&modules, &tunnel.carrier, snolc_abi::CLASS_CARRIER)?;
@@ -194,12 +294,14 @@ impl Engine {
             let policy_context = channel_security_context(&modules[protection], tunnel.role)?;
             let core_io_limit = config
                 .engine
-                .max_sessions
-                .checked_add(config.engine.max_flows)
+                .max_flows
+                .checked_mul(3)
+                .and_then(|flows| config.engine.max_sessions.checked_add(flows))
                 .ok_or(EngineError::ResourceOverflow)?;
             tunnels.push(TunnelBinding {
                 name: tunnel.name.clone(),
                 role: tunnel.role,
+                adapters,
                 carrier,
                 protection,
                 policy,
@@ -319,7 +421,7 @@ impl Engine {
                     stack.poll();
                     self.poll_modules();
                     self.poll_controls();
-                    self.poll_tunnels(&mut tunnels);
+                    self.poll_tunnels(&mut tunnels, &stack);
                     self.drain_module_events();
                     self.drain_log_errors();
                 }
@@ -407,13 +509,13 @@ impl Engine {
         }
     }
 
-    fn poll_tunnels(&mut self, tunnels: &mut [TunnelRuntime]) {
+    fn poll_tunnels(&mut self, tunnels: &mut [TunnelRuntime], stack: &SharedStackBridge) {
         let mut established = 0;
         let mut closed = 0;
         let mut failures = Vec::new();
         let mut transitions = Vec::new();
-        for tunnel in tunnels {
-            match tunnel.poll(&self.validated.modules) {
+        for tunnel in &mut *tunnels {
+            match tunnel.poll(&self.validated.modules, stack) {
                 Ok(update) => {
                     established += usize::from(update == TunnelUpdate::Established);
                     let state = match update {
@@ -433,6 +535,8 @@ impl Engine {
                 }
             }
         }
+        let flows = tunnels.iter().map(TunnelRuntime::flow_count).sum();
+        self.snapshot.flows.store(flows, Ordering::Release);
         if established != 0 {
             self.snapshot
                 .sessions
@@ -652,7 +756,11 @@ impl TunnelRuntime {
         }
     }
 
-    fn poll(&mut self, modules: &[LoadedModule]) -> Result<TunnelUpdate, (String, bool)> {
+    fn poll(
+        &mut self,
+        modules: &[LoadedModule],
+        stack: &SharedStackBridge,
+    ) -> Result<TunnelUpdate, (String, bool)> {
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -757,8 +865,13 @@ impl TunnelRuntime {
                             None => return self.fail("yamux session is unavailable".into(), false),
                         };
                         self.state = TunnelState::Established(Box::new(EstablishedSession {
-                            mux,
-                            _policy_session: policy_session,
+                            mux: Some(mux),
+                            policy_session,
+                            accepting: None,
+                            responding: None,
+                            pending: None,
+                            active: Vec::new(),
+                            next_operation: 1,
                         }));
                         self.deadline = None;
                         return Ok(TunnelUpdate::Established);
@@ -768,13 +881,20 @@ impl TunnelRuntime {
                 }
             }
             TunnelState::Established(session) => {
-                if let Poll::Ready(Err(error)) = session.mux.poll_drive(&mut context) {
+                if let Err(error) = session.poll(&self.binding, modules, stack, &mut context) {
                     return self.fail(error.to_string(), true);
                 }
             }
             TunnelState::Failed => {}
         }
         Ok(TunnelUpdate::None)
+    }
+
+    fn flow_count(&self) -> usize {
+        match &self.state {
+            TunnelState::Established(session) => session.active.len(),
+            _ => 0,
+        }
     }
 
     fn fail(
@@ -786,6 +906,272 @@ impl TunnelRuntime {
         self.deadline = None;
         Err((message, was_established))
     }
+}
+
+impl EstablishedSession {
+    fn poll(
+        &mut self,
+        binding: &TunnelBinding,
+        modules: &[LoadedModule],
+        stack: &SharedStackBridge,
+        context: &mut Context<'_>,
+    ) -> Result<(), SessionFlowError> {
+        self.reap_closed(modules);
+
+        if let Some(future) = &mut self.responding {
+            if let Poll::Ready((mux, stream, result)) = future.as_mut().poll(context) {
+                self.responding = None;
+                self.mux = Some(mux);
+                result?;
+                let pending = self.pending.as_mut().ok_or(SessionFlowError::State)?;
+                pending.stream = Some(stream);
+                pending.response_sent = true;
+                if !pending.accepted {
+                    self.reject_pending(modules);
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        if self.pending.is_some() {
+            self.poll_pending(binding, modules, stack, context)?;
+            return Ok(());
+        }
+
+        if let Some(future) = &mut self.accepting {
+            if let Poll::Ready((mux, result)) = future.as_mut().poll(context) {
+                self.accepting = None;
+                self.mux = Some(mux);
+                let (request, stream) = result?;
+                let operation = self.next_operation;
+                self.next_operation = self
+                    .next_operation
+                    .checked_add(1)
+                    .ok_or(SessionFlowError::Operation)?;
+                self.pending = Some(PendingServerFlow {
+                    metadata: OwnedFlowMetadata::from_request(&request),
+                    request,
+                    stream: Some(stream),
+                    operation,
+                    admitted: false,
+                    adapter_cursor: 0,
+                    adapter_flow: None,
+                    ports: None,
+                    response_sent: false,
+                    accepted: false,
+                });
+                self.poll_pending(binding, modules, stack, context)?;
+            }
+            return Ok(());
+        }
+
+        if binding.role == Role::Server {
+            let mut mux = self.mux.take().ok_or(SessionFlowError::State)?;
+            self.accepting = Some(Box::pin(async move {
+                let result = mux.accept_flow().await;
+                (mux, result)
+            }));
+        } else if let Some(mux) = &mut self.mux
+            && let Poll::Ready(Err(error)) = mux.poll_drive(context)
+        {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn poll_pending(
+        &mut self,
+        binding: &TunnelBinding,
+        modules: &[LoadedModule],
+        stack: &SharedStackBridge,
+        context: &mut Context<'_>,
+    ) -> Result<(), SessionFlowError> {
+        let pending = self.pending.as_mut().ok_or(SessionFlowError::State)?;
+        if pending.response_sent {
+            return self.attach_pending(binding, modules);
+        }
+        let metadata = pending.metadata.abi();
+        if !pending.admitted {
+            match modules[binding.policy].policy_admit_flow(self.policy_session, &metadata, context)
+            {
+                Poll::Ready(Ok(())) => pending.admitted = true,
+                Poll::Ready(Err(error)) => {
+                    let (status, reason) = open_error(&error);
+                    return self.start_response(status, reason);
+                }
+                Poll::Pending => return Ok(()),
+            }
+        }
+        if pending.adapter_cursor >= binding.adapters.len() {
+            return self.start_response(OpenStatus::Unsupported, "no adapter accepted the flow");
+        }
+        let adapter = binding.adapters[pending.adapter_cursor];
+        match modules[adapter].adapter_open(pending.operation, &metadata, context) {
+            Poll::Ready(Ok(flow)) => {
+                pending.adapter_flow = Some((adapter, flow));
+                if pending.request.kind != StreamKind::Tcp {
+                    return self.start_response(
+                        OpenStatus::Unsupported,
+                        "UDP adapter path is unavailable",
+                    );
+                }
+                match stack.open_tcp(FlowMetadata {
+                    destination: pending.request.destination.clone(),
+                    port: pending.request.port,
+                    opaque: pending.request.metadata.clone(),
+                }) {
+                    Ok(ports) => pending.ports = Some(ports),
+                    Err(_) => {
+                        return self.start_response(
+                            OpenStatus::ResourceLimit,
+                            "stack flow budget exhausted",
+                        );
+                    }
+                }
+                self.start_response(OpenStatus::Ok, "")
+            }
+            Poll::Ready(Err(LoadError::ModuleStatus(snolc_abi::STATUS_UNSUPPORTED)))
+                if pending.adapter_cursor + 1 < binding.adapters.len() =>
+            {
+                pending.adapter_cursor += 1;
+                Ok(())
+            }
+            Poll::Ready(Err(error)) => {
+                let (status, reason) = open_error(&error);
+                self.start_response(status, reason)
+            }
+            Poll::Pending => Ok(()),
+        }
+    }
+
+    fn start_response(
+        &mut self,
+        status: OpenStatus,
+        reason: &'static str,
+    ) -> Result<(), SessionFlowError> {
+        let pending = self.pending.as_mut().ok_or(SessionFlowError::State)?;
+        pending.accepted = status == OpenStatus::Ok;
+        let mut stream = pending.stream.take().ok_or(SessionFlowError::State)?;
+        let mut mux = self.mux.take().ok_or(SessionFlowError::State)?;
+        let response = OpenResponse {
+            status,
+            reason: reason.to_owned(),
+        };
+        self.responding = Some(Box::pin(async move {
+            let result = mux.respond_flow(&mut stream, &response).await;
+            (mux, stream, result)
+        }));
+        Ok(())
+    }
+
+    fn attach_pending(
+        &mut self,
+        binding: &TunnelBinding,
+        modules: &[LoadedModule],
+    ) -> Result<(), SessionFlowError> {
+        let mut pending = self.pending.take().ok_or(SessionFlowError::State)?;
+        let (adapter, adapter_flow) = pending.adapter_flow.ok_or(SessionFlowError::State)?;
+        let (adapter_port, policy_port) = pending.ports.take().ok_or(SessionFlowError::State)?;
+        let stream = pending.stream.take().ok_or(SessionFlowError::State)?;
+        let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
+        let policy_io = RegisteredIo::register(policy_port, binding.core_io_limit)?;
+        let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+        let (adapter_handle, adapter_table) = adapter_io.raw_parts();
+        let (policy_handle, policy_table) = policy_io.raw_parts();
+        let (mux_handle, mux_table) = mux_io.raw_parts();
+        if let Err(error) = unsafe {
+            modules[adapter].adapter_attach_flow(adapter_flow, adapter_handle, adapter_table)
+        } {
+            let _ = modules[adapter].adapter_close_flow(adapter_flow);
+            return Err(error.into());
+        }
+        adapter_io.transfer();
+        if let Err(error) = unsafe {
+            modules[binding.policy].policy_attach_flow(
+                self.policy_session,
+                policy_handle,
+                policy_table,
+                mux_handle,
+                mux_table,
+            )
+        } {
+            let _ = modules[adapter].adapter_close_flow(adapter_flow);
+            return Err(error.into());
+        }
+        policy_io.transfer();
+        mux_io.transfer();
+        modules[adapter].adapter_complete_flow(adapter_flow, snolc_abi::STATUS_OK, &[])?;
+        self.active.push(ActiveServerFlow {
+            adapter,
+            adapter_flow,
+            mux_handle,
+        });
+        Ok(())
+    }
+
+    fn reject_pending(&mut self, modules: &[LoadedModule]) {
+        if let Some(mut pending) = self.pending.take() {
+            if let Some((adapter, flow)) = pending.adapter_flow.take() {
+                let _ = modules[adapter].adapter_close_flow(flow);
+            }
+            if let Some(mux) = &mut self.mux {
+                mux.release_flow();
+            }
+        }
+    }
+
+    fn reap_closed(&mut self, modules: &[LoadedModule]) {
+        let mut closed = Vec::new();
+        self.active.retain(|flow| {
+            if is_registered(flow.mux_handle) {
+                true
+            } else {
+                closed.push((flow.adapter, flow.adapter_flow));
+                false
+            }
+        });
+        if let Some(mux) = &mut self.mux {
+            for (adapter, flow) in closed {
+                let _ = modules[adapter].adapter_close_flow(flow);
+                mux.release_flow();
+            }
+        }
+    }
+}
+
+fn open_error(error: &LoadError) -> (OpenStatus, &'static str) {
+    match error {
+        LoadError::ModuleStatus(snolc_abi::STATUS_DENIED) => (OpenStatus::Denied, "flow denied"),
+        LoadError::ModuleStatus(snolc_abi::STATUS_UNSUPPORTED) => {
+            (OpenStatus::Unsupported, "flow unsupported")
+        }
+        LoadError::ModuleStatus(snolc_abi::STATUS_RESOURCE) => {
+            (OpenStatus::ResourceLimit, "flow resource limit")
+        }
+        LoadError::ModuleStatus(snolc_abi::STATUS_IO) => {
+            (OpenStatus::ConnectFailed, "endpoint connect failed")
+        }
+        LoadError::ModuleStatus(snolc_abi::STATUS_INVALID) => {
+            (OpenStatus::ProtocolError, "invalid flow metadata")
+        }
+        _ => (OpenStatus::InternalError, "flow setup failed"),
+    }
+}
+
+#[derive(Debug, Error)]
+enum SessionFlowError {
+    #[error(transparent)]
+    Mux(#[from] MuxError),
+    #[error(transparent)]
+    Module(#[from] LoadError),
+    #[error(transparent)]
+    CoreIo(#[from] crate::core_io::CoreIoError),
+    #[error("flow state is inconsistent")]
+    State,
+    #[error("flow operation handle exhausted")]
+    Operation,
 }
 
 impl EngineHandle {

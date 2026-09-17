@@ -57,6 +57,10 @@ impl RegisteredIo {
     }
 }
 
+pub(crate) fn is_registered(handle: u64) -> bool {
+    STREAMS.with(|streams| streams.borrow().contains_key(&handle))
+}
+
 impl Drop for RegisteredIo {
     fn drop(&mut self) {
         if !self.transferred {
@@ -219,5 +223,14 @@ mod tests {
             unsafe { (*table).close.unwrap()(handle) },
             snolc_abi::STATUS_INVALID
         );
+    }
+
+    #[test]
+    fn registration_lifetime_is_observable() {
+        let stream = RegisteredIo::register(Cursor::new(Vec::<u8>::new()), 1).unwrap();
+        let (handle, _) = stream.raw_parts();
+        assert!(is_registered(handle));
+        drop(stream);
+        assert!(!is_registered(handle));
     }
 }
