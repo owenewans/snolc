@@ -286,7 +286,7 @@ enum Command {
         response: ControlSender,
     },
     Shutdown {
-        response: oneshot::Sender<()>,
+        response: Option<oneshot::Sender<()>>,
     },
     Platform {
         event: PlatformEvent,
@@ -496,7 +496,9 @@ impl Engine {
                     }
                     Some(Command::Shutdown { response }) => {
                         self.emit(Event::Lifecycle(Lifecycle::Stopping));
-                        let _ = response.send(());
+                        if let Some(response) = response {
+                            let _ = response.send(());
+                        }
                         break;
                     }
                     Some(Command::Platform { event, response }) => {
@@ -1684,10 +1686,17 @@ impl EngineHandle {
         let mut commands = self.commands.clone();
         commands
             .try_send(Command::Shutdown {
-                response: response_tx,
+                response: Some(response_tx),
             })
             .map_err(|_| EngineError::CommandQueue)?;
         async_io::block_on(response_rx).map_err(|_| EngineError::Stopped)
+    }
+
+    pub fn request_shutdown(&self) -> Result<(), EngineError> {
+        let mut commands = self.commands.clone();
+        commands
+            .try_send(Command::Shutdown { response: None })
+            .map_err(|_| EngineError::CommandQueue)
     }
 
     pub fn platform_event(&self, event: PlatformEvent) -> Result<(), EngineError> {
