@@ -21,6 +21,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "snolc"
+version = "0.0.1"
+dependencies = [
+ "snolc-abi",
+ "snolc-sdk",
+ "thiserror",
+]
+
+[[package]]
 name = "snolc-abi"
 version = "0.0.1"
 

@@ -1,0 +1,14 @@
+[package]
+name = "snolc"
+description = "library engine for the snolc userspace network stack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+snolc-abi = { path = "../snolc-abi" }
+snolc-sdk = { path = "../snolc-sdk" }
+thiserror.workspace = true
