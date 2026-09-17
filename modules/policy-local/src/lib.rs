@@ -7,7 +7,11 @@ mod frame;
 mod storage;
 
 pub use accounting::{QuotaAccount, QuotaError, TokenBucket};
-pub use admin::{AdminDecision, AdminError, AdminSequencer, Credential, UserId};
+pub use admin::{
+    AdminDecision, AdminError, AdminSequencer, ByteLimit, ControlRequest, CountLimit, Credential,
+    CredentialDigest, CredentialRecord, Expiration, RateLimit, RuleApply, UserId, UserRecord,
+    UserSpec, UserStatus,
+};
 pub use config::Options;
 pub use frame::{FrameDecoder, FrameError, encode_frame};
 pub use storage::{StorageError, StorageWorker};

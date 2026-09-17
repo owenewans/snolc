@@ -18,6 +18,23 @@ impl UserId {
     pub fn hex(self) -> String {
         encode_hex(&self.0)
     }
+
+    pub fn parse(input: &str) -> Result<Self, AdminError> {
+        Ok(Self(decode_hex(input)?))
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct CredentialDigest([u8; 32]);
+
+impl CredentialDigest {
+    pub fn parse(input: &str) -> Result<Self, AdminError> {
+        Ok(Self(decode_hex(input)?))
+    }
+
+    pub fn hex(self) -> String {
+        encode_hex(&self.0)
+    }
 }
 
 pub struct Credential([u8; 32]);
@@ -33,10 +50,285 @@ impl Credential {
         Sha256::digest(self.0).into()
     }
 
+    pub fn digest_id(&self) -> CredentialDigest {
+        CredentialDigest(self.digest())
+    }
+
     pub fn expose_once(mut self) -> [u8; 32] {
         let output = self.0;
         self.0.fill(0);
         output
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserStatus {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Expiration {
+    Unlimited,
+    AtUtc { unix_seconds: u64 },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum ByteLimit {
+    Unlimited,
+    Limited { bytes: u64 },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum RateLimit {
+    Unlimited,
+    Limited { bytes_per_second: u64 },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum CountLimit {
+    Unlimited,
+    Limited { count: u32 },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserSpec {
+    pub status: UserStatus,
+    pub expiration: Expiration,
+    pub quota: ByteLimit,
+    pub upload_rate: RateLimit,
+    pub download_rate: RateLimit,
+    pub combined_rate: RateLimit,
+    pub burst_bytes: u64,
+    pub max_sessions: CountLimit,
+    pub max_flows: CountLimit,
+    pub weight: u32,
+    pub group: String,
+    pub rule_profile: String,
+}
+
+impl UserSpec {
+    pub fn validate(&self) -> Result<(), AdminError> {
+        if self.weight == 0
+            || self.burst_bytes == 0
+            || self.group.is_empty()
+            || self.group.len() > 64
+            || self.rule_profile.is_empty()
+            || self.rule_profile.len() > 64
+            || matches!(self.quota, ByteLimit::Limited { bytes: 0 })
+            || matches!(
+                self.upload_rate,
+                RateLimit::Limited {
+                    bytes_per_second: 0
+                }
+            )
+            || matches!(
+                self.download_rate,
+                RateLimit::Limited {
+                    bytes_per_second: 0
+                }
+            )
+            || matches!(
+                self.combined_rate,
+                RateLimit::Limited {
+                    bytes_per_second: 0
+                }
+            )
+            || matches!(self.max_sessions, CountLimit::Limited { count: 0 })
+            || matches!(self.max_flows, CountLimit::Limited { count: 0 })
+        {
+            return Err(AdminError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UserRecord {
+    pub id: String,
+    pub spec: UserSpec,
+    pub revision: u64,
+    pub durable_charged_bytes: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub max_observed_utc: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CredentialRecord {
+    pub digest: String,
+    pub user_id: String,
+    pub revoked: bool,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "method", deny_unknown_fields)]
+pub enum ControlRequest {
+    #[serde(rename = "user.create")]
+    UserCreate {
+        client_id: String,
+        seq: u64,
+        user: UserSpec,
+    },
+    #[serde(rename = "user.update")]
+    UserUpdate {
+        client_id: String,
+        seq: u64,
+        user_id: String,
+        expected_revision: u64,
+        user: UserSpec,
+    },
+    #[serde(rename = "user.disable")]
+    UserDisable {
+        client_id: String,
+        seq: u64,
+        user_id: String,
+        expected_revision: u64,
+    },
+    #[serde(rename = "user.delete")]
+    UserDelete {
+        client_id: String,
+        seq: u64,
+        user_id: String,
+        expected_revision: u64,
+    },
+    #[serde(rename = "credential.add")]
+    CredentialAdd {
+        client_id: String,
+        seq: u64,
+        user_id: String,
+        credential_sha256: String,
+    },
+    #[serde(rename = "credential.revoke")]
+    CredentialRevoke {
+        client_id: String,
+        seq: u64,
+        credential_sha256: String,
+    },
+    #[serde(rename = "quota.add")]
+    QuotaAdd {
+        client_id: String,
+        seq: u64,
+        user_id: String,
+        bytes: u64,
+    },
+    #[serde(rename = "quota.new_period")]
+    QuotaNewPeriod {
+        client_id: String,
+        seq: u64,
+        user_id: String,
+        quota: ByteLimit,
+    },
+    #[serde(rename = "usage.get")]
+    UsageGet { user_id: String },
+    #[serde(rename = "sessions.list")]
+    SessionsList { user_id: Option<String> },
+    #[serde(rename = "sessions.disconnect")]
+    SessionsDisconnect {
+        client_id: String,
+        seq: u64,
+        session_id: u64,
+    },
+    #[serde(rename = "rules.replace")]
+    RulesReplace {
+        client_id: String,
+        seq: u64,
+        profile: String,
+        apply: RuleApply,
+        rules_toml: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleApply {
+    New,
+    Active,
+}
+
+impl ControlRequest {
+    pub fn parse(input: &[u8]) -> Result<Self, AdminError> {
+        let input = std::str::from_utf8(input).map_err(|_| AdminError::Invalid)?;
+        let request: Self = toml::from_str(input).map_err(|_| AdminError::Invalid)?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn sequence(&self) -> Option<(&str, u64)> {
+        match self {
+            Self::UserCreate { client_id, seq, .. }
+            | Self::UserUpdate { client_id, seq, .. }
+            | Self::UserDisable { client_id, seq, .. }
+            | Self::UserDelete { client_id, seq, .. }
+            | Self::CredentialAdd { client_id, seq, .. }
+            | Self::CredentialRevoke { client_id, seq, .. }
+            | Self::QuotaAdd { client_id, seq, .. }
+            | Self::QuotaNewPeriod { client_id, seq, .. }
+            | Self::SessionsDisconnect { client_id, seq, .. }
+            | Self::RulesReplace { client_id, seq, .. } => Some((client_id, *seq)),
+            Self::UsageGet { .. } | Self::SessionsList { .. } => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), AdminError> {
+        if let Some((client_id, seq)) = self.sequence() {
+            validate_client_id(client_id)?;
+            if seq == 0 {
+                return Err(AdminError::Sequence);
+            }
+        }
+        match self {
+            Self::UserCreate { user, .. } => user.validate(),
+            Self::UserUpdate { user_id, user, .. } => {
+                user.validate()?;
+                UserId::parse(user_id).map(|_| ())
+            }
+            Self::UserDisable { user_id, .. }
+            | Self::UserDelete { user_id, .. }
+            | Self::QuotaNewPeriod { user_id, .. }
+            | Self::UsageGet { user_id }
+            | Self::SessionsList {
+                user_id: Some(user_id),
+            } => UserId::parse(user_id).map(|_| ()),
+            Self::CredentialAdd {
+                user_id,
+                credential_sha256,
+                ..
+            } => {
+                UserId::parse(user_id)?;
+                CredentialDigest::parse(credential_sha256).map(|_| ())
+            }
+            Self::CredentialRevoke {
+                credential_sha256, ..
+            } => CredentialDigest::parse(credential_sha256).map(|_| ()),
+            Self::QuotaAdd { user_id, bytes, .. } => {
+                UserId::parse(user_id)?;
+                if *bytes == 0 {
+                    return Err(AdminError::Invalid);
+                }
+                Ok(())
+            }
+            Self::RulesReplace {
+                profile,
+                rules_toml,
+                ..
+            } if profile.is_empty()
+                || profile.len() > 64
+                || rules_toml.is_empty()
+                || rules_toml.len() > 65_536 =>
+            {
+                Err(AdminError::Invalid)
+            }
+            Self::SessionsDisconnect { session_id: 0, .. } => Err(AdminError::Invalid),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -153,6 +445,34 @@ fn encode_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn decode_hex<const N: usize>(input: &str) -> Result<[u8; N], AdminError> {
+    if input.len() != N * 2 || !input.is_ascii() {
+        return Err(AdminError::Invalid);
+    }
+    let mut output = [0; N];
+    let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(AdminError::Invalid);
+    }
+    for (index, pair) in pairs.iter().enumerate() {
+        let high = decode_nibble(pair[0])?;
+        let low = decode_nibble(pair[1])?;
+        output[index] = high
+            .checked_mul(16)
+            .and_then(|high| high.checked_add(low))
+            .ok_or(AdminError::Invalid)?;
+    }
+    Ok(output)
+}
+
+fn decode_nibble(byte: u8) -> Result<u8, AdminError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(AdminError::Invalid),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum AdminError {
     #[error("administrative client is invalid")]
@@ -205,5 +525,66 @@ mod tests {
         let secret = credential.expose_once();
         assert_eq!(digest.as_slice(), Sha256::digest(secret).as_slice());
         assert_eq!(UserId::generate().unwrap().hex().len(), 32);
+    }
+
+    #[test]
+    fn control_schema_requires_complete_user_limits() {
+        let request = br#"
+method = "user.create"
+client_id = "panel"
+seq = 1
+
+[user]
+status = "enabled"
+burst_bytes = 65507
+weight = 1
+group = "default"
+rule_profile = "default"
+
+[user.expiration]
+mode = "unlimited"
+
+[user.quota]
+mode = "limited"
+bytes = 1000000
+
+[user.upload_rate]
+mode = "unlimited"
+
+[user.download_rate]
+mode = "unlimited"
+
+[user.combined_rate]
+mode = "unlimited"
+
+[user.max_sessions]
+mode = "limited"
+count = 2
+
+[user.max_flows]
+mode = "limited"
+count = 16
+"#;
+        let parsed = ControlRequest::parse(request).unwrap();
+        assert_eq!(parsed.sequence(), Some(("panel", 1)));
+        let missing = std::str::from_utf8(request)
+            .unwrap()
+            .replace("weight = 1\n", "");
+        assert!(ControlRequest::parse(missing.as_bytes()).is_err());
+        let unknown = std::str::from_utf8(request)
+            .unwrap()
+            .replace("weight = 1", "weight = 1\nunknown = true");
+        assert!(ControlRequest::parse(unknown.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn identifiers_reject_noncanonical_hex() {
+        assert!(UserId::parse("00").is_err());
+        assert!(UserId::parse("GG000000000000000000000000000000").is_err());
+        let digest = Credential::generate().unwrap().digest_id();
+        assert_eq!(
+            CredentialDigest::parse(&digest.hex()).unwrap().hex(),
+            digest.hex()
+        );
     }
 }
