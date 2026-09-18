@@ -37,7 +37,7 @@ jobs:
         run: cargo build --workspace --release --locked
       - name: release tooling
         run: |
-          python -m py_compile tools/package-release.py tools/verify-release.py tools/release-inventory.py
+          python -m py_compile tools/check-glibc.py tools/package-release.py tools/verify-release.py tools/release-inventory.py
           python tools/package-release.py --source . --dist /tmp/snolc-bundle-a --bundle-output x86_64-unknown-linux-gnu=target/release
           python tools/package-release.py --source . --dist /tmp/snolc-bundle-b --bundle-output x86_64-unknown-linux-gnu=target/release
           cmp /tmp/snolc-bundle-a/snolc-0.0.1-x86_64-unknown-linux-gnu.tar.gz /tmp/snolc-bundle-b/snolc-0.0.1-x86_64-unknown-linux-gnu.tar.gz
