@@ -9,5 +9,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-snolc-abi = { version = "=0.0.2", path = "../snolc-abi" }
+snolc-abi = { version = "=0.0.3", path = "../snolc-abi" }
 thiserror.workspace = true

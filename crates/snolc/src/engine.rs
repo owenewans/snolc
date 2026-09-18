@@ -30,7 +30,7 @@ use crate::stack::{
 use crate::wire::{Destination, OpenRequest, OpenResponse, OpenStatus, StreamKind};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
-const MODULE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MODULE_POLL_INTERVAL: Duration = Duration::from_micros(100);
 static OPERATION_NEXT: AtomicU64 = AtomicU64::new(1);
 type ContextMap = HashMap<(u64, Vec<u8>), Vec<u8>>;
 

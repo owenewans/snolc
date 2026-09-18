@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "snolc"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "async-executor",
  "async-io",
@@ -699,11 +699,11 @@ dependencies = [
 
 [[package]]
 name = "snolc-abi"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "snolc-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ctrlc",
  "snolc",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "snolc-sdk"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "snolc-abi",
  "thiserror",
