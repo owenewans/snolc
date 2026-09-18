@@ -26,7 +26,11 @@ def main() -> None:
     checked = 0
     required = set()
     for path in paths:
-        if not path.is_file() or path.read_bytes()[:4] != b"\x7fELF":
+        if not path.is_file():
+            continue
+        with path.open("rb") as stream:
+            magic = stream.read(4)
+        if magic != b"\x7fELF":
             continue
         output = subprocess.check_output(
             ["readelf", "--version-info", str(path)], text=True, errors="replace"
