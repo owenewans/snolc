@@ -48,6 +48,7 @@ android {
     sourceSets {
         main {
             jniLibs.srcDirs = [layout.buildDirectory.dir("generated/jniLibs")]
+            assets.srcDirs = [layout.buildDirectory.dir("generated/assets")]
         }
     }
 
@@ -116,6 +117,22 @@ def registerRustBuild = { String taskName, String target, String abi, String cla
 registerRustBuild("cargoArm64", "aarch64-linux-android", "arm64-v8a", "aarch64-linux-android")
 registerRustBuild("cargoArmv7", "armv7-linux-androideabi", "armeabi-v7a", "armv7a-linux-androideabi")
 
+tasks.register("generateNotices", Exec) {
+    workingDir repoRoot
+    def assets = layout.buildDirectory.dir("generated/assets")
+    inputs.files(new File(repoRoot, "Cargo.toml"), new File(repoRoot, "Cargo.lock"))
+    outputs.files(assets.map { it.file("LICENSE") }, assets.map { it.file("THIRD_PARTY_NOTICES.txt") })
+    commandLine "python", new File(repoRoot, "tools/package-release.py"),
+        "--source", repoRoot,
+        "--notices-output", assets.map { it.file("THIRD_PARTY_NOTICES.txt") }.get().asFile
+    doLast {
+        copy {
+            from new File(repoRoot, "LICENSE")
+            into assets
+        }
+    }
+}
+
 tasks.named("preBuild").configure {
-    dependsOn("cargoArm64", "cargoArmv7")
+    dependsOn("cargoArm64", "cargoArmv7", "generateNotices")
 }

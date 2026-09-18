@@ -29,7 +29,11 @@ jobs:
         working-directory: clients/snolcNG/android
         run: ./gradlew --no-daemon assembleDebug
       - name: verify native libraries
-        run: test "$(unzip -Z1 clients/snolcNG/android/app/build/outputs/apk/debug/app-debug.apk | grep -c '^lib/.*/libsnolc_.*\.so$')" -eq 22
+        run: |
+          apk=clients/snolcNG/android/app/build/outputs/apk/debug/app-debug.apk
+          test "$(unzip -Z1 "$apk" | grep -c '^lib/.*/libsnolc_.*\.so$')" -eq 22
+          unzip -p "$apk" assets/LICENSE | grep -q 'This is free and unencumbered software'
+          unzip -p "$apk" assets/THIRD_PARTY_NOTICES.txt | grep -q 'SNOLC THIRD-PARTY NOTICES'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: snolcNG-android-debug

@@ -20,10 +20,11 @@ except ModuleNotFoundError:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--dist", type=Path, required=True)
+    parser.add_argument("--dist", type=Path)
     parser.add_argument("--signing-key", type=Path)
     parser.add_argument("--output", action="append", default=[], metavar="TARGET=DIR")
     parser.add_argument("--bundle-output", action="append", default=[], metavar="TARGET=DIR")
+    parser.add_argument("--notices-output", type=Path)
     return parser.parse_args()
 
 
@@ -33,11 +34,13 @@ def main() -> None:
     source = args.source.resolve()
     outputs = parse_outputs(args.output)
     bundle_outputs = parse_outputs(args.bundle_output)
-    dist = args.dist.resolve()
+    dist = args.dist.resolve() if args.dist is not None else None
     if not source.is_dir():
         raise SystemExit("source checkout is missing")
-    if not outputs and not bundle_outputs:
+    if not outputs and not bundle_outputs and args.notices_output is None:
         raise SystemExit("at least one output is required")
+    if (outputs or bundle_outputs) and dist is None:
+        raise SystemExit("dist directory is required for archives")
     if outputs and (args.signing_key is None or not args.signing_key.is_file()):
         raise SystemExit("signing key is missing")
     if outputs and tomllib is None:
@@ -50,9 +53,10 @@ def main() -> None:
         source_revision = subprocess.check_output(
             [*git, "rev-parse", "HEAD"], cwd=source, text=True
         ).strip()
-    dist.mkdir(parents=True, exist_ok=True)
-    if any(dist.iterdir()):
-        raise SystemExit("dist directory must be empty")
+    if dist is not None:
+        dist.mkdir(parents=True, exist_ok=True)
+        if any(dist.iterdir()):
+            raise SystemExit("dist directory must be empty")
 
     metadata = json.loads(
         subprocess.check_output(
@@ -107,6 +111,10 @@ def main() -> None:
             check=True,
         )
     notices = dependency_notices(sorted(local), local, packages, nodes)
+    if args.notices_output is not None:
+        notices_output = args.notices_output.resolve()
+        notices_output.parent.mkdir(parents=True, exist_ok=True)
+        notices_output.write_bytes(notices)
     for target, output in sorted(bundle_outputs.items()):
         write_bundle(
             dist / f"snolc-0.0.1-{target}.tar.gz",
@@ -115,7 +123,8 @@ def main() -> None:
             output,
             notices,
         )
-    print(f"created {len(list(dist.glob('*.tar.gz')))} release artifacts")
+    artifacts = len(list(dist.glob("*.tar.gz"))) if dist is not None else 0
+    print(f"created {artifacts} release artifacts")
 
 
 def parse_outputs(values: list[str]) -> dict[str, Path]:
