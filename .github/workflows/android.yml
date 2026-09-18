@@ -1,0 +1,34 @@
+name: android
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - name: install Android SDK packages
+        run: yes | sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
+      - name: install Rust targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi
+      - name: build APK
+        working-directory: clients/snolcNG/android
+        run: ./gradlew --no-daemon assembleDebug
+      - name: verify native libraries
+        run: test "$(unzip -Z1 clients/snolcNG/android/app/build/outputs/apk/debug/app-debug.apk | grep -c '^lib/.*/libsnolc_.*\.so$')" -eq 22
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: snolcNG-android-debug
+          path: clients/snolcNG/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
