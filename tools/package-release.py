@@ -34,6 +34,11 @@ def main() -> None:
         raise SystemExit("at least one output is required")
     if outputs and (args.signing_key is None or not args.signing_key.is_file()):
         raise SystemExit("signing key is missing")
+    if subprocess.check_output(["git", "status", "--porcelain"], cwd=source, text=True).strip():
+        raise SystemExit("source checkout must be clean")
+    source_revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True
+    ).strip()
     dist.mkdir(parents=True, exist_ok=True)
     if any(dist.iterdir()):
         raise SystemExit("dist directory must be empty")
@@ -53,6 +58,7 @@ def main() -> None:
 
     manifest_paths = sorted((root / "snolpkg").glob("*.toml")) if outputs else []
     for manifest_path in manifest_paths:
+        update_source_revision(manifest_path, source_revision)
         manifest = tomllib.loads(manifest_path.read_text())
         notices = dependency_notices([manifest["build"]["package"]], local, packages, nodes)
         updates = {}
@@ -269,6 +275,24 @@ def update_artifacts(path: Path, updates: dict[str, tuple[int, str]]) -> None:
         if artifact and target in updates and line.startswith("sha256 = "):
             line = f'sha256 = "{updates[target][1]}"'
         output.append(line)
+    path.write_text("\n".join(output) + "\n")
+
+
+def update_source_revision(path: Path, revision: str) -> None:
+    output = []
+    source = False
+    updated = False
+    for line in path.read_text().splitlines():
+        if line == "[source]":
+            source = True
+        elif line.startswith("["):
+            source = False
+        if source and line.startswith("revision = "):
+            line = f'revision = "{revision}"'
+            updated = True
+        output.append(line)
+    if not updated:
+        raise SystemExit(f"source revision is missing: {path}")
     path.write_text("\n".join(output) + "\n")
 
 
