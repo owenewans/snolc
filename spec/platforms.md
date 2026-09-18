@@ -24,6 +24,12 @@ macOS, Haiku, and Windows targets use triples supported by the pinned Rust
 toolchain and runner. CI records a missing runner or target as unverified. It
 does not mark that row passed.
 
+The i586 build enables SSE and SSE2 because the pinned SSH cryptography stack
+requires them; its published minimum ISA must say so. Rust 1.98.1 distributes
+standard libraries for FreeBSD x86_64/aarch64 and NetBSD x86_64 on the Linux CI
+host. It does not distribute the requested OpenBSD, NetBSD aarch64, or Haiku
+x86_64 components there, so those 0.0.1 rows remain unverified.
+
 Version 0.0.1 official module manifests contain measured artifacts for:
 
 - `x86_64-unknown-linux-gnu`, x86-64, glibc 2.28;
