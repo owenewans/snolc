@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       - name: install Android SDK packages
-        run: yes | sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
+        run: yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
       - name: install Rust targets
         run: rustup target add aarch64-linux-android armv7-linux-androideabi
       - name: build APK
