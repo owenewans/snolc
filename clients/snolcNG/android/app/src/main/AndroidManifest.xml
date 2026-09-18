@@ -6,7 +6,6 @@
 
     <application
         android:allowBackup="false"
-        android:extractNativeLibs="true"
         android:hasFragileUserData="false"
         android:label="snolcNG"
         android:usesCleartextTraffic="false">
