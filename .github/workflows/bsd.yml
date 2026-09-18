@@ -34,7 +34,7 @@ jobs:
         with:
           release: "14.0"
           arch: ${{ matrix.arch }}
-          prepare: pkg install -y curl ca_root_nss
+          prepare: pkg install -y bash curl ca_root_nss
           run: |
             if [ "$(uname -m)" = "arm64" ]; then
               archive=rust-1.98.1-aarch64-unknown-freebsd.tar.xz
