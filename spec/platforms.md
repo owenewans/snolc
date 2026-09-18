@@ -16,6 +16,10 @@ The minimum Linux profile is kernel 4.19 and glibc 2.28. Android requires API
 24. The release manifest records the target triple and minimum runtime for each
 artifact.
 
+Linux release jobs build inside the pinned Debian 10 container from the pinned
+2024-06-12 package snapshot. `tools/check-glibc.py` rejects any ELF artifact
+whose imported symbol versions exceed `GLIBC_2.28`.
+
 ## release targets
 
 Linux targets are i586 GNU, i686 GNU, x86_64 GNU, aarch64 GNU,
