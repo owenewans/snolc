@@ -92,7 +92,7 @@ def dependency_notices(
         (packages[package] for package in seen if packages[package]["source"] is not None),
         key=lambda package: (package["name"], package["version"]),
     )
-    output = ["SNOLC THIRD-PARTY NOTICES", ""]
+    output = ["snolc third-party notices", ""]
     for package in dependencies:
         directory = Path(package["manifest_path"]).parent
         output.extend(

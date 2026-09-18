@@ -4,11 +4,6 @@
 
 modular userspace network engine for linux and android.
 
-[![ci](https://github.com/owenewans/snolc/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/owenewans/snolc/actions/workflows/ci.yml)
-[![scorecard](https://api.securityscorecards.dev/projects/github.com/owenewans/snolc/badge)](https://securityscorecards.dev/viewer/?uri=github.com/owenewans/snolc)
-[![last commit](https://img.shields.io/github/last-commit/owenewans/snolc?logo=github)](https://github.com/owenewans/snolc/commits/dev)
-[![license](https://img.shields.io/github/license/owenewans/snolc)](LICENSE)
-
 <a href="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle"><img src="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle" alt="repository views"></a>
 
 `rust` `proxy` `networking`

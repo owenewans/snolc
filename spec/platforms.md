@@ -1,6 +1,6 @@
 # platforms and resource contract
 
-SNOLC publishes target-specific binaries. One `.so` cannot represent another
+snolc publishes target-specific binaries. One `.so` cannot represent another
 libc, architecture, ABI, or Android API.
 
 ## support tiers
@@ -35,7 +35,7 @@ NetBSD 10 x86_64 inside target-native VMs. The pinned distribution has no
 OpenBSD or NetBSD aarch64 host toolchain. Those rows and Haiku x86_64 remain
 unverified; CI does not mark them passed with another compiler version.
 
-Version 0.0.1 official module manifests contain measured artifacts for:
+Official module manifests list measured artifacts for:
 
 - `x86_64-unknown-linux-gnu`, x86-64, glibc 2.28;
 - `aarch64-linux-android`, armv8-a, API 24;

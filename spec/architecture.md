@@ -1,6 +1,7 @@
 # architecture
 
-SNOLC 0.0.1 exposes a library engine. The CLI and snolcNG call that engine.
+The `snolc` repository exposes a library engine and a thin CLI. The snolcNG
+client imports the engine at a pinned commit.
 The compatibility generation is `wire_version = 1`.
 
 ## packet path
@@ -16,17 +17,21 @@ external request or packet, then hands it to `StackBridge`. Policy owns the
 transfer between a smoltcp socket and a yamux stream. Core has no second copy
 loop and no direct adapter-to-yamux path.
 
-## crates
+## repositories and crates
 
 - `snolc-abi` defines C-compatible values and function tables.
 - `snolc-sdk` wraps ABI I/O, handles, wakes, framing, and `Pump`.
 - `snolc` owns configuration, loading, stack, mux, events, and the engine.
 - `snolc-cli` handles arguments, signals, control requests, and output.
-- `snolpkg` installs signed native module packages.
-- `snolc-ng` owns profile import, desktop UI, and Android bootstrap.
+- [`snolc-modules`](https://github.com/owenewans/snolc-modules) owns the ten
+  official modules, templates, manifests and native E2E tests.
+- [`snolpkg`](https://github.com/owenewans/snolpkg) installs signed packages.
+- [`snolcNG`](https://github.com/owenewans/snolcNG) owns profile import, the
+  desktop UI and Android bootstrap.
 
-Core depends on ABI. SDK depends on ABI. Modules depend on SDK and ABI, but do
-not link to private core types. Concrete modules do not appear in core.
+Core depends on ABI. SDK depends on ABI. The module repository pins one SDK
+commit. Modules do not link to private core types. Concrete modules do not
+appear in core.
 
 ## ownership and execution
 

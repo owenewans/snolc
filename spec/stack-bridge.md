@@ -13,7 +13,7 @@ socket receives those packets and exposes payload to policy. Return traffic
 uses the same path in reverse.
 
 smoltcp creates SYN, ACK, sequence numbers, windows, retransmission, FIN, and
-reset behavior. SNOLC does not implement a second TCP state machine.
+reset behavior. snolc does not implement a second TCP state machine.
 
 The bridge allocates virtual endpoints from ports 1024 through 65535 on
 `127.0.0.1` or `::1`. These addresses exist inside the smoltcp interface. They

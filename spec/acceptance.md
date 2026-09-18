@@ -1,6 +1,6 @@
 # acceptance
 
-SNOLC 0.0.1 releases only when each required row has command output and an
+Release work closes only when each required row has command output and an
 artifact or log reference. `pass`, `fail`, `blocked`, and `unverified` are the
 allowed results. A missing runner is `unverified`.
 
@@ -13,10 +13,11 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
 
-Run cargo-deny advisory, ban, license, and source checks. Run fuzz smoke for
-wire, strict TOML boundaries, policy frames, profile URI, and archive paths.
-Build release artifacts from `Cargo.lock`; record rustc, linker, target, source
-commit, SHA-256, size, and dependency inventory.
+Run cargo-deny advisory, ban, license and source checks in all four
+repositories. Run core fuzz smoke for wire and strict TOML. Run the policy,
+profile URI and archive targets in their owning repositories. Build release
+artifacts from each `Cargo.lock`; record rustc, linker, target, source commit,
+SHA-256, size and dependency inventory.
 
 ## network gates
 
@@ -79,7 +80,7 @@ Run the normative traffic profile after the release workspace build:
 ```sh
 cargo build --workspace --release --locked
 SNOLC_LONG_RUN_SECONDS=3600 SNOLC_STORED_USERS=10000 \
-  cargo test --release -p snolc --test native_session \
+  cargo test --release -p snolc-module-tests --test native_session \
   release_resource_profile --locked -- --ignored --nocapture --exact
 ```
 
@@ -91,7 +92,7 @@ Measure the available host's unthrottled ceiling through the same path:
 
 ```sh
 SNOLC_RESOURCE_CEILING=1 SNOLC_LONG_RUN_SECONDS=60 SNOLC_STORED_USERS=2 \
-  cargo test --release -p snolc --test native_session \
+  cargo test --release -p snolc-module-tests --test native_session \
   release_resource_profile --locked -- --ignored --nocapture --exact
 ```
 
