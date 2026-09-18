@@ -4,6 +4,11 @@
 
 modular userspace network engine for linux and android.
 
+[![ci](https://github.com/owenewans/snolc/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/owenewans/snolc/actions/workflows/ci.yml)
+[![scorecard](https://api.securityscorecards.dev/projects/github.com/owenewans/snolc/badge)](https://securityscorecards.dev/viewer/?uri=github.com/owenewans/snolc)
+[![last commit](https://img.shields.io/github/last-commit/owenewans/snolc?logo=github)](https://github.com/owenewans/snolc/commits/dev)
+[![license](https://img.shields.io/github/license/owenewans/snolc)](LICENSE)
+
 <a href="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle"><img src="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle" alt="repository views"></a>
 
 `rust` `proxy` `networking`
@@ -15,13 +20,13 @@ modular userspace network engine for linux and android.
 The installer places the `snolc` binary in `$HOME/.local/bin`.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/v0.0.2/install.sh | sh -s -- --binary
+curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/master/install.sh | sh -s -- --binary
 ```
 
 Compile the same tagged source instead:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/v0.0.2/install.sh | sh -s -- --source
+curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/master/install.sh | sh -s -- --source
 ```
 
 Pass `--prefix /usr/local` to select another installation root. Binary mode
@@ -30,7 +35,7 @@ Rust 1.98.1. Both modes install one executable and leave modules untouched.
 
 ## components
 
-SNOLC 0.0.2 uses four repositories:
+snolc uses four repositories:
 
 - [`snolc`](https://github.com/owenewans/snolc): engine, C ABI, Rust SDK and CLI
 - [`snolc-modules`](https://github.com/owenewans/snolc-modules): official adapters, protection, carriers and policies
@@ -57,7 +62,7 @@ snolc run snolc.toml
 snolc control /run/snolc/snolc.sock policy-main request.toml
 ```
 
-SNOLC loads native modules into its process. Install modules only from a source
+snolc loads native modules into its process. Install modules only from a source
 you trust.
 
 ## documentation
