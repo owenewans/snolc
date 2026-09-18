@@ -30,7 +30,7 @@ TARGETS = {
     "x86_64-unknown-netbsd": {"minimum_os": "NetBSD 10", "minimum_isa": "x86-64"},
     "x86_64-apple-darwin": {"minimum_os": "macOS 11", "minimum_isa": "x86-64"},
     "aarch64-apple-darwin": {"minimum_os": "macOS 11", "minimum_isa": "armv8-a"},
-    "x86_64-pc-windows-msvc": {"minimum_os": "Windows 10", "minimum_isa": "x86-64"},
+    "x86_64-pc-windows-msvc": {"minimum_os": "unverified", "minimum_isa": "x86-64"},
 }
 
 
