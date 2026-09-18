@@ -30,40 +30,19 @@ jobs:
           arch: ${{ matrix.arch }}
           prepare: pkg install -y curl ca_root_nss
           run: |
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
-            . "$HOME/.cargo/env"
-            cargo build --workspace --exclude snolc-ng --release --locked
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: ${{ matrix.profile }}
-          path: |
-            target/release/snolc
-            target/release/snolpkg
-            target/release/libsnolc_*.so
-          if-no-files-found: error
-          retention-days: 7
-
-  openbsd:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            profile: openbsd-x86_64
-          - arch: aarch64
-            profile: openbsd-aarch64
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-      - uses: vmactions/openbsd-vm@86cdc08415d9d0865267e686561e276c52d62530
-        with:
-          release: "7.7"
-          arch: ${{ matrix.arch }}
-          prepare: pkg_add curl
-          run: |
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
-            . "$HOME/.cargo/env"
+            if [ "$(uname -m)" = "arm64" ]; then
+              archive=rust-1.98.1-aarch64-unknown-freebsd.tar.xz
+              curl --proto '=https' --tlsv1.2 -sSfO "https://static.rust-lang.org/dist/2026-09-03/$archive"
+              echo "408b0fe6880d074bff349ad730f5a46c085a60b730e2be0a81654ec1617cb3c7  $archive" | sha256 -c
+              tar -xJf "$archive"
+              "${archive%.tar.xz}/install.sh" --prefix="$HOME/.rust-1.98.1" --without=rust-docs
+              PATH="$HOME/.rust-1.98.1/bin:$PATH"
+              export PATH
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
+              . "$HOME/.cargo/env"
+            fi
+            test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
             cargo build --workspace --exclude snolc-ng --release --locked
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -84,8 +63,6 @@ jobs:
         include:
           - arch: x86_64
             profile: netbsd-x86_64
-          - arch: aarch64
-            profile: netbsd-aarch64
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       - uses: vmactions/netbsd-vm@20ee93a005c9fc78743e6e05269f4cb023b87413
@@ -96,6 +73,7 @@ jobs:
           run: |
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
             . "$HOME/.cargo/env"
+            test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
             cargo build --workspace --exclude snolc-ng --release --locked
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
