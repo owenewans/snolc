@@ -86,6 +86,17 @@ SNOLC_LONG_RUN_SECONDS=3600 SNOLC_STORED_USERS=10000 \
 The test prints duration, stored users, flows, payload throughput, RSS, and HWM.
 It fails outside 0.95..1.05 Mbit/s or the 32/64/96 MiB RSS limits.
 
+Measure the available host's unthrottled ceiling through the same path:
+
+```sh
+SNOLC_RESOURCE_CEILING=1 SNOLC_LONG_RUN_SECONDS=60 SNOLC_STORED_USERS=2 \
+  cargo test --release -p snolc --test native_session \
+  release_resource_profile --locked -- --ignored --nocapture --exact
+```
+
+Record the CPU and host with this result. Only a physical device near 600 MHz
+satisfies the low-frequency hardware gate.
+
 Measure ceiling throughput on an available physical device near 600 MHz. Label
 virtual CPU measurements by their host and model. Check stripped installed
 binaries against the 128 MiB allocation and report database, logs, staging, and
