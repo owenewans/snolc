@@ -6,6 +6,8 @@ use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1188,6 +1190,397 @@ cidr = "::1/128"
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+#[ignore = "60-minute release resource gate"]
+fn release_resource_profile() {
+    const FLOWS_PER_USER: usize = 8;
+    const TOTAL_FLOWS: usize = FLOWS_PER_USER * 2;
+    const MIB: u64 = 1024 * 1024;
+
+    let duration = std::env::var("SNOLC_LONG_RUN_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    let stored_users = std::env::var("SNOLC_STORED_USERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+    assert!(duration > 0 && stored_users >= 2);
+
+    let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let carrier_endpoint = carrier_listener.local_addr().unwrap();
+    drop(carrier_listener);
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let target_endpoint = target.local_addr().unwrap();
+    let socks_a = free_tcp_endpoint();
+    let socks_b = free_tcp_endpoint();
+    let directory = std::env::temp_dir().join(format!(
+        "snolc-resource-{}-{}",
+        std::process::id(),
+        carrier_endpoint.port()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+
+    let params: NoiseParams = "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let keypair = Builder::new(params).generate_keypair().unwrap();
+    let private = directory.join("server.key");
+    let public = directory.join("server.pub");
+    fs::write(&private, keypair.private).unwrap();
+    fs::write(&public, keypair.public).unwrap();
+    let server_protection = format!(
+        "mode = \"server\"\nprivate_key_file = \"{}\"\n",
+        private.display()
+    );
+    let client_protection = format!(
+        "mode = \"client\"\nserver_public_key_file = \"{}\"\n",
+        public.display()
+    );
+    let credential_a = "31".repeat(32);
+    let credential_b = "72".repeat(32);
+    let digest_a = format!("{:x}", Sha256::digest(hex_bytes(&credential_a)));
+    let digest_b = format!("{:x}", Sha256::digest(hex_bytes(&credential_b)));
+    let server_policy = policy_local_options(&directory.join("server/policy.redb"), None);
+    let server_carrier = format!(
+        "mode = \"listen\"\nendpoint_ip = \"{carrier_endpoint}\"\nmax_connections = 2\nnodelay = true\n"
+    );
+    let server = build_side_with_modules_and_tunnels(
+        "server-resource",
+        "server",
+        (
+            "adapter_direct",
+            b"dns_mode = \"reject-domains\"\nmax_pending_opens = 8\nmax_resolved_addresses = 16\nresolve_timeout_ms = 1000\nconnect_timeout_ms = 1000\n",
+        ),
+        ("carrier_tcp", server_carrier.as_bytes()),
+        ("protection_noise", server_protection.as_bytes()),
+        ("policy_local", server_policy.as_bytes()),
+        None,
+        2,
+    );
+    let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
+    let server_thread = thread::spawn(move || server_engine.run());
+    wait_running(&server_handle);
+    let users = provision_resource_users(
+        &server_handle,
+        "policy-server-resource",
+        stored_users,
+        [&digest_a, &digest_b],
+    );
+    let idle_rss = process_rss_bytes();
+    assert!(idle_rss <= 32 * MIB, "idle RSS is {idle_rss} bytes");
+    let target_thread = thread::spawn(move || run_echo_target(target, TOTAL_FLOWS));
+
+    let client_policy_a =
+        policy_local_options(&directory.join("client-a/policy.redb"), Some(&credential_a));
+    let client_policy_b =
+        policy_local_options(&directory.join("client-b/policy.redb"), Some(&credential_b));
+    let client_a = build_resource_client(
+        "client-resource-a",
+        carrier_endpoint,
+        socks_a,
+        &client_protection,
+        &client_policy_a,
+    );
+    let client_b = build_resource_client(
+        "client-resource-b",
+        carrier_endpoint,
+        socks_b,
+        &client_protection,
+        &client_policy_b,
+    );
+    let (client_a_engine, client_a_handle) = Engine::build(client_a, QuietHost).unwrap();
+    let (client_b_engine, client_b_handle) = Engine::build(client_b, QuietHost).unwrap();
+    let client_a_thread = thread::spawn(move || client_a_engine.run());
+    let client_b_thread = thread::spawn(move || client_b_engine.run());
+    wait_session_count(&server_handle, 2);
+    wait_session_count(&client_a_handle, 1);
+    wait_session_count(&client_b_handle, 1);
+    wait_user_session(&server_handle, "policy-server-resource", &users[0]);
+    wait_user_session(&server_handle, "policy-server-resource", &users[1]);
+    wait_any_policy_session(&client_a_handle, "policy-client-resource-a");
+    wait_any_policy_session(&client_b_handle, "policy-client-resource-b");
+
+    let mut streams = Vec::with_capacity(TOTAL_FLOWS);
+    for (endpoint, client) in [(socks_a, &client_a_handle), (socks_b, &client_b_handle)] {
+        for index in 0..FLOWS_PER_USER {
+            streams.push(open_socks_flow(
+                endpoint,
+                target_endpoint,
+                index,
+                &server_handle,
+                client,
+            ));
+        }
+    }
+    wait_flow_count(&server_handle, TOTAL_FLOWS);
+    wait_flow_count(&client_a_handle, FLOWS_PER_USER);
+    wait_flow_count(&client_b_handle, FLOWS_PER_USER);
+
+    let stop_sample = Arc::new(AtomicBool::new(false));
+    let steady_rss = Arc::new(AtomicU64::new(process_rss_bytes()));
+    let sample_thread = {
+        let stop = stop_sample.clone();
+        let maximum = steady_rss.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                maximum.fetch_max(process_rss_bytes(), Ordering::AcqRel);
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    let transferred = Arc::new(AtomicU64::new(0));
+    let deadline = Instant::now() + Duration::from_secs(duration);
+    let mut workers = Vec::with_capacity(TOTAL_FLOWS);
+    for (index, stream) in streams.into_iter().enumerate() {
+        let transferred = transferred.clone();
+        workers.push(thread::spawn(move || {
+            run_rate_limited_flow(stream, deadline, index as u8, &transferred)
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    stop_sample.store(true, Ordering::Release);
+    sample_thread.join().unwrap();
+    target_thread.join().unwrap();
+
+    let bytes = transferred.load(Ordering::Acquire);
+    let bits_per_second = bytes.saturating_mul(8) / duration;
+    let steady_rss = steady_rss.load(Ordering::Acquire);
+    let peak_rss = process_peak_rss_bytes();
+    println!(
+        "snolc_resource duration_seconds={duration} stored_users={stored_users} flows={TOTAL_FLOWS} transferred_bytes={bytes} bits_per_second={bits_per_second} idle_rss_bytes={idle_rss} steady_rss_bytes={steady_rss} peak_rss_bytes={peak_rss}"
+    );
+    assert!(steady_rss <= 64 * MIB, "steady RSS is {steady_rss} bytes");
+    assert!(peak_rss <= 96 * MIB, "peak RSS is {peak_rss} bytes");
+    assert!(
+        (950_000..=1_050_000).contains(&bits_per_second),
+        "aggregate payload rate is {bits_per_second} bit/s"
+    );
+
+    client_a_handle.shutdown().unwrap();
+    client_b_handle.shutdown().unwrap();
+    server_handle.shutdown().unwrap();
+    client_a_thread.join().unwrap().unwrap();
+    client_b_thread.join().unwrap().unwrap();
+    server_thread.join().unwrap().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn free_tcp_endpoint() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    drop(listener);
+    endpoint
+}
+
+fn build_resource_client(
+    identity: &str,
+    carrier: std::net::SocketAddr,
+    socks: std::net::SocketAddr,
+    protection: &str,
+    policy: &str,
+) -> snolc::ValidatedConfig {
+    let adapter = format!(
+        "listen = \"{socks}\"\nmax_connections = 16\nmax_udp_associations = 4\nmax_request_bytes = 1024\nreject_fragments = true\n"
+    );
+    build_side_with_adapter(
+        identity,
+        "client",
+        carrier,
+        false,
+        ("adapter_socks5", adapter.as_bytes()),
+        ("protection_noise", protection.as_bytes()),
+        ("policy_local", policy.as_bytes()),
+    )
+}
+
+fn provision_resource_users(
+    handle: &snolc::EngineHandle,
+    instance: &str,
+    count: usize,
+    credentials: [&str; 2],
+) -> Vec<String> {
+    let mut user_ids = Vec::with_capacity(2);
+    for index in 0..count {
+        let seq = index + 1;
+        let request = format!(
+            r#"method = "user.create"
+client_id = "resource-gate"
+seq = {seq}
+
+[user]
+status = "enabled"
+burst_bytes = 65507
+weight = 1
+group = "default"
+rule_profile = "default"
+
+[user.expiration]
+mode = "unlimited"
+[user.weekly_access]
+mode = "unlimited"
+[user.quota]
+mode = "limited"
+bytes = 1073741824
+[user.upload_rate]
+mode = "unlimited"
+[user.download_rate]
+mode = "unlimited"
+[user.combined_rate]
+mode = "limited"
+bytes_per_second = 62500
+[user.max_sessions]
+mode = "limited"
+count = 1
+[user.max_flows]
+mode = "limited"
+count = 8
+"#
+        );
+        let response =
+            futures::executor::block_on(handle.control(instance, request.into_bytes())).unwrap();
+        if index < 2 {
+            let response: toml::Value =
+                toml::from_str(std::str::from_utf8(&response).unwrap()).unwrap();
+            user_ids.push(response["user_id"].as_str().unwrap().to_owned());
+        }
+    }
+    for (offset, (user_id, credential)) in user_ids.iter().zip(credentials).enumerate() {
+        let seq = count + offset + 1;
+        let request = format!(
+            "method = \"credential.add\"\nclient_id = \"resource-gate\"\nseq = {seq}\nuser_id = \"{user_id}\"\ncredential_sha256 = \"{credential}\"\n"
+        );
+        futures::executor::block_on(handle.control(instance, request.into_bytes())).unwrap();
+    }
+    user_ids
+}
+
+fn open_socks_flow(
+    socks: std::net::SocketAddr,
+    target: std::net::SocketAddr,
+    index: usize,
+    server: &snolc::EngineHandle,
+    client: &snolc::EngineHandle,
+) -> TcpStream {
+    let mut stream = TcpStream::connect(socks).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream.write_all(&[5, 1, 0]).unwrap();
+    let mut greeting = [0; 2];
+    stream.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 0]);
+    let std::net::IpAddr::V4(address) = target.ip() else {
+        panic!("resource target must use IPv4")
+    };
+    let mut request = vec![5, 1, 0, 1];
+    request.extend_from_slice(&address.octets());
+    request.extend_from_slice(&target.port().to_be_bytes());
+    stream.write_all(&request).unwrap();
+    let mut response = [0; 10];
+    stream.read_exact(&mut response).unwrap_or_else(|error| {
+        panic!(
+            "SOCKS flow {socks} index {index} failed: {error}; server={:?}; client={:?}",
+            server.snapshot(),
+            client.snapshot()
+        )
+    });
+    assert_eq!(response[1], 0);
+    stream
+}
+
+fn run_echo_target(listener: TcpListener, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut workers = Vec::with_capacity(count);
+    while workers.len() < count {
+        match listener.accept() {
+            Ok((mut stream, _)) => workers.push(thread::spawn(move || {
+                let mut buffer = [0; 16_384];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(length) => stream.write_all(&buffer[..length]).unwrap(),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => panic!("echo read failed: {error}"),
+                    }
+                }
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "flow accept timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("flow accept failed: {error}"),
+        }
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+fn run_rate_limited_flow(
+    mut stream: TcpStream,
+    deadline: Instant,
+    byte: u8,
+    transferred: &AtomicU64,
+) {
+    let payload = [byte; 3906];
+    let mut reply = [0; 3906];
+    let mut next = Instant::now();
+    while Instant::now() < deadline {
+        stream.write_all(&payload).unwrap();
+        stream.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, payload);
+        transferred.fetch_add((payload.len() + reply.len()) as u64, Ordering::AcqRel);
+        next += Duration::from_secs(1);
+        if let Some(delay) = next.checked_duration_since(Instant::now()) {
+            thread::sleep(delay);
+        }
+    }
+    stream.shutdown(Shutdown::Both).unwrap();
+}
+
+fn wait_session_count(handle: &snolc::EngineHandle, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while handle.snapshot().sessions != count && Instant::now() < deadline {
+        assert_ne!(handle.snapshot().lifecycle, Lifecycle::Failed);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(handle.snapshot().sessions, count);
+}
+
+fn wait_flow_count(handle: &snolc::EngineHandle, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while handle.snapshot().flows != count && Instant::now() < deadline {
+        assert_ne!(handle.snapshot().lifecycle, Lifecycle::Failed);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(handle.snapshot().flows, count);
+}
+
+fn process_rss_bytes() -> u64 {
+    process_status_kib("VmRSS:") * 1024
+}
+
+fn process_peak_rss_bytes() -> u64 {
+    process_status_kib("VmHWM:") * 1024
+}
+
+fn process_status_kib(field: &str) -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(field)
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap()
+}
+
 fn run_pair(server: snolc::ValidatedConfig, client: snolc::ValidatedConfig) {
     let (server_engine, server_handle) = Engine::build(server, QuietHost).unwrap();
     let (client_engine, client_handle) = Engine::build(client, QuietHost).unwrap();
@@ -1459,6 +1852,22 @@ fn build_side_with_modules(
     policy: (&str, &[u8]),
     control: Option<&Path>,
 ) -> snolc::ValidatedConfig {
+    build_side_with_modules_and_tunnels(
+        identity, role, adapter, carrier, protection, policy, control, 1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_side_with_modules_and_tunnels(
+    identity: &str,
+    role: &str,
+    adapter: (&str, &[u8]),
+    carrier: (&str, &[u8]),
+    protection: (&str, &[u8]),
+    policy: (&str, &[u8]),
+    control: Option<&Path>,
+    tunnel_count: usize,
+) -> snolc::ValidatedConfig {
     let root = PathBuf::from(format!("/tmp/snolc-native-session-{identity}"));
     let adapter_config = root.join("adapter.toml");
     let protection_config = root.join("protection.toml");
@@ -1481,6 +1890,11 @@ fn build_side_with_modules(
             max_request_bytes: 65_536,
             max_connections: 4,
         };
+    }
+    while config.tunnels.len() < tunnel_count {
+        let mut tunnel = config.tunnels[0].clone();
+        tunnel.name = format!("main-{}", config.tunnels.len() + 1);
+        config.tunnels.push(tunnel);
     }
     let modules = vec![
         load(
