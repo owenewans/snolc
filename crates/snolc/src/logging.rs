@@ -222,12 +222,15 @@ fn temporary_path(path: &Path) -> Result<PathBuf, LogError> {
     Ok(path.with_file_name(format!(".{name}.compact-{}", std::process::id())))
 }
 
+#[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 

@@ -1,20 +1,33 @@
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use futures::channel::oneshot;
 use thiserror::Error;
 
 use crate::EngineError;
 
+#[cfg(unix)]
 const REQUEST_HEADER_BYTES: usize = 8;
+#[cfg(unix)]
 const RESPONSE_HEADER_BYTES: usize = 5;
+#[cfg(unix)]
 const MAX_INSTANCE_BYTES: usize = 128;
 
+#[cfg(unix)]
 pub(crate) struct UnixControlServer {
     listener: UnixListener,
     path: PathBuf,
@@ -24,18 +37,23 @@ pub(crate) struct UnixControlServer {
     connections: HashMap<u64, Connection>,
 }
 
+#[cfg(not(unix))]
+pub(crate) struct UnixControlServer;
+
 pub(crate) struct LocalRequest {
     pub(crate) connection: u64,
     pub(crate) instance: String,
     pub(crate) request: Vec<u8>,
 }
 
+#[cfg(unix)]
 struct Connection {
     stream: UnixStream,
     input: Vec<u8>,
     state: ConnectionState,
 }
 
+#[cfg(unix)]
 enum ConnectionState {
     Reading,
     Dispatched,
@@ -43,6 +61,7 @@ enum ConnectionState {
     Writing { frame: Vec<u8>, offset: usize },
 }
 
+#[cfg(unix)]
 impl UnixControlServer {
     pub(crate) fn bind(
         path: &Path,
@@ -144,12 +163,38 @@ impl UnixControlServer {
     }
 }
 
+#[cfg(not(unix))]
+impl UnixControlServer {
+    pub(crate) fn bind(
+        _path: &Path,
+        _max_request_bytes: usize,
+        _max_connections: usize,
+    ) -> Result<Self, ControlError> {
+        Err(ControlError::Unsupported)
+    }
+
+    pub(crate) fn poll(&mut self) -> Vec<LocalRequest> {
+        Vec::new()
+    }
+
+    pub(crate) fn wait_for(
+        &mut self,
+        _connection: u64,
+        _receiver: oneshot::Receiver<Result<Vec<u8>, EngineError>>,
+    ) {
+    }
+
+    pub(crate) fn reject(&mut self, _connection: u64, _error: &EngineError) {}
+}
+
+#[cfg(unix)]
 impl Drop for UnixControlServer {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(unix)]
 impl Connection {
     fn poll(
         &mut self,
@@ -265,6 +310,7 @@ impl Connection {
     }
 }
 
+#[cfg(unix)]
 fn request_lengths(input: &[u8]) -> Option<(usize, usize)> {
     let header: [u8; REQUEST_HEADER_BYTES] = input.get(..REQUEST_HEADER_BYTES)?.try_into().ok()?;
     Some((
@@ -295,11 +341,12 @@ fn peer_is_owner(stream: &UnixStream) -> bool {
         && credentials.uid == unsafe { libc::geteuid() }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn peer_is_owner(_stream: &UnixStream) -> bool {
     false
 }
 
+#[cfg(unix)]
 pub fn request(
     path: &Path,
     instance: &str,
@@ -338,6 +385,16 @@ pub fn request(
     }
 }
 
+#[cfg(not(unix))]
+pub fn request(
+    _path: &Path,
+    _instance: &str,
+    _request: &[u8],
+    _max_response_bytes: usize,
+) -> Result<Vec<u8>, ControlError> {
+    Err(ControlError::Unsupported)
+}
+
 #[derive(Debug, Error)]
 pub enum ControlError {
     #[error("control socket I/O failed: {0}")]
@@ -350,9 +407,11 @@ pub enum ControlError {
     Closed,
     #[error("control request failed: {0}")]
     Remote(String),
+    #[error("Unix control sockets are unsupported on this platform")]
+    Unsupported,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
