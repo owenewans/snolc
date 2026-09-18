@@ -57,6 +57,7 @@ compatibility generation is `wire_version = 1`.
 
 ## documentation
 
+- [LLM repository and API guide](llm.md)
 - [architecture](spec/architecture.md)
 - [stack bridge](spec/stack-bridge.md)
 - [wire version 1](spec/wire.md)
