@@ -98,7 +98,7 @@ source needed by the selected mode.
 
 Ten signed manifests live under the repository-root `snolpkg/`. Version 0.0.1 manifests
 publish Linux x86_64 and Android arm64/armv7 artifacts built from commit
-`dc4432b62ced51953beb662d6879beec2128486d`. Each archive carries Unlicense and
+`83aadeda5c5ae26f27588b64b67a04b3584b31c6`. Each archive carries Unlicense and
 third-party dependency notices. Release checks compare archive size and SHA-256
 to every signed row before upload.
 
