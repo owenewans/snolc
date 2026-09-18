@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - name: install system libraries
+        run: sudo apt-get update && sudo apt-get install --yes libegl1-mesa-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev
+      - name: toolchain
+        run: rustc --version --verbose && cargo --version
+      - name: format
+        run: cargo fmt --all -- --check
+      - name: build native modules
+        run: cargo build --workspace --locked
+      - name: test
+        run: cargo test --workspace --locked
+      - name: lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: release build
+        run: cargo build --workspace --release --locked
+      - name: install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: dependency policy
+        run: cargo deny check
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - name: install fuzz toolchain
+        run: rustup toolchain install nightly-2026-09-16 --profile minimal
+      - name: install cargo-fuzz
+        run: cargo +1.98.1 install cargo-fuzz --version 0.13.2 --locked
+      - name: verify fuzz lock
+        run: cargo +nightly-2026-09-16 metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null
+      - name: wire
+        working-directory: fuzz
+        run: cargo +nightly-2026-09-16 fuzz run wire -- -max_total_time=10 -rss_limit_mb=4096 -max_len=131072
+      - name: config
+        working-directory: fuzz
+        run: cargo +nightly-2026-09-16 fuzz run config -- -max_total_time=10 -rss_limit_mb=4096 -max_len=131072
+      - name: policy frame
+        working-directory: fuzz
+        run: cargo +nightly-2026-09-16 fuzz run policy-frame -- -max_total_time=10 -rss_limit_mb=4096 -max_len=65536
+      - name: profile URI
+        working-directory: fuzz
+        run: cargo +nightly-2026-09-16 fuzz run profile-uri -- -max_total_time=10 -rss_limit_mb=4096 -max_len=131072
+      - name: archive path
+        working-directory: fuzz
+        run: cargo +nightly-2026-09-16 fuzz run archive-path -- -max_total_time=10 -rss_limit_mb=4096 -max_len=4096
