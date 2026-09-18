@@ -1,6 +1,6 @@
 # configuration
 
-SNOLC uses strict TOML. Runtime rejects unknown fields, duplicate keys, missing
+snolc uses strict TOML. Runtime rejects unknown fields, duplicate keys, missing
 required fields, invalid units, overflow, duplicate instance IDs, cyclic
 references, incompatible limits, and unsupported module roles before opening a
 listener.
@@ -51,12 +51,13 @@ fields. A publication manifest contains no deployment secret.
 
 ## templates
 
-Official module templates live under `config/templates/modules`. `snolpkg
-template` copies a signed package template with `create_new`; it does not
+Official module templates live under `config/templates/modules` in the
+`snolc-modules` repository. `snolpkg template` copies a signed package template
+with `create_new`; it does not
 overwrite a user file. Generated files remain normal complete TOML files. A run
 does not apply a hidden preset after generation.
 
-Server policy-local uses `config/templates/modules/policy.toml`. It states
+Server policy-local uses `snolc-modules/config/templates/modules/policy.toml`. It states
 Immediate durability through the module contract and writes cache, database,
 queue, quota block, sniff, status, and checkpoint limits.
 

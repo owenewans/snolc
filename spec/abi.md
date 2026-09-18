@@ -1,6 +1,6 @@
 # native module ABI
 
-SNOLC modules are target-specific dynamic libraries. Linux uses `.so`, macOS
+snolc modules are target-specific dynamic libraries. Linux uses `.so`, macOS
 uses `.dylib`, and Windows uses `.dll`. A module exports:
 
 ```c

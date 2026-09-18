@@ -1,8 +1,10 @@
 # operations
 
-All examples use the pinned toolchain and locked dependency graph.
+Each repository pins its toolchain and dependency graph.
 
 ## build
+
+Run the standard gates in each checkout:
 
 ```sh
 cargo build --workspace --locked
@@ -10,24 +12,25 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Native tests load module libraries from `target/debug/deps`, so build the
-workspace before running `crates/snolc/tests/native_session.rs` after an ABI or
-module change.
+The core repository contains ABI, SDK, engine and CLI tests. The
+`snolc-modules` repository contains module unit tests and native E2E. `snolpkg`
+tests signed installation and archive handling. snolcNG tests profiles and UI
+state; its Android Gradle build packages both supported ABIs.
 
 ## package root
 
 ```sh
 install -d -m 700 "$HOME/.local/share/snolc/packages"
-cp config/packages/snolpkg.toml "$HOME/.local/share/snolc/packages/"
-cp config/packages/sources.toml "$HOME/.local/share/snolc/packages/"
+cp config/snolpkg.toml "$HOME/.local/share/snolc/packages/"
+cp config/sources.toml "$HOME/.local/share/snolc/packages/"
 export SNOLPKG_ROOT="$HOME/.local/share/snolc/packages"
 ```
 
 Install each selected module from the trusted source:
 
 ```sh
-snolpkg add -b https://github.com/owenewans/snolc.git carrier-tcp
-snolpkg template owenewans/carrier-tcp@0.0.1 --role server --output modules/tcp.toml
+snolpkg add -b https://github.com/owenewans/snolc-modules.git carrier-tcp
+snolpkg template owenewans/carrier-tcp@VERSION --role server --output modules/tcp.toml
 ```
 
 The binary command requires published release assets. Use `-s` to build the
@@ -109,26 +112,20 @@ socket must pass before policy sees this request.
 ## issue access
 
 Create a client-only provisioning profile without a credential. It contains
-the endpoint, pin, and exact client module records. Issue one credential and
-print one URI:
+the endpoint, pin and exact client module records. The snolcNG panel example
+issues one credential and prints one URI:
 
 ```sh
-snolc provision /run/snolc/snolc.sock policy-main provision-profile.toml \
+git clone https://github.com/owenewans/snolcNG
+cd snolcNG
+cargo run --locked --no-default-features --example panel -- \
+  /run/snolc/snolc.sock policy-main provision-profile.toml \
   <32-hex-user-id> panel-main 2
 ```
 
 The helper generates 32 random bytes, sends their SHA-256 in `credential.add`,
-checks the committed response, and places the bearer in the returned URI. The
+checks the committed response and places the bearer in the returned URI. The
 server database never stores the bearer.
-
-`clients/snolcNG/examples/panel.rs` shows the same panel integration through
-the Rust APIs:
-
-```sh
-cargo run --locked -p snolc-ng --no-default-features --example panel -- \
-  /run/snolc/snolc.sock policy-main provision-profile.toml \
-  <32-hex-user-id> panel-main 2
-```
 
 ## quota and revoke
 

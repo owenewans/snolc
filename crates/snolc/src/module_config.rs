@@ -130,15 +130,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_template_is_valid() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/templates/modules/policy.toml");
+    fn module_config_is_valid() {
         let config = ModuleConfig::parse(
-            include_str!("../../../config/templates/modules/policy.toml"),
-            &path,
+            "wire_version = 1\ninstance = \"policy-main\"\npackage = \"owenewans/policy-local@0.0.2\"\nrole = \"server\"\n[options]\nnode_id = \"node-1\"\n",
+            Path::new("/tmp/modules/policy.toml"),
         )
         .unwrap();
-        assert_eq!(config.package.to_string(), "owenewans/policy-local@0.0.1");
+        assert_eq!(config.package.to_string(), "owenewans/policy-local@0.0.2");
         assert!(
             String::from_utf8(config.options_toml().unwrap())
                 .unwrap()
@@ -147,87 +145,8 @@ mod tests {
     }
 
     #[test]
-    fn official_module_templates_use_the_runtime_schema() {
-        for (name, input) in [
-            (
-                "direct.toml",
-                include_str!("../../../config/templates/modules/direct.toml"),
-            ),
-            (
-                "socks5.toml",
-                include_str!("../../../config/templates/modules/socks5.toml"),
-            ),
-            (
-                "http-connect.toml",
-                include_str!("../../../config/templates/modules/http-connect.toml"),
-            ),
-            (
-                "tun-linux.toml",
-                include_str!("../../../config/templates/modules/tun-linux.toml"),
-            ),
-            (
-                "tun-android.toml",
-                include_str!("../../../config/templates/modules/tun-android.toml"),
-            ),
-            (
-                "protection-dummy.toml",
-                include_str!("../../../config/templates/modules/protection-dummy.toml"),
-            ),
-            (
-                "protection-dummy-server.toml",
-                include_str!("../../../config/templates/modules/protection-dummy-server.toml"),
-            ),
-            (
-                "noise.toml",
-                include_str!("../../../config/templates/modules/noise.toml"),
-            ),
-            (
-                "noise-client.toml",
-                include_str!("../../../config/templates/modules/noise-client.toml"),
-            ),
-            (
-                "tcp.toml",
-                include_str!("../../../config/templates/modules/tcp.toml"),
-            ),
-            (
-                "tcp-client.toml",
-                include_str!("../../../config/templates/modules/tcp-client.toml"),
-            ),
-            (
-                "ssh.toml",
-                include_str!("../../../config/templates/modules/ssh.toml"),
-            ),
-            (
-                "ssh-client.toml",
-                include_str!("../../../config/templates/modules/ssh-client.toml"),
-            ),
-            (
-                "policy-dummy.toml",
-                include_str!("../../../config/templates/modules/policy-dummy.toml"),
-            ),
-            (
-                "policy-dummy-server.toml",
-                include_str!("../../../config/templates/modules/policy-dummy-server.toml"),
-            ),
-            (
-                "policy.toml",
-                include_str!("../../../config/templates/modules/policy.toml"),
-            ),
-            (
-                "policy-client.toml",
-                include_str!("../../../config/templates/modules/policy-client.toml"),
-            ),
-        ] {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../config/templates/modules")
-                .join(name);
-            ModuleConfig::parse(input, &path).unwrap();
-        }
-    }
-
-    #[test]
     fn package_identity_is_exact() {
-        let package: PackageIdentity = "owenewans/carrier-tcp@0.0.1".parse().unwrap();
+        let package: PackageIdentity = "owenewans/carrier-tcp@0.0.2".parse().unwrap();
         assert_eq!(package.name, "carrier-tcp");
         assert!("carrier-tcp".parse::<PackageIdentity>().is_err());
     }

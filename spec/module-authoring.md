@@ -77,7 +77,7 @@ authority separate from user policy streams.
 
 ## package
 
-Publish `snolpkg/<module>.toml` and the detached 64-byte Ed25519 signature. The
+Publish `snolc-modules/snolpkg/<module>.toml` and its detached 64-byte Ed25519 signature. The
 manifest identifies roles, platform capabilities, source commit, Rust package,
 role templates, and target artifacts. Each artifact includes target triple,
 minimum ISA or Android API, byte size, SHA-256, and build output.

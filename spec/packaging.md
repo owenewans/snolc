@@ -10,15 +10,15 @@ snolpkg del <owner/name@version>
 snolpkg template <owner/name@version> --role <role> --output <path>
 ```
 
-Set `SNOLPKG_ROOT` to an absolute package directory. Copy
-`config/packages/snolpkg.toml` and `config/packages/sources.toml` there before
-the first install.
+Set `SNOLPKG_ROOT` to an absolute package directory. Copy `config/snolpkg.toml`
+and `config/sources.toml` from the `snolpkg` repository there before the first
+install.
 
 ## publication
 
 The installer reads `snolpkg/<module>.toml` and its detached `.toml.sig` from a
-single pinned Git commit through gix object access. It does not check out the
-publication tree or run Git filters.
+single pinned `snolc-modules` commit through gix object access. It does not
+check out the publication tree or run Git filters.
 
 The strict manifest names package, authors, license, package version,
 `wire_version`, classes, family, roles, platform capabilities, role template
@@ -96,11 +96,10 @@ source needed by the selected mode.
 
 ## official packages
 
-Ten signed manifests live under the repository-root `snolpkg/`. Version 0.0.1 manifests
-publish Linux x86_64 and Android arm64/armv7 artifacts built from commit
-`83aadeda5c5ae26f27588b64b67a04b3584b31c6`. Each archive carries Unlicense and
+Ten signed manifests live under `snolc-modules/snolpkg/`. Each release manifest
+binds artifacts to one clean source commit. Each archive carries Unlicense and
 third-party dependency notices. Release checks compare archive size and SHA-256
-to every signed row before upload.
+to each signed row before upload.
 
 `tools/package-release.py` consumes a checkout at that revision and explicit
 prebuilt target directories. It writes deterministic archives, updates signed
@@ -109,11 +108,11 @@ manifest with the release Ed25519 key. Run
 `tools/verify-release.py <dist>` before upload. A second package run must produce
 byte-identical archives.
 
-Each `--bundle-output <target>=<release-directory>` adds a deterministic product
-bundle with `snolc`, `snolpkg`, ten native modules, the C header, complete
-templates, Unlicense, and dependency notices. `snolcNG` is included when that
-target output contains it. The verifier checks the exact bundle tree, modes,
-metadata, gzip timestamp, and module count.
+Each repository packages its own product. Core archives contain the `snolc`
+binary, C header, Unlicense and dependency notices. The module repository
+publishes one signed archive per module and target. The `snolpkg` repository
+publishes the installer. The snolcNG repository publishes desktop binaries and
+the Android APK.
 
 `tools/release-inventory.py` refuses a dirty checkout, derives the configured
 Ed25519 public key from the private release key, and records every asset plus
