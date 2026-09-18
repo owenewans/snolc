@@ -1409,20 +1409,8 @@ build_output = "release/libsnolc_carrier_tcp.so"
             .unwrap();
         macro_rules! verify {
             ($module:literal) => {{
-                let manifest = include_bytes!(concat!(
-                    "../../../modules/",
-                    $module,
-                    "/snolpkg/",
-                    $module,
-                    ".toml"
-                ));
-                let signature = include_bytes!(concat!(
-                    "../../../modules/",
-                    $module,
-                    "/snolpkg/",
-                    $module,
-                    ".toml.sig"
-                ));
+                let manifest = include_bytes!(concat!("../../../snolpkg/", $module, ".toml"));
+                let signature = include_bytes!(concat!("../../../snolpkg/", $module, ".toml.sig"));
                 PublicationManifest::parse(manifest).unwrap();
                 verify_manifest(manifest, signature, source).unwrap();
             }};
