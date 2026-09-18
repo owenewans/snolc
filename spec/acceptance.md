@@ -74,7 +74,7 @@ combination. Run two users and sixteen TCP/UDP flows at 1 Mbit/s for 60 minutes
 with 10,000 stored users and at most 256 cached users. Confirm RSS limits and
 bounded queues under a slow peer and stalled policy.
 
-Run the normative TCP profile after the release workspace build:
+Run the normative traffic profile after the release workspace build:
 
 ```sh
 cargo build --workspace --release --locked
