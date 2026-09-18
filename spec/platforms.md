@@ -89,3 +89,9 @@ does not route direct. VPN permission revoke arrives as a platform event.
 The store build follows store executable-code rules. It does not download
 arbitrary native libraries. Release APKs use a release signing key; debug APKs
 are test artifacts.
+
+`assembleRelease` requires `SNOLC_ANDROID_KEYSTORE`,
+`SNOLC_ANDROID_STORE_PASSWORD`, `SNOLC_ANDROID_KEY_ALIAS`, and
+`SNOLC_ANDROID_KEY_PASSWORD`. Gradle rejects incomplete signing input. Keep the
+keystore and passwords outside the repository, then verify the APK with the
+pinned build-tools `apksigner` before publication.
