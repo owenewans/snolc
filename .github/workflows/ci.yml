@@ -36,10 +36,12 @@ jobs:
       - name: release tooling
         run: |
           python -m py_compile tools/check-glibc.py tools/package-release.py tools/verify-release.py tools/release-inventory.py
-          python tools/package-release.py --source . --dist /tmp/snolc-bundle-a --bundle-output x86_64-unknown-linux-gnu=target/release
-          python tools/package-release.py --source . --dist /tmp/snolc-bundle-b --bundle-output x86_64-unknown-linux-gnu=target/release
-          cmp /tmp/snolc-bundle-a/snolc-0.0.2-x86_64-unknown-linux-gnu.tar.gz /tmp/snolc-bundle-b/snolc-0.0.2-x86_64-unknown-linux-gnu.tar.gz
-          test "$(tar -tzf /tmp/snolc-bundle-a/snolc-0.0.2-x86_64-unknown-linux-gnu.tar.gz | grep -c '^bin/snolc$')" -eq 1
+           python tools/package-release.py --source . --dist /tmp/snolc-bundle-a --bundle-output x86_64-unknown-linux-gnu=target/release
+           python tools/package-release.py --source . --dist /tmp/snolc-bundle-b --bundle-output x86_64-unknown-linux-gnu=target/release
+           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+           archive="snolc-${version}-x86_64-unknown-linux-gnu.tar.gz"
+           cmp "/tmp/snolc-bundle-a/${archive}" "/tmp/snolc-bundle-b/${archive}"
+           test "$(tar -tzf "/tmp/snolc-bundle-a/${archive}" | grep -c '^bin/snolc$')" -eq 1
       - name: install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: dependency policy
