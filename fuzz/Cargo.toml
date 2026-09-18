@@ -1,6 +1,6 @@
 [package]
 name = "snolc-fuzz"
-version = "0.0.2"
+version = "0.0.3"
 publish = false
 edition = "2024"
 
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-snolc = { version = "=0.0.2", path = "../crates/snolc" }
+snolc = { version = "=0.0.3", path = "../crates/snolc" }
 
 [[bin]]
 name = "wire"
