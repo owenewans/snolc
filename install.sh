@@ -3,7 +3,7 @@
 set -eu
 
 repo=https://github.com/owenewans/snolc
-version=0.0.2
+version=0.0.3
 mode=binary
 prefix=${HOME:-}/.local
 

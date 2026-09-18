@@ -104,8 +104,8 @@ def main() -> None:
     files = []
     for path in sorted(value for value in assets.iterdir() if value.is_file()):
         target = None
-        if path.name.startswith("snolc-0.0.2-") and path.name.endswith(".tar.gz"):
-            target_name = path.name.removeprefix("snolc-0.0.2-").removesuffix(".tar.gz")
+        if path.name.startswith("snolc-") and path.name.endswith(".tar.gz"):
+            target_name = path.name.removeprefix("snolc-").split("-", 1)[1].removesuffix(".tar.gz")
             target = {"target": target_name, **TARGETS.get(target_name, {})}
         files.append(
             {

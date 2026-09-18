@@ -15,9 +15,9 @@ def main() -> None:
     dist = Path(sys.argv[1]).resolve()
     if not dist.is_dir():
         fail(f"artifact directory does not exist: {dist}")
-    assets = sorted(dist.glob("snolc-0.0.2-*.tar.gz"))
+    assets = sorted(dist.glob("snolc-*.tar.gz"))
     if not assets:
-        fail("no snolc 0.0.2 archives found")
+        fail("no snolc archives found")
     for path in assets:
         verify_bundle(path)
     print(f"verified {len(assets)} binary archives")
@@ -27,7 +27,7 @@ def verify_bundle(path: Path) -> None:
     data = path.read_bytes()
     if len(data) < 10 or int.from_bytes(data[4:8], "little") != 0:
         fail(f"gzip timestamp is not zero: {path.name}")
-    target = path.name.removeprefix("snolc-0.0.2-").removesuffix(".tar.gz")
+    target = path.name.removeprefix("snolc-").split("-", 1)[1].removesuffix(".tar.gz")
     suffix = ".exe" if "windows" in target else ""
     expected = {
         f"bin/snolc{suffix}",
