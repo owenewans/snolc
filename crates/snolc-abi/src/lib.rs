@@ -18,6 +18,8 @@ pub const CLASS_ADAPTER: u32 = 1 << 0;
 pub const CLASS_PROTECTION: u32 = 1 << 1;
 pub const CLASS_CARRIER: u32 = 1 << 2;
 pub const CLASS_POLICY: u32 = 1 << 3;
+pub const POLICY_PASSTHROUGH_TCP: u32 = 1 << 0;
+pub const PROTECTION_PASSTHROUGH: u32 = 1 << 0;
 
 pub const IO_PROGRESS: u32 = 0;
 pub const IO_PENDING: u32 = 1;
@@ -218,7 +220,7 @@ pub type WrapFn = unsafe extern "C" fn(
 #[repr(C)]
 pub struct SnolProtectionApiV1 {
     pub struct_size: u32,
-    pub reserved: u32,
+    pub flags: u32,
     pub wrap: Option<WrapFn>,
 }
 
@@ -272,7 +274,7 @@ pub type AttachDatagramFlowFn = unsafe extern "C" fn(
 #[repr(C)]
 pub struct SnolPolicyApiV1 {
     pub struct_size: u32,
-    pub reserved: u32,
+    pub flags: u32,
     pub attach_session: Option<AttachSessionFn>,
     pub admit_flow: Option<AdmitFlowFn>,
     pub attach_flow: Option<AttachFlowFn>,

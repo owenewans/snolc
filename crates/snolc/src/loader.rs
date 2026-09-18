@@ -540,6 +540,11 @@ impl LoadedModule {
         }
     }
 
+    pub fn protection_passthrough(&self) -> bool {
+        unsafe { self.descriptor().protection.as_ref() }
+            .is_some_and(|protection| protection.flags & snolc_abi::PROTECTION_PASSTHROUGH != 0)
+    }
+
     pub(crate) fn policy_attach_session(
         &self,
         policy_stream: u64,
@@ -604,6 +609,11 @@ impl LoadedModule {
             snolc_abi::STATUS_OK => Poll::Ready(Ok(())),
             status => Poll::Ready(Err(LoadError::ModuleStatus(status))),
         }
+    }
+
+    pub fn policy_passthrough_tcp(&self) -> bool {
+        unsafe { self.descriptor().policy.as_ref() }
+            .is_some_and(|policy| policy.flags & snolc_abi::POLICY_PASSTHROUGH_TCP != 0)
     }
 
     pub fn policy_admit_resolved(
@@ -843,7 +853,7 @@ fn validate_class_tables(descriptor: &SnolModuleDescriptor) -> Result<(), LoadEr
         let protection = unsafe { descriptor.protection.as_ref() }
             .ok_or(LoadError::ClassTable(snolc_abi::CLASS_PROTECTION))?;
         if protection.struct_size < size_of::<snolc_abi::SnolProtectionApiV1>() as u32
-            || protection.reserved != 0
+            || protection.flags & !snolc_abi::PROTECTION_PASSTHROUGH != 0
             || protection.wrap.is_none()
         {
             return Err(LoadError::ClassTable(snolc_abi::CLASS_PROTECTION));
@@ -864,7 +874,7 @@ fn validate_class_tables(descriptor: &SnolModuleDescriptor) -> Result<(), LoadEr
         let policy = unsafe { descriptor.policy.as_ref() }
             .ok_or(LoadError::ClassTable(snolc_abi::CLASS_POLICY))?;
         if policy.struct_size < size_of::<snolc_abi::SnolPolicyApiV1>() as u32
-            || policy.reserved != 0
+            || policy.flags & !snolc_abi::POLICY_PASSTHROUGH_TCP != 0
             || policy.attach_session.is_none()
             || policy.admit_flow.is_none()
             || policy.admit_resolved.is_none()

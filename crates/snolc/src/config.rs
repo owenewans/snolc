@@ -27,6 +27,8 @@ pub struct Paths {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
     pub max_sessions: usize,
     pub max_flows: usize,
     pub max_pending_sessions: usize,
@@ -39,6 +41,10 @@ pub struct EngineConfig {
     pub connect_timeout_ms: u64,
     pub handshake_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
+}
+
+fn default_worker_threads() -> usize {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -161,6 +167,7 @@ impl Config {
             return Err(ConfigError::Invalid("reassembly slots must be 4"));
         }
         let capacities = [
+            self.engine.worker_threads,
             self.engine.max_sessions,
             self.engine.max_flows,
             self.engine.max_pending_sessions,
@@ -183,6 +190,11 @@ impl Config {
         ];
         if capacities.contains(&0) {
             return Err(ConfigError::Invalid("capacities must be nonzero"));
+        }
+        if self.engine.worker_threads > 1 && !matches!(self.control, ControlConfig::Off) {
+            return Err(ConfigError::Invalid(
+                "multiple workers require control mode off",
+            ));
         }
         if self.engine.max_io_chunk > self.stack.tcp_socket_rx_bytes
             || self.engine.max_io_chunk > self.stack.tcp_socket_tx_bytes
