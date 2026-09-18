@@ -2,7 +2,20 @@ name: bsd
 
 on:
   workflow_dispatch:
+    inputs:
+      freebsd_aarch64:
+        description: run the native FreeBSD aarch64 build
+        required: true
+        default: false
+        type: boolean
   push:
+    branches:
+      - dev
+    tags:
+      - "v*"
+    paths-ignore:
+      - "**/*.md"
+      - "spec/**"
 
 permissions:
   contents: read
@@ -15,41 +28,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  freebsd:
+  native:
+    name: ${{ matrix.profile }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - os: freebsd
+            version: "14.0"
+            architecture: x86-64
             profile: freebsd-x86_64
             target: x86_64-unknown-freebsd
-          - arch: aarch64
-            profile: freebsd-aarch64
-            target: aarch64-unknown-freebsd
+          - os: netbsd
+            version: "10.0"
+            architecture: x86-64
+            profile: netbsd-x86_64
+            target: x86_64-unknown-netbsd
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-      - uses: vmactions/freebsd-vm@4469451fe39bee80be4066836c5170362e9349f3
+      - name: start ${{ matrix.os }} VM
+        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641
         with:
-          release: "14.0"
-          arch: ${{ matrix.arch }}
-          prepare: pkg install -y bash curl ca_root_nss
-          run: |
-            if [ "$(uname -m)" = "arm64" ]; then
-              archive=rust-1.98.1-aarch64-unknown-freebsd.tar.xz
-              curl --proto '=https' --tlsv1.2 -sSfO "https://static.rust-lang.org/dist/2026-09-03/$archive"
-              test "$(sha256 -q "$archive")" = "408b0fe6880d074bff349ad730f5a46c085a60b730e2be0a81654ec1617cb3c7"
-              tar -xJf "$archive"
-              "${archive%.tar.xz}/install.sh" --prefix="$HOME/.rust-1.98.1" --without=rust-docs
-              PATH="$HOME/.rust-1.98.1/bin:$PATH"
-              export PATH
-            else
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
-              . "$HOME/.cargo/env"
-            fi
-            test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
-            cargo build --workspace --exclude snolc-ng --release --locked
+          operating_system: ${{ matrix.os }}
+          architecture: ${{ matrix.architecture }}
+          version: ${{ matrix.version }}
+      - name: build
+        shell: cpa.sh {0}
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
+          . "$HOME/.cargo/env"
+          test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
+          cargo build --workspace --exclude snolc-ng --release --locked
       - name: package product bundle
         run: python tools/package-release.py --source . --dist dist --bundle-output ${{ matrix.target }}=target/release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -59,33 +70,35 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  netbsd:
+  freebsd-aarch64:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.freebsd_aarch64 }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            profile: netbsd-x86_64
-            target: x86_64-unknown-netbsd
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-      - uses: vmactions/netbsd-vm@20ee93a005c9fc78743e6e05269f4cb023b87413
+      - name: start FreeBSD VM
+        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641
         with:
-          release: "10.0"
-          arch: ${{ matrix.arch }}
-          prepare: /usr/sbin/pkg_add curl mozilla-rootcerts-openssl
-          run: |
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
-            . "$HOME/.cargo/env"
-            test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
-            cargo build --workspace --exclude snolc-ng --release --locked
+          operating_system: freebsd
+          architecture: arm64
+          version: "14.0"
+      - name: build
+        shell: cpa.sh {0}
+        run: |
+          archive=rust-1.98.1-aarch64-unknown-freebsd.tar.xz
+          curl --proto '=https' --tlsv1.2 -sSfO "https://static.rust-lang.org/dist/2026-09-03/$archive"
+          test "$(sha256 -q "$archive")" = "408b0fe6880d074bff349ad730f5a46c085a60b730e2be0a81654ec1617cb3c7"
+          tar -xJf "$archive"
+          "${archive%.tar.xz}/install.sh" --prefix="$HOME/.rust-1.98.1" --without=rust-docs
+          PATH="$HOME/.rust-1.98.1/bin:$PATH"
+          export PATH
+          test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
+          cargo build --workspace --exclude snolc-ng --release --locked
       - name: package product bundle
-        run: python tools/package-release.py --source . --dist dist --bundle-output ${{ matrix.target }}=target/release
+        run: python tools/package-release.py --source . --dist dist --bundle-output aarch64-unknown-freebsd=target/release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ${{ matrix.profile }}
+          name: freebsd-aarch64
           path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
