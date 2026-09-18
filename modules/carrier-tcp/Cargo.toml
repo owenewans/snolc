@@ -16,5 +16,5 @@ async-io.workspace = true
 futures.workspace = true
 libc.workspace = true
 serde.workspace = true
-snolc-sdk = { path = "../../crates/snolc-sdk" }
+snolc-sdk = { version = "=0.0.1", path = "../../crates/snolc-sdk" }
 toml.workspace = true

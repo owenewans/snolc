@@ -13,5 +13,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 serde.workspace = true
-snolc-sdk = { path = "../../crates/snolc-sdk" }
+snolc-sdk = { version = "=0.0.1", path = "../../crates/snolc-sdk" }
 toml.workspace = true

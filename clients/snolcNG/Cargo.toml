@@ -37,7 +37,7 @@ libc = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
-snolc = { path = "../../crates/snolc" }
+snolc = { version = "=0.0.1", path = "../../crates/snolc" }
 thiserror.workspace = true
 toml.workspace = true
 winit = { workspace = true, optional = true }

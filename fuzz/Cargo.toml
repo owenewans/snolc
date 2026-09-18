@@ -9,10 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-snolc = { path = "../crates/snolc" }
-snolc-ng = { path = "../clients/snolcNG", default-features = false }
-snolc-policy-local = { path = "../modules/policy-local" }
-snolpkg = { path = "../crates/snolpkg" }
+snolc = { version = "=0.0.1", path = "../crates/snolc" }
+snolc-ng = { version = "=0.0.1", path = "../clients/snolcNG", default-features = false }
+snolc-policy-local = { version = "=0.0.1", path = "../modules/policy-local" }
+snolpkg = { version = "=0.0.1", path = "../crates/snolpkg" }
 
 [[bin]]
 name = "wire"
