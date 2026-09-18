@@ -15,8 +15,8 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--dist", type=Path, required=True)
-    parser.add_argument("--signing-key", type=Path, required=True)
-    parser.add_argument("--output", action="append", required=True, metavar="TARGET=DIR")
+    parser.add_argument("--signing-key", type=Path)
+    parser.add_argument("--output", action="append", default=[], metavar="TARGET=DIR")
     parser.add_argument("--bundle-output", action="append", default=[], metavar="TARGET=DIR")
     return parser.parse_args()
 
@@ -28,8 +28,12 @@ def main() -> None:
     outputs = parse_outputs(args.output)
     bundle_outputs = parse_outputs(args.bundle_output)
     dist = args.dist.resolve()
-    if not source.is_dir() or not args.signing_key.is_file():
-        raise SystemExit("source checkout or signing key is missing")
+    if not source.is_dir():
+        raise SystemExit("source checkout is missing")
+    if not outputs and not bundle_outputs:
+        raise SystemExit("at least one output is required")
+    if outputs and (args.signing_key is None or not args.signing_key.is_file()):
+        raise SystemExit("signing key is missing")
     dist.mkdir(parents=True, exist_ok=True)
     if any(dist.iterdir()):
         raise SystemExit("dist directory must be empty")
@@ -47,7 +51,8 @@ def main() -> None:
         if package["source"] is None
     }
 
-    for manifest_path in sorted((root / "snolpkg").glob("*.toml")):
+    manifest_paths = sorted((root / "snolpkg").glob("*.toml")) if outputs else []
+    for manifest_path in manifest_paths:
         manifest = tomllib.loads(manifest_path.read_text())
         notices = dependency_notices([manifest["build"]["package"]], local, packages, nodes)
         updates = {}
