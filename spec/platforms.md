@@ -26,9 +26,10 @@ does not mark that row passed.
 
 The i586 build enables SSE and SSE2 because the pinned SSH cryptography stack
 requires them; its published minimum ISA must say so. Rust 1.98.1 does not
-distribute all BSD standard libraries as Linux cross-components. CI builds
-FreeBSD 14, OpenBSD 7.7, and NetBSD 10 inside target-native x86_64 and aarch64
-VMs. Haiku x86_64 remains unverified without a pinned runner.
+distribute all BSD host toolchains. CI builds FreeBSD 14 x86_64/aarch64 and
+NetBSD 10 x86_64 inside target-native VMs. The pinned distribution has no
+OpenBSD or NetBSD aarch64 host toolchain. Those rows and Haiku x86_64 remain
+unverified; CI does not mark them passed with another compiler version.
 
 Version 0.0.1 official module manifests contain measured artifacts for:
 
