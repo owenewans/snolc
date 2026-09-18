@@ -42,10 +42,11 @@ def main() -> None:
         raise SystemExit("signing key is missing")
     if outputs and tomllib is None:
         raise SystemExit("Python 3.11 or tomllib is required for module publication")
-    if subprocess.check_output(["git", "status", "--porcelain"], cwd=source, text=True).strip():
+    git = ["git", "-c", f"safe.directory={source}"]
+    if subprocess.check_output([*git, "status", "--porcelain"], cwd=source, text=True).strip():
         raise SystemExit("source checkout must be clean")
     source_revision = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=source, text=True
+        [*git, "rev-parse", "HEAD"], cwd=source, text=True
     ).strip()
     dist.mkdir(parents=True, exist_ok=True)
     if any(dist.iterdir()):
