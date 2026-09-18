@@ -389,6 +389,7 @@ impl Profile {
 }
 
 impl ProvisionProfile {
+    #[cfg(any(feature = "gui", test))]
     fn from_profile(profile: &Profile) -> Self {
         Self {
             wire_version: profile.wire_version,
