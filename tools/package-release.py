@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
 import gzip
 import hashlib
@@ -7,8 +9,12 @@ import io
 import json
 import subprocess
 import tarfile
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
 
 
 def arguments() -> argparse.Namespace:
@@ -34,6 +40,8 @@ def main() -> None:
         raise SystemExit("at least one output is required")
     if outputs and (args.signing_key is None or not args.signing_key.is_file()):
         raise SystemExit("signing key is missing")
+    if outputs and tomllib is None:
+        raise SystemExit("Python 3.11 or tomllib is required for module publication")
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=source, text=True).strip():
         raise SystemExit("source checkout must be clean")
     source_revision = subprocess.check_output(
