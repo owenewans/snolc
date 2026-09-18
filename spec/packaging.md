@@ -114,6 +114,11 @@ templates, Unlicense, and dependency notices. `snolcNG` is included when that
 target output contains it. The verifier checks the exact bundle tree, modes,
 metadata, gzip timestamp, and module count.
 
+`tools/release-inventory.py` refuses a dirty checkout, derives the configured
+Ed25519 public key from the private release key, and records every asset plus
+the exact `Cargo.lock` dependency set. It writes and verifies detached
+signatures for `release-inventory.json` and `SHA256SUMS`.
+
 ## failure behavior
 
 A signature, hash, size, target, dependency, path, extraction, build, or move
