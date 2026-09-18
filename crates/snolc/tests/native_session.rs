@@ -1205,6 +1205,7 @@ fn release_resource_profile() {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10_000);
+    let ceiling = std::env::var("SNOLC_RESOURCE_CEILING").as_deref() == Ok("1");
     assert!(duration > 0 && stored_users >= 2);
 
     let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1265,6 +1266,7 @@ fn release_resource_profile() {
         "policy-server-resource",
         stored_users,
         [&digest_a, &digest_b],
+        ceiling,
     );
     let idle_rss = process_rss_bytes();
     assert!(idle_rss <= 32 * MIB, "idle RSS is {idle_rss} bytes");
@@ -1334,7 +1336,7 @@ fn release_resource_profile() {
     for (index, stream) in streams.into_iter().enumerate() {
         let transferred = transferred.clone();
         workers.push(thread::spawn(move || {
-            run_rate_limited_flow(stream, deadline, index as u8, &transferred)
+            run_resource_flow(stream, deadline, index as u8, &transferred, ceiling)
         }));
     }
     for worker in workers {
@@ -1349,14 +1351,16 @@ fn release_resource_profile() {
     let steady_rss = steady_rss.load(Ordering::Acquire);
     let peak_rss = process_peak_rss_bytes();
     println!(
-        "snolc_resource duration_seconds={duration} stored_users={stored_users} flows={TOTAL_FLOWS} transferred_bytes={bytes} bits_per_second={bits_per_second} idle_rss_bytes={idle_rss} steady_rss_bytes={steady_rss} peak_rss_bytes={peak_rss}"
+        "snolc_resource ceiling={ceiling} duration_seconds={duration} stored_users={stored_users} flows={TOTAL_FLOWS} transferred_bytes={bytes} bits_per_second={bits_per_second} idle_rss_bytes={idle_rss} steady_rss_bytes={steady_rss} peak_rss_bytes={peak_rss}"
     );
     assert!(steady_rss <= 64 * MIB, "steady RSS is {steady_rss} bytes");
     assert!(peak_rss <= 96 * MIB, "peak RSS is {peak_rss} bytes");
-    assert!(
-        (950_000..=1_050_000).contains(&bits_per_second),
-        "aggregate payload rate is {bits_per_second} bit/s"
-    );
+    if !ceiling {
+        assert!(
+            (950_000..=1_050_000).contains(&bits_per_second),
+            "aggregate payload rate is {bits_per_second} bit/s"
+        );
+    }
 
     client_a_handle.shutdown().unwrap();
     client_b_handle.shutdown().unwrap();
@@ -1400,10 +1404,21 @@ fn provision_resource_users(
     instance: &str,
     count: usize,
     credentials: [&str; 2],
+    ceiling: bool,
 ) -> Vec<String> {
     let mut user_ids = Vec::with_capacity(2);
     for index in 0..count {
         let seq = index + 1;
+        let combined_rate = if ceiling {
+            "mode = \"unlimited\"".to_owned()
+        } else {
+            "mode = \"limited\"\nbytes_per_second = 62500".to_owned()
+        };
+        let quota = if ceiling {
+            "mode = \"unlimited\"".to_owned()
+        } else {
+            "mode = \"limited\"\nbytes = 1073741824".to_owned()
+        };
         let request = format!(
             r#"method = "user.create"
 client_id = "resource-gate"
@@ -1421,15 +1436,13 @@ mode = "unlimited"
 [user.weekly_access]
 mode = "unlimited"
 [user.quota]
-mode = "limited"
-bytes = 1073741824
+{quota}
 [user.upload_rate]
 mode = "unlimited"
 [user.download_rate]
 mode = "unlimited"
 [user.combined_rate]
-mode = "limited"
-bytes_per_second = 62500
+{combined_rate}
 [user.max_sessions]
 mode = "limited"
 count = 1
@@ -1521,23 +1534,27 @@ fn run_echo_target(listener: TcpListener, count: usize) {
     }
 }
 
-fn run_rate_limited_flow(
+fn run_resource_flow(
     mut stream: TcpStream,
     deadline: Instant,
     byte: u8,
     transferred: &AtomicU64,
+    ceiling: bool,
 ) {
-    let payload = [byte; 3906];
-    let mut reply = [0; 3906];
+    let size = if ceiling { 16_384 } else { 3906 };
+    let payload = vec![byte; size];
+    let mut reply = vec![0; size];
     let mut next = Instant::now();
     while Instant::now() < deadline {
         stream.write_all(&payload).unwrap();
         stream.read_exact(&mut reply).unwrap();
         assert_eq!(reply, payload);
         transferred.fetch_add((payload.len() + reply.len()) as u64, Ordering::AcqRel);
-        next += Duration::from_secs(1);
-        if let Some(delay) = next.checked_duration_since(Instant::now()) {
-            thread::sleep(delay);
+        if !ceiling {
+            next += Duration::from_secs(1);
+            if let Some(delay) = next.checked_duration_since(Instant::now()) {
+                thread::sleep(delay);
+            }
         }
     }
     stream.shutdown(Shutdown::Both).unwrap();
