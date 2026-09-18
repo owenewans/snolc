@@ -92,7 +92,7 @@ source needed by the selected mode.
 
 ## official packages
 
-Ten signed manifests live under `modules/*/snolpkg`. Version 0.0.1 manifests
+Ten signed manifests live under the repository-root `snolpkg/`. Version 0.0.1 manifests
 publish Linux x86_64 and Android arm64/armv7 artifacts built from commit
 `dc4432b62ced51953beb662d6879beec2128486d`. Each archive carries Unlicense and
 third-party dependency notices. Release checks compare archive size and SHA-256
