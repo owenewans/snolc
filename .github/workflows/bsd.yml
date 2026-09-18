@@ -35,7 +35,7 @@ jobs:
             if [ "$(uname -m)" = "arm64" ]; then
               archive=rust-1.98.1-aarch64-unknown-freebsd.tar.xz
               curl --proto '=https' --tlsv1.2 -sSfO "https://static.rust-lang.org/dist/2026-09-03/$archive"
-              echo "408b0fe6880d074bff349ad730f5a46c085a60b730e2be0a81654ec1617cb3c7  $archive" | sha256 -c
+              test "$(sha256 -q "$archive")" = "408b0fe6880d074bff349ad730f5a46c085a60b730e2be0a81654ec1617cb3c7"
               tar -xJf "$archive"
               "${archive%.tar.xz}/install.sh" --prefix="$HOME/.rust-1.98.1" --without=rust-docs
               PATH="$HOME/.rust-1.98.1/bin:$PATH"
