@@ -74,6 +74,18 @@ combination. Run two users and sixteen TCP/UDP flows at 1 Mbit/s for 60 minutes
 with 10,000 stored users and at most 256 cached users. Confirm RSS limits and
 bounded queues under a slow peer and stalled policy.
 
+Run the normative TCP profile after the release workspace build:
+
+```sh
+cargo build --workspace --release --locked
+SNOLC_LONG_RUN_SECONDS=3600 SNOLC_STORED_USERS=10000 \
+  cargo test --release -p snolc --test native_session \
+  release_resource_profile --locked -- --ignored --nocapture --exact
+```
+
+The test prints duration, stored users, flows, payload throughput, RSS, and HWM.
+It fails outside 0.95..1.05 Mbit/s or the 32/64/96 MiB RSS limits.
+
 Measure ceiling throughput on an available physical device near 600 MHz. Label
 virtual CPU measurements by their host and model. Check stripped installed
 binaries against the 128 MiB allocation and report database, logs, staging, and
