@@ -1193,8 +1193,12 @@ cidr = "::1/128"
 #[test]
 #[ignore = "60-minute release resource gate"]
 fn release_resource_profile() {
-    const FLOWS_PER_USER: usize = 8;
+    const TCP_FLOWS_PER_USER: usize = 4;
+    const UDP_FLOWS_PER_USER: usize = 4;
+    const FLOWS_PER_USER: usize = TCP_FLOWS_PER_USER + UDP_FLOWS_PER_USER;
     const TOTAL_FLOWS: usize = FLOWS_PER_USER * 2;
+    const TOTAL_TCP_FLOWS: usize = TCP_FLOWS_PER_USER * 2;
+    const TOTAL_UDP_FLOWS: usize = UDP_FLOWS_PER_USER * 2;
     const MIB: u64 = 1024 * 1024;
 
     let duration = std::env::var("SNOLC_LONG_RUN_SECONDS")
@@ -1211,9 +1215,16 @@ fn release_resource_profile() {
     let carrier_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let carrier_endpoint = carrier_listener.local_addr().unwrap();
     drop(carrier_listener);
-    let target = TcpListener::bind("127.0.0.1:0").unwrap();
-    target.set_nonblocking(true).unwrap();
-    let target_endpoint = target.local_addr().unwrap();
+    let tcp_target = TcpListener::bind("127.0.0.1:0").unwrap();
+    tcp_target.set_nonblocking(true).unwrap();
+    let tcp_target_endpoint = tcp_target.local_addr().unwrap();
+    let udp_targets = (0..TOTAL_UDP_FLOWS)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect::<Vec<_>>();
+    let udp_target_endpoints = udp_targets
+        .iter()
+        .map(|target| target.local_addr().unwrap())
+        .collect::<Vec<_>>();
     let socks_a = free_tcp_endpoint();
     let socks_b = free_tcp_endpoint();
     let directory = std::env::temp_dir().join(format!(
@@ -1270,7 +1281,15 @@ fn release_resource_profile() {
     );
     let idle_rss = process_rss_bytes();
     assert!(idle_rss <= 32 * MIB, "idle RSS is {idle_rss} bytes");
-    let target_thread = thread::spawn(move || run_echo_target(target, TOTAL_FLOWS));
+    let tcp_target_thread = thread::spawn(move || run_echo_target(tcp_target, TOTAL_TCP_FLOWS));
+    let stop_udp_targets = Arc::new(AtomicBool::new(false));
+    let udp_target_threads = udp_targets
+        .into_iter()
+        .map(|target| {
+            let stop = stop_udp_targets.clone();
+            thread::spawn(move || run_udp_echo_target(target, &stop))
+        })
+        .collect::<Vec<_>>();
 
     let client_policy_a =
         policy_local_options(&directory.join("client-a/policy.redb"), Some(&credential_a));
@@ -1302,16 +1321,24 @@ fn release_resource_profile() {
     wait_any_policy_session(&client_a_handle, "policy-client-resource-a");
     wait_any_policy_session(&client_b_handle, "policy-client-resource-b");
 
-    let mut streams = Vec::with_capacity(TOTAL_FLOWS);
-    for (endpoint, client) in [(socks_a, &client_a_handle), (socks_b, &client_b_handle)] {
-        for index in 0..FLOWS_PER_USER {
-            streams.push(open_socks_flow(
+    let mut tcp_flows = Vec::with_capacity(TOTAL_TCP_FLOWS);
+    let mut udp_flows = Vec::with_capacity(TOTAL_UDP_FLOWS);
+    for (user, (endpoint, client)) in [(socks_a, &client_a_handle), (socks_b, &client_b_handle)]
+        .into_iter()
+        .enumerate()
+    {
+        for index in 0..TCP_FLOWS_PER_USER {
+            tcp_flows.push(open_socks_flow(
                 endpoint,
-                target_endpoint,
+                tcp_target_endpoint,
                 index,
                 &server_handle,
                 client,
             ));
+        }
+        let start = user * UDP_FLOWS_PER_USER;
+        for target in &udp_target_endpoints[start..start + UDP_FLOWS_PER_USER] {
+            udp_flows.push(open_socks_udp_flow(endpoint, *target));
         }
     }
     wait_flow_count(&server_handle, TOTAL_FLOWS);
@@ -1333,10 +1360,21 @@ fn release_resource_profile() {
     let transferred = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + Duration::from_secs(duration);
     let mut workers = Vec::with_capacity(TOTAL_FLOWS);
-    for (index, stream) in streams.into_iter().enumerate() {
+    for (index, stream) in tcp_flows.into_iter().enumerate() {
         let transferred = transferred.clone();
         workers.push(thread::spawn(move || {
             run_resource_flow(stream, deadline, index as u8, &transferred, ceiling)
+        }));
+    }
+    for (index, flow) in udp_flows.into_iter().enumerate() {
+        let transferred = transferred.clone();
+        workers.push(thread::spawn(move || {
+            run_resource_udp_flow(
+                flow,
+                deadline,
+                (index + TOTAL_TCP_FLOWS) as u8,
+                &transferred,
+            )
         }));
     }
     for worker in workers {
@@ -1344,7 +1382,11 @@ fn release_resource_profile() {
     }
     stop_sample.store(true, Ordering::Release);
     sample_thread.join().unwrap();
-    target_thread.join().unwrap();
+    tcp_target_thread.join().unwrap();
+    stop_udp_targets.store(true, Ordering::Release);
+    for target in udp_target_threads {
+        target.join().unwrap();
+    }
 
     let bytes = transferred.load(Ordering::Acquire);
     let bits_per_second = bytes.saturating_mul(8) / duration;
@@ -1506,6 +1548,60 @@ fn open_socks_flow(
     stream
 }
 
+struct SocksUdpFlow {
+    _control: TcpStream,
+    socket: UdpSocket,
+    relay: std::net::SocketAddr,
+    target: std::net::SocketAddr,
+}
+
+fn open_socks_udp_flow(socks: std::net::SocketAddr, target: std::net::SocketAddr) -> SocksUdpFlow {
+    let mut control = TcpStream::connect(socks).unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    control.write_all(&[5, 1, 0]).unwrap();
+    let mut greeting = [0; 2];
+    control.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 0]);
+    control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+    let mut response = [0; 10];
+    control.read_exact(&mut response).unwrap();
+    assert_eq!(response[..4], [5, 0, 0, 1]);
+    let relay = std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::new(response[4], response[5], response[6], response[7]),
+        u16::from_be_bytes([response[8], response[9]]),
+    )
+    .into();
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let packet = socks_udp_packet(target, &[]);
+    socket.send_to(&packet, relay).unwrap();
+    let mut reply = [0; 10];
+    let (length, _) = socket.recv_from(&mut reply).unwrap();
+    assert_eq!(length, 10);
+    assert_eq!(reply, packet.as_slice());
+    SocksUdpFlow {
+        _control: control,
+        socket,
+        relay,
+        target,
+    }
+}
+
+fn socks_udp_packet(target: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let std::net::IpAddr::V4(address) = target.ip() else {
+        panic!("resource target must use IPv4")
+    };
+    let mut packet = vec![0, 0, 0, 1];
+    packet.extend_from_slice(&address.octets());
+    packet.extend_from_slice(&target.port().to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
 fn run_echo_target(listener: TcpListener, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut workers = Vec::with_capacity(count);
@@ -1534,6 +1630,26 @@ fn run_echo_target(listener: TcpListener, count: usize) {
     }
 }
 
+fn run_udp_echo_target(target: UdpSocket, stop: &AtomicBool) {
+    target
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut buffer = [0; 65_507];
+    while !stop.load(Ordering::Acquire) {
+        match target.recv_from(&mut buffer) {
+            Ok((length, source)) => {
+                target.send_to(&buffer[..length], source).unwrap();
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("UDP echo failed: {error}"),
+        }
+    }
+}
+
 fn run_resource_flow(
     mut stream: TcpStream,
     deadline: Instant,
@@ -1541,7 +1657,7 @@ fn run_resource_flow(
     transferred: &AtomicU64,
     ceiling: bool,
 ) {
-    let size = if ceiling { 16_384 } else { 3906 };
+    let size = if ceiling { 16_384 } else { 6788 };
     let payload = vec![byte; size];
     let mut reply = vec![0; size];
     let mut next = Instant::now();
@@ -1558,6 +1674,25 @@ fn run_resource_flow(
         }
     }
     stream.shutdown(Shutdown::Both).unwrap();
+}
+
+fn run_resource_udp_flow(flow: SocksUdpFlow, deadline: Instant, byte: u8, transferred: &AtomicU64) {
+    let size = 1024;
+    let payload = vec![byte; size];
+    let packet = socks_udp_packet(flow.target, &payload);
+    let mut reply = vec![0; packet.len()];
+    let mut next = Instant::now();
+    while Instant::now() < deadline {
+        flow.socket.send_to(&packet, flow.relay).unwrap();
+        let (length, _) = flow.socket.recv_from(&mut reply).unwrap();
+        assert_eq!(length, packet.len());
+        assert_eq!(reply, packet);
+        transferred.fetch_add((payload.len() * 2) as u64, Ordering::AcqRel);
+        next += Duration::from_secs(1);
+        if let Some(delay) = next.checked_duration_since(Instant::now()) {
+            thread::sleep(delay);
+        }
+    }
 }
 
 fn wait_session_count(handle: &snolc::EngineHandle, count: usize) {
