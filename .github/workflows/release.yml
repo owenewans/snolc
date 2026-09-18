@@ -1,0 +1,136 @@
+name: release targets
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: linux-i586
+            target: i586-unknown-linux-gnu
+            apt: gcc-multilib
+            linker: gcc
+            rustflags: -C link-arg=-m32
+          - profile: linux-i686
+            target: i686-unknown-linux-gnu
+            apt: gcc-multilib
+            linker: gcc
+            rustflags: -C link-arg=-m32
+          - profile: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            apt: gcc
+            linker: gcc
+            rustflags: ""
+          - profile: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            rustflags: ""
+          - profile: linux-armv7
+            target: armv7-unknown-linux-gnueabihf
+            apt: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+            rustflags: ""
+          - profile: linux-riscv64gc
+            target: riscv64gc-unknown-linux-gnu
+            apt: gcc-riscv64-linux-gnu
+            linker: riscv64-linux-gnu-gcc
+            rustflags: ""
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - name: install linker
+        run: sudo apt-get update && sudo apt-get install --yes ${{ matrix.apt }}
+      - name: install target
+        run: rustup target add ${{ matrix.target }}
+      - name: build CLI, library, and modules
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --workspace --exclude snolc-ng --release --locked --target ${{ matrix.target }} --config 'target.${{ matrix.target }}.linker="${{ matrix.linker }}"'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.profile }}
+          path: |
+            target/${{ matrix.target }}/release/snolc
+            target/${{ matrix.target }}/release/snolpkg
+            target/${{ matrix.target }}/release/libsnolc_*.so
+          if-no-files-found: error
+          retention-days: 7
+
+  apple:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - profile: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.profile }}
+          path: target/${{ matrix.target }}/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - run: rustup target add x86_64-pc-windows-msvc
+      - run: cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-x86_64-msvc
+          path: target/x86_64-pc-windows-msvc/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  static-cross-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: freebsd-x86_64
+            target: x86_64-unknown-freebsd
+          - profile: freebsd-arm64
+            target: aarch64-unknown-freebsd
+          - profile: openbsd-x86_64
+            target: x86_64-unknown-openbsd
+          - profile: openbsd-arm64
+            target: aarch64-unknown-openbsd
+          - profile: netbsd-x86_64
+            target: x86_64-unknown-netbsd
+          - profile: netbsd-arm64
+            target: aarch64-unknown-netbsd
+          - profile: haiku-x86_64
+            target: x86_64-unknown-haiku
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - run: rustup target add ${{ matrix.target }}
+      - name: check portable core
+        run: cargo check --locked --target ${{ matrix.target }} -p snolc-abi -p snolc-sdk -p snolc
