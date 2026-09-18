@@ -25,6 +25,10 @@ The strict manifest names package, authors, license, package version,
 source paths, entry, exact dependencies, source revision, toolchain, Cargo
 package, and artifacts.
 
+Each template lists its artifact targets. Every platform target and role pair
+maps to one template. The installed target selects the template, so adapter-tun
+emits Linux native mode on Linux and Android fd mode on Android.
+
 Each artifact declares target triple, minimum ISA, minimum glibc or Android
 API, HTTPS URL, byte size, SHA-256, and source-build output. The detached
 Ed25519 signature covers the source TOML bytes. `sources.toml` supplies the
