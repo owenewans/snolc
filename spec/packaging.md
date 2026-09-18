@@ -104,7 +104,8 @@ to every signed row before upload.
 
 `tools/package-release.py` consumes a checkout at that revision and explicit
 prebuilt target directories. It writes deterministic archives, updates signed
-artifact rows, and signs each manifest with the release Ed25519 key. Run
+artifact rows, binds every manifest to the clean checkout commit, and signs each
+manifest with the release Ed25519 key. Run
 `tools/verify-release.py <dist>` before upload. A second package run must produce
 byte-identical archives.
 
