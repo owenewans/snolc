@@ -72,7 +72,8 @@ def main() -> None:
         ["openssl", "pkey", "-in", str(args.signing_key), "-pubout", "-out", str(public_key)],
         check=True,
     )
-    verify_public_key(source, public_key)
+    if public_key.read_bytes() != (source / "release-ed25519.pem").read_bytes():
+        raise SystemExit("release key does not match release-ed25519.pem")
 
     metadata = json.loads(
         subprocess.check_output(
@@ -99,20 +100,13 @@ def main() -> None:
             }
         )
 
-    module_assets, revisions = module_metadata(source)
-    build_source_commit = revisions.pop() if len(revisions) == 1 else sorted(revisions)
+    build_source_commit = command(["git", "rev-parse", "HEAD"], source)
     files = []
     for path in sorted(value for value in assets.iterdir() if value.is_file()):
-        target = module_assets.get(path.name)
-        if target is None and path.name.startswith("snolc-0.0.1-") and path.name.endswith(".tar.gz"):
-            target_name = path.name.removeprefix("snolc-0.0.1-").removesuffix(".tar.gz")
+        target = None
+        if path.name.startswith("snolc-0.0.2-") and path.name.endswith(".tar.gz"):
+            target_name = path.name.removeprefix("snolc-0.0.2-").removesuffix(".tar.gz")
             target = {"target": target_name, **TARGETS.get(target_name, {})}
-        elif target is None and path.suffix == ".apk":
-            target = {
-                "target": "aarch64-linux-android+armv7-linux-androideabi",
-                "minimum_os": "Android API 24",
-                "minimum_isa": "armv8-a+armv7-a",
-            }
         files.append(
             {
                 "name": path.name,
@@ -129,7 +123,6 @@ def main() -> None:
         "publication_commit": command(["git", "rev-parse", "HEAD"], source),
         "build_source_commit": build_source_commit,
         "dirty": False,
-        "module_source_commit": build_source_commit,
         "rustc": command(["rustc", "+1.98.1", "--version", "--verbose"], source),
         "cargo": command(["cargo", "+1.98.1", "--version", "--verbose"], source),
         "cargo_lock_sha256": sha256(source / "Cargo.lock"),
@@ -155,30 +148,6 @@ def main() -> None:
         check=True,
     )
     print(f"inventoried {len(files)} assets and {len(dependencies)} dependencies")
-
-
-def module_metadata(source: Path) -> tuple[dict[str, dict], set[str]]:
-    assets = {}
-    revisions = set()
-    for path in sorted((source / "snolpkg").glob("*.toml")):
-        manifest = tomllib.loads(path.read_text())
-        revisions.add(manifest["source"]["revision"])
-        for artifact in manifest["artifacts"]:
-            target = artifact["target"]
-            values = {"target": target, **TARGETS.get(target, {})}
-            assets[artifact["url"].rsplit("/", 1)[-1]] = values
-    return assets, revisions
-
-
-def verify_public_key(source: Path, public_key: Path) -> None:
-    der = subprocess.check_output(
-        ["openssl", "pkey", "-pubin", "-in", str(public_key), "-outform", "DER"]
-    )
-    configured = tomllib.loads((source / "config/packages/sources.toml").read_text())[
-        "sources"
-    ][0]["public_key"]
-    if der[-32:].hex() != configured:
-        raise SystemExit("release key does not match the configured trust root")
 
 
 def sign(key: Path, path: Path) -> None:

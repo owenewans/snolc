@@ -60,7 +60,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
           . "$HOME/.cargo/env"
           test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
-          cargo build --workspace --exclude snolc-ng --release --locked
+          cargo build --workspace --release --locked
       - name: package product bundle
         run: python tools/package-release.py --source . --dist dist --bundle-output ${{ matrix.target }}=target/release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -93,7 +93,7 @@ jobs:
           PATH="$HOME/.rust-1.98.1/bin:$PATH"
           export PATH
           test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
-          cargo build --workspace --exclude snolc-ng --release --locked
+          cargo build --workspace --release --locked
       - name: package product bundle
         run: python tools/package-release.py --source . --dist dist --bundle-output aarch64-unknown-freebsd=target/release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

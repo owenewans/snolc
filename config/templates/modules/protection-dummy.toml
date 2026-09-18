@@ -1,6 +1,0 @@
-wire_version = 1
-instance = "protection-main"
-package = "owenewans/protection-dummy@0.0.1"
-role = "client"
-
-[options]

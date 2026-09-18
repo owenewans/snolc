@@ -2,7 +2,7 @@
 
 # snolc
 
-modular userspace network stack for linux and android.
+modular userspace network engine for linux and android.
 
 <a href="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle"><img src="https://count.owenewans.org/owenewans/snolc?theme=moebooru-h&notitle" alt="repository views"></a>
 
@@ -10,29 +10,46 @@ modular userspace network stack for linux and android.
 
 </div>
 
-## features
-
-- one packet path through smoltcp, yamux, protection and carrier layers
-- native adapter, protection, carrier and policy modules behind a C ABI
-- strict TOML configuration with explicit resource limits
-- library engine shared by the CLI and snolcNG
-- TCP and UDP over IPv4 and IPv6
-
 ## install
 
-Download signed 0.0.1 artifacts from the
-[release](https://github.com/owenewans/snolc/releases/tag/v0.0.1), or build the
-source with Rust 1.98.1:
+The installer places the `snolc` binary in `$HOME/.local/bin`.
 
 ```sh
-git clone --branch v0.0.1 https://github.com/owenewans/snolc
-cd snolc
-cargo build --locked
+curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/v0.0.2/install.sh | sh -s -- --binary
 ```
 
-## usage
+Compile the same tagged source instead:
 
-The workspace provides a library-first engine and thin command line client:
+```sh
+curl -fsSL https://raw.githubusercontent.com/owenewans/snolc/v0.0.2/install.sh | sh -s -- --source
+```
+
+Pass `--prefix /usr/local` to select another installation root. Binary mode
+checks the signed release checksum before extraction. Source mode requires
+Rust 1.98.1. Both modes install one executable and leave modules untouched.
+
+## components
+
+SNOLC 0.0.2 uses four repositories:
+
+- [`snolc`](https://github.com/owenewans/snolc): engine, C ABI, Rust SDK and CLI
+- [`snolc-modules`](https://github.com/owenewans/snolc-modules): official adapters, protection, carriers and policies
+- [`snolpkg`](https://github.com/owenewans/snolpkg): signed module installer
+- [`snolcNG`](https://github.com/owenewans/snolcNG): desktop and Android client
+
+## network path
+
+User traffic takes one route in each direction:
+
+```text
+adapter -> smoltcp -> policy -> yamux -> protection -> carrier
+```
+
+The engine owns scheduling, stack bridging, multiplexing, module loading and
+events. Policy modules decide admission, accounting, rates and filtering. The
+public compatibility generation remains `wire_version = 1`.
+
+## usage
 
 ```sh
 snolc validate snolc.toml
@@ -40,33 +57,23 @@ snolc run snolc.toml
 snolc control /run/snolc/snolc.sock policy-main request.toml
 ```
 
-Native modules run in the process and must come from a trusted source. Release
-notes list measured gates and unavailable platform checks.
-
-## architecture
-
-User traffic follows one route in each direction:
-
-```text
-adapter -> smoltcp -> yamux -> protection -> carrier
-```
-
-Core owns scheduling, stack bridging, multiplexing, module loading and events.
-Policy modules own admission, accounting, rate limits and filtering. The public
-compatibility generation is `wire_version = 1`.
+SNOLC loads native modules into its process. Install modules only from a source
+you trust.
 
 ## documentation
 
-- [LLM repository and API guide](llm.md)
+- [repository guide](llm.md)
 - [architecture](spec/architecture.md)
 - [stack bridge](spec/stack-bridge.md)
 - [wire version 1](spec/wire.md)
-- [native ABI](spec/abi.md)
-- [module authoring](spec/module-authoring.md)
-- [policy-local](spec/policy-local.md)
 - [configuration](spec/config.md)
-- [packaging](spec/packaging.md)
-- [profile URI](spec/uri.md)
+- [C ABI](spec/abi.md)
 - [platforms](spec/platforms.md)
-- [operations](spec/operations.md)
 - [acceptance](spec/acceptance.md)
+- [operations](spec/operations.md)
+- [benchmarks](spec/benchmarks.md)
+- [comparison plan](spec/xray-and-sing-vs-snolc.md)
+
+## license
+
+[Unlicense](LICENSE)

@@ -1,4 +1,0 @@
-offline = false
-max_archive_files = 64
-max_archive_bytes = 16777216
-max_file_bytes = 8388608
