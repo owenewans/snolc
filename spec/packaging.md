@@ -108,6 +108,12 @@ artifact rows, and signs each manifest with the release Ed25519 key. Run
 `tools/verify-release.py <dist>` before upload. A second package run must produce
 byte-identical archives.
 
+Each `--bundle-output <target>=<release-directory>` adds a deterministic product
+bundle with `snolc`, `snolpkg`, ten native modules, the C header, complete
+templates, Unlicense, and dependency notices. `snolcNG` is included when that
+target output contains it. The verifier checks the exact bundle tree, modes,
+metadata, gzip timestamp, and module count.
+
 ## failure behavior
 
 A signature, hash, size, target, dependency, path, extraction, build, or move
