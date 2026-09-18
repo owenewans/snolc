@@ -4,7 +4,7 @@ use std::env;
 use std::ffi::c_void;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ use crate::wire::{Destination, OpenRequest, OpenResponse, OpenStatus, StreamKind
 
 const HOST_EVENT_LIMIT: usize = 65_536;
 const MODULE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+static OPERATION_NEXT: AtomicU64 = AtomicU64::new(1);
 type ContextMap = HashMap<(u64, Vec<u8>), Vec<u8>>;
 
 pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, EngineError>> + Send>>;
@@ -110,7 +111,6 @@ struct EstablishedSession {
     pending: Option<PendingServerFlow>,
     client_pending: Option<PendingClientFlow>,
     active: Vec<ActiveServerFlow>,
-    next_operation: u64,
 }
 
 type AcceptFlowFuture = Pin<
@@ -1064,7 +1064,6 @@ impl TunnelRuntime {
                             pending: None,
                             client_pending: None,
                             active: Vec::new(),
-                            next_operation: 1,
                         }));
                         self.deadline = None;
                         return Ok(TunnelUpdate::Established);
@@ -1148,11 +1147,7 @@ impl EstablishedSession {
                 self.accepting = None;
                 self.mux = Some(mux);
                 let (request, stream) = result?;
-                let operation = self.next_operation;
-                self.next_operation = self
-                    .next_operation
-                    .checked_add(1)
-                    .ok_or(SessionFlowError::Operation)?;
+                let operation = next_operation()?;
                 self.pending = Some(PendingServerFlow {
                     metadata: OwnedFlowMetadata::from_request(&request),
                     request,
@@ -1703,6 +1698,22 @@ impl EstablishedSession {
     }
 }
 
+fn next_operation() -> Result<u64, SessionFlowError> {
+    let mut current = OPERATION_NEXT.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).ok_or(SessionFlowError::Operation)?;
+        match OPERATION_NEXT.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn open_error(error: &LoadError) -> (OpenStatus, &'static str) {
     match error {
         LoadError::ModuleStatus(snolc_abi::STATUS_DENIED) => (OpenStatus::Denied, "flow denied"),
@@ -2030,5 +2041,14 @@ mod tests {
         assert!(parse_log_levels("debug,debug").is_err());
         assert!(parse_log_levels("info").is_err());
         assert!(parse_log_levels("").is_err());
+    }
+
+    #[test]
+    fn flow_operations_are_unique_across_sessions() {
+        let first = next_operation().unwrap();
+        let second = next_operation().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
     }
 }
