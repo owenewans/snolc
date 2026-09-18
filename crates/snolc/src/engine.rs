@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use async_executor::LocalExecutor;
 use futures::channel::{mpsc, oneshot};
-use futures::{FutureExt, StreamExt, select};
 use thiserror::Error;
 
 use crate::config::{
@@ -22,7 +21,7 @@ use crate::core_io::{MuxDatagramIo, RegisteredDatagramIo, RegisteredIo, is_regis
 use crate::events::{Event, EventReceiver, Lifecycle, PlatformEvent, Snapshot};
 use crate::loader::{LoadError, LoadedModule, ModuleByteIo};
 use crate::logging::{FileLogger, LogError};
-use crate::mux::{MuxError, MuxSession};
+use crate::mux::{MuxError, MuxSession, MuxStream, OpenFlowFuture};
 use crate::stack::{
     FlowMetadata, PacketTcpPort, PacketUdpPort, SharedStackBridge, StackError, TcpStreamPort,
     UdpDatagramPort,
@@ -30,7 +29,7 @@ use crate::stack::{
 use crate::wire::{Destination, OpenRequest, OpenResponse, OpenStatus, StreamKind};
 
 const HOST_EVENT_LIMIT: usize = 65_536;
-const MODULE_POLL_INTERVAL: Duration = Duration::from_micros(100);
+const MODULE_POLL_INTERVAL: Duration = Duration::ZERO;
 static OPERATION_NEXT: AtomicU64 = AtomicU64::new(1);
 type ContextMap = HashMap<(u64, Vec<u8>), Vec<u8>>;
 
@@ -71,6 +70,7 @@ struct TunnelRuntime {
     binding: TunnelBinding,
     state: TunnelState,
     deadline: Option<Instant>,
+    retry_at: Option<Instant>,
 }
 
 enum TunnelState {
@@ -94,7 +94,7 @@ type HandshakeFuture = Pin<Box<dyn Future<Output = Result<PendingPolicySession, 
 
 struct PendingPolicySession {
     mux: MuxSession<ModuleByteIo>,
-    policy_stream: yamux::Stream,
+    policy_stream: MuxStream<ModuleByteIo>,
 }
 
 struct PolicyAttachState {
@@ -107,7 +107,7 @@ struct EstablishedSession {
     policy_session: u64,
     accepting: Option<AcceptFlowFuture>,
     responding: Option<RespondFlowFuture>,
-    opening: Option<OpenClientFuture>,
+    openings: Vec<ClientOpening>,
     pending: Option<PendingServerFlow>,
     client_pending: Option<PendingClientFlow>,
     active: Vec<ActiveServerFlow>,
@@ -118,7 +118,7 @@ type AcceptFlowFuture = Pin<
         dyn Future<
             Output = (
                 MuxSession<ModuleByteIo>,
-                Result<(OpenRequest, yamux::Stream), MuxError>,
+                Result<(OpenRequest, MuxStream<ModuleByteIo>), MuxError>,
             ),
         >,
     >,
@@ -128,27 +128,21 @@ type RespondFlowFuture = Pin<
         dyn Future<
             Output = (
                 MuxSession<ModuleByteIo>,
-                yamux::Stream,
+                MuxStream<ModuleByteIo>,
                 Result<(), MuxError>,
             ),
         >,
     >,
 >;
-type OpenClientFuture = Pin<
-    Box<
-        dyn Future<
-            Output = (
-                MuxSession<ModuleByteIo>,
-                Result<(OpenResponse, yamux::Stream), MuxError>,
-            ),
-        >,
-    >,
->;
+struct ClientOpening {
+    future: OpenFlowFuture<ModuleByteIo>,
+    pending: PendingClientFlow,
+}
 
 struct PendingServerFlow {
     request: OpenRequest,
     metadata: OwnedFlowMetadata,
-    stream: Option<yamux::Stream>,
+    stream: Option<MuxStream<ModuleByteIo>>,
     operation: u64,
     admitted: bool,
     adapter_cursor: usize,
@@ -175,11 +169,13 @@ struct PendingClientFlow {
 }
 
 enum PendingPorts {
+    Direct,
     Tcp(TcpStreamPort, TcpStreamPort),
     Udp(UdpDatagramPort, UdpDatagramPort),
 }
 
 enum ClientPolicyPort {
+    Direct,
     Tcp(TcpStreamPort),
     PacketTcp(PacketTcpPort),
     PacketUdp(PacketUdpPort),
@@ -262,6 +258,7 @@ pub struct Engine {
     log_errors: Arc<Mutex<VecDeque<String>>>,
     pending_controls: VecDeque<PendingControl>,
     control_server: Option<UnixControlServer>,
+    idle_wait: bool,
 }
 
 struct EngineLogger {
@@ -434,8 +431,13 @@ impl Engine {
             log_errors,
             pending_controls: VecDeque::new(),
             control_server,
+            idle_wait: false,
         };
         Ok((engine, handle))
+    }
+
+    pub fn set_idle_wait(&mut self, enabled: bool) {
+        self.idle_wait = enabled;
     }
 
     pub fn run(self) -> Result<(), EngineError> {
@@ -498,27 +500,26 @@ impl Engine {
         self.emit(Event::Lifecycle(Lifecycle::Running));
 
         loop {
-            let command = FutureExt::fuse(self.commands.next());
-            let timer = FutureExt::fuse(async_io::Timer::after(MODULE_POLL_INTERVAL));
-            futures::pin_mut!(command, timer);
-            select! {
-                command = command => match command {
-                    Some(Command::Control { instance, request, response }) => {
-                        match self.start_control(&instance, request, response) {
-                            Ok(()) => self.poll_controls(),
-                            Err((error, response)) => {
-                                let _ = response.send(Err(error));
-                            }
+            match self.commands.try_recv() {
+                Ok(command) => match command {
+                    Command::Control {
+                        instance,
+                        request,
+                        response,
+                    } => match self.start_control(&instance, request, response) {
+                        Ok(()) => self.poll_controls(),
+                        Err((error, response)) => {
+                            let _ = response.send(Err(error));
                         }
-                    }
-                    Some(Command::Shutdown { response }) => {
+                    },
+                    Command::Shutdown { response } => {
                         self.emit(Event::Lifecycle(Lifecycle::Stopping));
                         if let Some(response) = response {
                             let _ = response.send(());
                         }
                         break;
                     }
-                    Some(Command::Platform { event, response }) => {
+                    Command::Platform { event, response } => {
                         self.emit(Event::Platform(event));
                         match event {
                             PlatformEvent::NetworkChanged => {
@@ -540,19 +541,23 @@ impl Engine {
                             }
                         }
                     }
-                    None => {
-                        self.emit(Event::Lifecycle(Lifecycle::Stopping));
-                        break;
-                    }
                 },
-                _ = timer => {
-                    stack.poll();
-                    self.poll_modules();
-                    self.poll_local_control();
-                    self.poll_tunnels(&mut tunnels, &stack);
-                    self.drain_module_events();
-                    self.drain_log_errors();
+                Err(mpsc::TryRecvError::Closed) => {
+                    self.emit(Event::Lifecycle(Lifecycle::Stopping));
+                    break;
                 }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if stack.has_work() {
+                stack.poll();
+            }
+            self.poll_modules();
+            self.poll_local_control();
+            self.poll_tunnels(&mut tunnels, &stack);
+            self.drain_module_events();
+            self.drain_log_errors();
+            if self.idle_wait && tunnels.iter().all(TunnelRuntime::is_idle) {
+                std::thread::sleep(Duration::from_micros(25));
             }
         }
 
@@ -937,6 +942,13 @@ fn channel_security_context(module: &LoadedModule, role: Role) -> Result<Vec<u8>
 }
 
 impl TunnelRuntime {
+    fn is_idle(&self) -> bool {
+        match &self.state {
+            TunnelState::Established(session) => session.is_idle(self.binding.role),
+            _ => false,
+        }
+    }
+
     fn new(binding: TunnelBinding) -> Self {
         let deadline = match binding.role {
             Role::Client => Some(Instant::now() + binding.connect_timeout),
@@ -946,6 +958,7 @@ impl TunnelRuntime {
             binding,
             state: TunnelState::Carrier,
             deadline,
+            retry_at: None,
         }
     }
 
@@ -975,6 +988,12 @@ impl TunnelRuntime {
         let mut context = Context::from_waker(waker);
         match &mut self.state {
             TunnelState::Carrier => {
+                if self
+                    .retry_at
+                    .is_some_and(|retry_at| Instant::now() < retry_at)
+                {
+                    return Ok(TunnelUpdate::None);
+                }
                 let carrier = &modules[self.binding.carrier];
                 let result = match self.binding.role {
                     Role::Client => carrier.carrier_connect(&[], &mut context),
@@ -982,6 +1001,7 @@ impl TunnelRuntime {
                 };
                 match result {
                     Poll::Ready(Ok(io)) => {
+                        self.retry_at = None;
                         self.state = TunnelState::Protection(Some(io));
                         self.deadline = Some(Instant::now() + self.binding.handshake_timeout);
                         return Ok(TunnelUpdate::CarrierReady);
@@ -991,6 +1011,27 @@ impl TunnelRuntime {
                 }
             }
             TunnelState::Protection(lower) => {
+                if modules[self.binding.protection].protection_passthrough() {
+                    let Some(io) = lower.take() else {
+                        return self.fail("carrier stream is unavailable".into(), false);
+                    };
+                    let role = self.binding.role;
+                    let family = self.binding.policy_family.clone();
+                    let config = self.binding.yamux.clone();
+                    self.state = TunnelState::Handshake(Box::pin(async move {
+                        let mode = match role {
+                            Role::Client => yamux::Mode::Client,
+                            Role::Server => yamux::Mode::Server,
+                        };
+                        let mut mux = MuxSession::new(io, mode, &config);
+                        let policy_stream = match role {
+                            Role::Client => mux.open_policy(&family).await?,
+                            Role::Server => mux.accept_policy(&family).await?,
+                        };
+                        Ok(PendingPolicySession { mux, policy_stream })
+                    }));
+                    return Ok(TunnelUpdate::Protected);
+                }
                 let role = match self.binding.role {
                     Role::Client => b"role = \"client\"\n".as_slice(),
                     Role::Server => b"role = \"server\"\n".as_slice(),
@@ -1060,7 +1101,7 @@ impl TunnelRuntime {
                             policy_session,
                             accepting: None,
                             responding: None,
-                            opening: None,
+                            openings: Vec::new(),
                             pending: None,
                             client_pending: None,
                             active: Vec::new(),
@@ -1090,6 +1131,7 @@ impl TunnelRuntime {
 
     fn reset(&mut self) {
         self.state = TunnelState::Carrier;
+        self.retry_at = None;
         self.deadline = match self.binding.role {
             Role::Client => Some(Instant::now() + self.binding.connect_timeout),
             Role::Server => None,
@@ -1102,11 +1144,24 @@ impl TunnelRuntime {
         was_established: bool,
     ) -> Result<TunnelUpdate, (String, bool)> {
         self.reset();
+        if self.binding.role == Role::Client {
+            self.retry_at = Some(Instant::now() + Duration::from_millis(10));
+        }
         Err((message, was_established))
     }
 }
 
 impl EstablishedSession {
+    fn is_idle(&self, role: Role) -> bool {
+        if !self.active.is_empty() {
+            return false;
+        }
+        match role {
+            Role::Client => self.openings.is_empty() && self.client_pending.is_none(),
+            Role::Server => self.responding.is_none() && self.pending.is_none(),
+        }
+    }
+
     fn poll(
         &mut self,
         binding: &TunnelBinding,
@@ -1183,137 +1238,146 @@ impl EstablishedSession {
         stack: &SharedStackBridge,
         context: &mut Context<'_>,
     ) -> Result<(), SessionFlowError> {
-        if let Some(future) = &mut self.opening {
-            if let Poll::Ready((mux, result)) = future.as_mut().poll(context) {
-                self.opening = None;
-                self.mux = Some(mux);
-                let mut pending = self.client_pending.take().ok_or(SessionFlowError::State)?;
-                match result {
-                    Ok((response, stream)) if response.status == OpenStatus::Ok => {
-                        let policy_port =
-                            pending.policy_port.take().ok_or(SessionFlowError::State)?;
-                        let mux_handle = match policy_port {
-                            ClientPolicyPort::Tcp(policy_port) => {
-                                let policy_io =
-                                    RegisteredIo::register(policy_port, binding.core_io_limit)?;
-                                let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
-                                let (policy_handle, policy_table) = policy_io.raw_parts();
-                                let (mux_handle, mux_table) = mux_io.raw_parts();
-                                unsafe {
-                                    modules[binding.policy].policy_attach_flow(
-                                        self.policy_session,
-                                        policy_handle,
-                                        policy_table,
-                                        mux_handle,
-                                        mux_table,
-                                    )?;
-                                }
-                                policy_io.transfer();
-                                mux_io.transfer();
-                                mux_handle
-                            }
-                            ClientPolicyPort::PacketTcp(policy_port) => {
-                                let policy_io =
-                                    RegisteredIo::register(policy_port, binding.core_io_limit)?;
-                                let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
-                                let (policy_handle, policy_table) = policy_io.raw_parts();
-                                let (mux_handle, mux_table) = mux_io.raw_parts();
-                                unsafe {
-                                    modules[binding.policy].policy_attach_flow(
-                                        self.policy_session,
-                                        policy_handle,
-                                        policy_table,
-                                        mux_handle,
-                                        mux_table,
-                                    )?;
-                                }
-                                policy_io.transfer();
-                                mux_io.transfer();
-                                mux_handle
-                            }
-                            ClientPolicyPort::Udp(policy_port) => {
-                                let policy_io = RegisteredDatagramIo::register(
-                                    policy_port,
-                                    binding.core_io_limit,
+        let mut completed = None;
+        for (index, opening) in self.openings.iter_mut().enumerate() {
+            if let Poll::Ready(result) = opening.future.as_mut().poll(context) {
+                completed = Some((index, result));
+                break;
+            }
+        }
+        if let Some((index, result)) = completed {
+            let mut pending = self.openings.swap_remove(index).pending;
+            match result {
+                Ok((response, stream)) if response.status == OpenStatus::Ok => {
+                    let policy_port = pending.policy_port.take().ok_or(SessionFlowError::State)?;
+                    let mux_handle = match policy_port {
+                        ClientPolicyPort::Tcp(policy_port) => {
+                            let policy_io =
+                                RegisteredIo::register(policy_port, binding.core_io_limit)?;
+                            let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+                            let (policy_handle, policy_table) = policy_io.raw_parts();
+                            let (mux_handle, mux_table) = mux_io.raw_parts();
+                            unsafe {
+                                modules[binding.policy].policy_attach_flow(
+                                    self.policy_session,
+                                    policy_handle,
+                                    policy_table,
+                                    mux_handle,
+                                    mux_table,
                                 )?;
-                                let mux_io = RegisteredDatagramIo::register(
-                                    MuxDatagramIo::new(stream),
-                                    binding.core_io_limit,
-                                )?;
-                                let (policy_handle, policy_table) = policy_io.raw_parts();
-                                let (mux_handle, mux_table) = mux_io.raw_parts();
-                                unsafe {
-                                    modules[binding.policy].policy_attach_datagram_flow(
-                                        self.policy_session,
-                                        policy_handle,
-                                        policy_table,
-                                        mux_handle,
-                                        mux_table,
-                                    )?;
-                                }
-                                policy_io.transfer();
-                                mux_io.transfer();
-                                mux_handle
                             }
-                            ClientPolicyPort::PacketUdp(policy_port) => {
-                                let policy_io = RegisteredDatagramIo::register(
-                                    policy_port,
-                                    binding.core_io_limit,
+                            policy_io.transfer();
+                            mux_io.transfer();
+                            mux_handle
+                        }
+                        ClientPolicyPort::Direct => {
+                            let (adapter, adapter_flow) =
+                                pending.adapter_flow.ok_or(SessionFlowError::State)?;
+                            let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+                            let (mux_handle, mux_table) = mux_io.raw_parts();
+                            unsafe {
+                                modules[adapter].adapter_attach_flow(
+                                    adapter_flow,
+                                    mux_handle,
+                                    mux_table,
                                 )?;
-                                let mux_io = RegisteredDatagramIo::register(
-                                    MuxDatagramIo::new(stream),
-                                    binding.core_io_limit,
-                                )?;
-                                let (policy_handle, policy_table) = policy_io.raw_parts();
-                                let (mux_handle, mux_table) = mux_io.raw_parts();
-                                unsafe {
-                                    modules[binding.policy].policy_attach_datagram_flow(
-                                        self.policy_session,
-                                        policy_handle,
-                                        policy_table,
-                                        mux_handle,
-                                        mux_table,
-                                    )?;
-                                }
-                                policy_io.transfer();
-                                mux_io.transfer();
-                                mux_handle
                             }
-                        };
-                        if let Some((adapter, flow)) = pending.adapter_flow {
-                            modules[adapter].adapter_complete_flow(
-                                flow,
-                                snolc_abi::STATUS_OK,
-                                &[],
+                            mux_io.transfer();
+                            mux_handle
+                        }
+                        ClientPolicyPort::PacketTcp(policy_port) => {
+                            let policy_io =
+                                RegisteredIo::register(policy_port, binding.core_io_limit)?;
+                            let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+                            let (policy_handle, policy_table) = policy_io.raw_parts();
+                            let (mux_handle, mux_table) = mux_io.raw_parts();
+                            unsafe {
+                                modules[binding.policy].policy_attach_flow(
+                                    self.policy_session,
+                                    policy_handle,
+                                    policy_table,
+                                    mux_handle,
+                                    mux_table,
+                                )?;
+                            }
+                            policy_io.transfer();
+                            mux_io.transfer();
+                            mux_handle
+                        }
+                        ClientPolicyPort::Udp(policy_port) => {
+                            let policy_io =
+                                RegisteredDatagramIo::register(policy_port, binding.core_io_limit)?;
+                            let mux_io = RegisteredDatagramIo::register(
+                                MuxDatagramIo::new(stream),
+                                binding.core_io_limit,
                             )?;
+                            let (policy_handle, policy_table) = policy_io.raw_parts();
+                            let (mux_handle, mux_table) = mux_io.raw_parts();
+                            unsafe {
+                                modules[binding.policy].policy_attach_datagram_flow(
+                                    self.policy_session,
+                                    policy_handle,
+                                    policy_table,
+                                    mux_handle,
+                                    mux_table,
+                                )?;
+                            }
+                            policy_io.transfer();
+                            mux_io.transfer();
+                            mux_handle
                         }
-                        self.active.push(ActiveServerFlow {
-                            adapter_flow: pending.adapter_flow,
-                            mux_handle,
-                        });
-                    }
-                    Ok((response, _)) => {
-                        if let Some((adapter, flow)) = pending.adapter_flow {
-                            modules[adapter].adapter_complete_flow(
-                                flow,
-                                abi_status(response.status),
-                                response.reason.as_bytes(),
+                        ClientPolicyPort::PacketUdp(policy_port) => {
+                            let policy_io =
+                                RegisteredDatagramIo::register(policy_port, binding.core_io_limit)?;
+                            let mux_io = RegisteredDatagramIo::register(
+                                MuxDatagramIo::new(stream),
+                                binding.core_io_limit,
                             )?;
+                            let (policy_handle, policy_table) = policy_io.raw_parts();
+                            let (mux_handle, mux_table) = mux_io.raw_parts();
+                            unsafe {
+                                modules[binding.policy].policy_attach_datagram_flow(
+                                    self.policy_session,
+                                    policy_handle,
+                                    policy_table,
+                                    mux_handle,
+                                    mux_table,
+                                )?;
+                            }
+                            policy_io.transfer();
+                            mux_io.transfer();
+                            mux_handle
                         }
-                        if let Some(mux) = &mut self.mux {
-                            mux.release_flow();
-                        }
+                    };
+                    if let Some((adapter, flow)) = pending.adapter_flow {
+                        modules[adapter].adapter_complete_flow(flow, snolc_abi::STATUS_OK, &[])?;
                     }
-                    Err(error) => {
-                        if let Some((adapter, flow)) = pending.adapter_flow {
-                            let _ = modules[adapter].adapter_complete_flow(
-                                flow,
-                                snolc_abi::STATUS_IO,
-                                b"tunnel stream failed",
-                            );
-                        }
-                        return Err(error.into());
+                    self.active.push(ActiveServerFlow {
+                        adapter_flow: pending.adapter_flow,
+                        mux_handle,
+                    });
+                }
+                Ok((response, _)) => {
+                    if let Some((adapter, flow)) = pending.adapter_flow {
+                        modules[adapter].adapter_complete_flow(
+                            flow,
+                            abi_status(response.status),
+                            response.reason.as_bytes(),
+                        )?;
                     }
+                    if let Some(mux) = &mut self.mux {
+                        mux.release_flow();
+                    }
+                }
+                Err(error) => {
+                    if let Some((adapter, flow)) = pending.adapter_flow {
+                        let _ = modules[adapter].adapter_complete_flow(
+                            flow,
+                            snolc_abi::STATUS_IO,
+                            b"tunnel stream failed",
+                        );
+                    }
+                    return Err(error.into());
                 }
             }
             return Ok(());
@@ -1422,18 +1486,23 @@ impl EstablishedSession {
             };
             pending.policy_port = Some(match pending.request.kind {
                 StreamKind::Tcp => {
-                    let (adapter_port, policy_port) = stack.open_tcp(metadata)?;
-                    let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
-                    let (adapter_handle, adapter_table) = adapter_io.raw_parts();
-                    unsafe {
-                        modules[adapter].adapter_attach_flow(
-                            adapter_flow,
-                            adapter_handle,
-                            adapter_table,
-                        )?;
+                    if modules[binding.policy].policy_passthrough_tcp() {
+                        ClientPolicyPort::Direct
+                    } else {
+                        let (adapter_port, policy_port) = stack.open_tcp(metadata)?;
+                        let adapter_io =
+                            RegisteredIo::register(adapter_port, binding.core_io_limit)?;
+                        let (adapter_handle, adapter_table) = adapter_io.raw_parts();
+                        unsafe {
+                            modules[adapter].adapter_attach_flow(
+                                adapter_flow,
+                                adapter_handle,
+                                adapter_table,
+                            )?;
+                        }
+                        adapter_io.transfer();
+                        ClientPolicyPort::Tcp(policy_port)
                     }
-                    adapter_io.transfer();
-                    ClientPolicyPort::Tcp(policy_port)
                 }
                 StreamKind::Udp => {
                     let (adapter_port, policy_port) = stack.open_udp(metadata)?;
@@ -1453,12 +1522,13 @@ impl EstablishedSession {
                 StreamKind::Policy => return Err(SessionFlowError::State),
             });
         }
-        let request = pending.request.clone();
-        let mut mux = self.mux.take().ok_or(SessionFlowError::State)?;
-        self.opening = Some(Box::pin(async move {
-            let result = mux.open_flow_confirmed(&request).await;
-            (mux, result)
-        }));
+        let pending = self.client_pending.take().ok_or(SessionFlowError::State)?;
+        let future = self
+            .mux
+            .as_mut()
+            .ok_or(SessionFlowError::State)?
+            .begin_open_flow_confirmed(pending.request.clone())?;
+        self.openings.push(ClientOpening { future, pending });
         Ok(())
     }
 
@@ -1535,6 +1605,9 @@ impl EstablishedSession {
                     opaque: pending.request.metadata.clone(),
                 };
                 let ports = match pending.request.kind {
+                    StreamKind::Tcp if modules[binding.policy].policy_passthrough_tcp() => {
+                        Ok(PendingPorts::Direct)
+                    }
                     StreamKind::Tcp => stack
                         .open_tcp(metadata)
                         .map(|(adapter, policy)| PendingPorts::Tcp(adapter, policy)),
@@ -1601,6 +1674,15 @@ impl EstablishedSession {
         let ports = pending.ports.take().ok_or(SessionFlowError::State)?;
         let stream = pending.stream.take().ok_or(SessionFlowError::State)?;
         let mux_handle = match ports {
+            PendingPorts::Direct => {
+                let mux_io = RegisteredIo::register(stream, binding.core_io_limit)?;
+                let (mux_handle, mux_table) = mux_io.raw_parts();
+                unsafe {
+                    modules[adapter].adapter_attach_flow(adapter_flow, mux_handle, mux_table)?;
+                }
+                mux_io.transfer();
+                mux_handle
+            }
             PendingPorts::Tcp(adapter_port, policy_port) => {
                 let adapter_io = RegisteredIo::register(adapter_port, binding.core_io_limit)?;
                 let policy_io = RegisteredIo::register(policy_port, binding.core_io_limit)?;

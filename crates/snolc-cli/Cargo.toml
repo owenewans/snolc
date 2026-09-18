@@ -14,4 +14,4 @@ path = "src/main.rs"
 
 [dependencies]
 ctrlc.workspace = true
-snolc = { version = "=0.0.3", path = "../snolc" }
+snolc = { version = "=0.0.4", path = "../snolc" }

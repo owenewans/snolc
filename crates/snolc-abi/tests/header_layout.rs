@@ -137,7 +137,7 @@ fn c_header_matches_rust_layout() {
         "SnolProtectionApiV1",
         &[
             offset_of!(SnolProtectionApiV1, struct_size),
-            offset_of!(SnolProtectionApiV1, reserved),
+            offset_of!(SnolProtectionApiV1, flags),
             offset_of!(SnolProtectionApiV1, wrap),
         ],
     );
@@ -156,7 +156,7 @@ fn c_header_matches_rust_layout() {
         "SnolPolicyApiV1",
         &[
             offset_of!(SnolPolicyApiV1, struct_size),
-            offset_of!(SnolPolicyApiV1, reserved),
+            offset_of!(SnolPolicyApiV1, flags),
             offset_of!(SnolPolicyApiV1, attach_session),
             offset_of!(SnolPolicyApiV1, admit_flow),
             offset_of!(SnolPolicyApiV1, attach_flow),

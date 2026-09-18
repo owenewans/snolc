@@ -123,7 +123,7 @@ struct SnolAdapterApiV1 {
 
 struct SnolProtectionApiV1 {
     uint32_t struct_size;
-    uint32_t reserved;
+    uint32_t flags;
     SnolStatus (*wrap)(SnolHandle instance, SnolHandle lower,
                        const SnolByteIoV1 *lower_io, SnolBytes context,
                        SnolWakeHandle wake, SnolHandle *wrapped);
@@ -140,7 +140,7 @@ struct SnolCarrierApiV1 {
 
 struct SnolPolicyApiV1 {
     uint32_t struct_size;
-    uint32_t reserved;
+    uint32_t flags;
     SnolStatus (*attach_session)(SnolHandle instance, SnolHandle policy_stream,
                                   const SnolByteIoV1 *policy_stream_io,
                                   SnolBytes context, SnolWakeHandle wake,

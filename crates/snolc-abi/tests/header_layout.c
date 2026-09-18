@@ -73,7 +73,7 @@ int main(void) {
 
     printf("SnolProtectionApiV1 %zu", sizeof(SnolProtectionApiV1));
     FIELD(SnolProtectionApiV1, struct_size);
-    FIELD(SnolProtectionApiV1, reserved);
+    FIELD(SnolProtectionApiV1, flags);
     FIELD(SnolProtectionApiV1, wrap);
     putchar('\n');
 
@@ -86,7 +86,7 @@ int main(void) {
 
     printf("SnolPolicyApiV1 %zu", sizeof(SnolPolicyApiV1));
     FIELD(SnolPolicyApiV1, struct_size);
-    FIELD(SnolPolicyApiV1, reserved);
+    FIELD(SnolPolicyApiV1, flags);
     FIELD(SnolPolicyApiV1, attach_session);
     FIELD(SnolPolicyApiV1, admit_flow);
     FIELD(SnolPolicyApiV1, attach_flow);

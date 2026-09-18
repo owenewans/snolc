@@ -60,6 +60,23 @@ Sparse files and the page cache make loopback throughput a software ceiling.
 Use the real-server table in
 [`xray-and-sing-vs-snolc.md`](xray-and-sing-vs-snolc.md) for network results.
 
+## 0.0.4 proxy result
+
+The 0.0.4 release candidate used four workers, 128 KiB mux frames and adapter
+buffers, and a 512 KiB adapter work budget. Two independent five-run loopback
+series produced eight-flow medians of 4,008.6 and 4,035.9 Mbit/s. The peak was
+4,367.9 Mbit/s. Median p50 latency across those runs was 1.30 ms. Client and
+server RSS stayed between 9.9 and 10.6 MiB.
+
+Noise/TCP used the same configuration. Its five-run median was 2,965.7 Mbit/s
+with 1.46 ms p50 latency and about 10.5 MiB RSS.
+
+The real-server correctness run used `93.95.228.248`, four workers at each end,
+and the same payload and sample counts. It completed at 86.5 Mbit/s aggregate
+with a 12.6 Mbit/s single-flow median and 166.6 ms p50 latency. The link, host
+and date differ from the comparison table, so these values do not form a direct
+ranking.
+
 ## required stress rows
 
 Release evidence must include these rows:

@@ -365,6 +365,13 @@ impl SharedStackBridge {
         });
     }
 
+    pub fn has_work(&self) -> bool {
+        self.wakes
+            .borrow()
+            .iter()
+            .any(|wake| wake.strong_count() != 0)
+    }
+
     pub fn managed_bytes(&self) -> usize {
         self.inner.borrow().managed_bytes()
     }

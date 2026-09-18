@@ -17,8 +17,8 @@ libloading.workspace = true
 libc.workspace = true
 serde.workspace = true
 sha2.workspace = true
-snolc-abi = { version = "=0.0.3", path = "../snolc-abi" }
-snolc-sdk = { version = "=0.0.3", path = "../snolc-sdk" }
+snolc-abi = { version = "=0.0.4", path = "../snolc-abi" }
+snolc-sdk = { version = "=0.0.4", path = "../snolc-sdk" }
 smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "fragmentation-buffer-size-65536", "reassembly-buffer-count-4", "reassembly-buffer-size-65536", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation"] }
 thiserror.workspace = true
 toml.workspace = true

@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "snolc"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-executor",
  "async-io",
@@ -701,11 +701,11 @@ dependencies = [
 
 [[package]]
 name = "snolc-abi"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "snolc-fuzz"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libfuzzer-sys",
  "snolc",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "snolc-sdk"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "snolc-abi",
  "thiserror",
