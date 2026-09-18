@@ -11,7 +11,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "dc4432b62ced51953beb662d6879beec2128486d"
+revision = "83aadeda5c5ae26f27588b64b67a04b3584b31c6"
 
 [build]
 package = "snolc-adapter-http-connect"
@@ -41,8 +41,8 @@ target = "x86_64-unknown-linux-gnu"
 minimum_isa = "x86-64"
 minimum_libc = "2.28"
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-http-connect-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
-byte_size = 297688
-sha256 = "9c488597fc8458da7f3b842ab63d7cb8d72b3a285f350caf973f6ee631b6dec2"
+byte_size = 295985
+sha256 = "ea435bad4464404d7444f09a725120a0e92c20b95c0d6044a2bb380e1cdc4620"
 build_output = "release/libsnolc_adapter_http_connect.so"
 
 [[artifacts]]

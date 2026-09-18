@@ -11,7 +11,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "dc4432b62ced51953beb662d6879beec2128486d"
+revision = "83aadeda5c5ae26f27588b64b67a04b3584b31c6"
 
 [build]
 package = "snolc-carrier-tcp"
@@ -46,8 +46,8 @@ target = "x86_64-unknown-linux-gnu"
 minimum_isa = "x86-64"
 minimum_libc = "2.28"
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/carrier-tcp-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
-byte_size = 342644
-sha256 = "3a46d13bbdc71eeed566a75ab2cbbc7e2a816fdf089df0c16c0d0ea09ce6c940"
+byte_size = 339053
+sha256 = "0f459202e22b87119faf3a2b35ecef06082f15d028e1a9017157a6b9be47da09"
 build_output = "release/libsnolc_carrier_tcp.so"
 
 [[artifacts]]
@@ -55,8 +55,8 @@ target = "aarch64-linux-android"
 minimum_isa = "armv8-a"
 minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/carrier-tcp-0.0.1-aarch64-linux-android.tar.gz"
-byte_size = 327467
-sha256 = "978d4ceb4a1e53ebd7c722ef14d4193420db5b1c37155ee2c99ff7a5be221e78"
+byte_size = 327460
+sha256 = "ef5a5a7fa7e763c72aadd1e236ad97ac6ebd7ac028581bfce9a043d2eb76b2cd"
 build_output = "release/libsnolc_carrier_tcp.so"
 
 [[artifacts]]

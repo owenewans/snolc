@@ -11,7 +11,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "dc4432b62ced51953beb662d6879beec2128486d"
+revision = "83aadeda5c5ae26f27588b64b67a04b3584b31c6"
 
 [build]
 package = "snolc-protection-dummy"
@@ -46,8 +46,8 @@ target = "x86_64-unknown-linux-gnu"
 minimum_isa = "x86-64"
 minimum_libc = "2.28"
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-dummy-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
-byte_size = 235950
-sha256 = "0eb1b0b66cded7b1103dca7b583bb873b1bdb0340bbcdd8c319910c49323cb3a"
+byte_size = 233318
+sha256 = "10a2b8aa33ca691161b5d6f4c90d94e321e32a18ebe3d4a0268893c4ea412596"
 build_output = "release/libsnolc_protection_dummy.so"
 
 [[artifacts]]

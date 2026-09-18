@@ -11,7 +11,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "dc4432b62ced51953beb662d6879beec2128486d"
+revision = "83aadeda5c5ae26f27588b64b67a04b3584b31c6"
 
 [build]
 package = "snolc-protection-noise"
@@ -46,8 +46,8 @@ target = "x86_64-unknown-linux-gnu"
 minimum_isa = "x86-64"
 minimum_libc = "2.28"
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/protection-noise-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
-byte_size = 397574
-sha256 = "4a296d5f19052eb43d529f893e1d58b20d5ebf742ade59826a8b17b8e3084609"
+byte_size = 394560
+sha256 = "041d8dfac2e11d553fa849c3155c99a78660452ff446b125888c1f9b96bce8bb"
 build_output = "release/libsnolc_protection_noise.so"
 
 [[artifacts]]

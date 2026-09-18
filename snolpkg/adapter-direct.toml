@@ -11,7 +11,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "dc4432b62ced51953beb662d6879beec2128486d"
+revision = "83aadeda5c5ae26f27588b64b67a04b3584b31c6"
 
 [build]
 package = "snolc-adapter-direct"
@@ -41,8 +41,8 @@ target = "x86_64-unknown-linux-gnu"
 minimum_isa = "x86-64"
 minimum_libc = "2.28"
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-direct-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
-byte_size = 354467
-sha256 = "40ca5632569d02ea86b52622766fc97c9678f8e7de406a71268c3d2480d3bad5"
+byte_size = 351773
+sha256 = "5f8d1e45fe270fff29300d7de90e27099ab6708db23c1b593581dfcfece40d2b"
 build_output = "release/libsnolc_adapter_direct.so"
 
 [[artifacts]]

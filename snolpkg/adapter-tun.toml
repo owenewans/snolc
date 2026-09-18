@@ -11,7 +11,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "dc4432b62ced51953beb662d6879beec2128486d"
+revision = "83aadeda5c5ae26f27588b64b67a04b3584b31c6"
 
 [build]
 package = "snolc-adapter-tun"
@@ -46,8 +46,8 @@ target = "x86_64-unknown-linux-gnu"
 minimum_isa = "x86-64"
 minimum_libc = "2.28"
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-tun-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
-byte_size = 291975
-sha256 = "b9c48964863ea7dba65e297fe4ad91c0ca4ac3ba6f13fca8f26cd6ea0a593555"
+byte_size = 289102
+sha256 = "dfaeae29e0d30152a44d3b3c2c02d0b74e849138c248dde09932e2353d0790a9"
 build_output = "release/libsnolc_adapter_tun.so"
 
 [[artifacts]]
@@ -55,8 +55,8 @@ target = "aarch64-linux-android"
 minimum_isa = "armv8-a"
 minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-tun-0.0.1-aarch64-linux-android.tar.gz"
-byte_size = 287287
-sha256 = "93942dafa454bdf4cb82d5382e29576123788579f22af66f9b27bfd415aadfab"
+byte_size = 287297
+sha256 = "bf8b0ceea3ba5d339e7c37ec16a8e1590ba051c7c354a1d7ee595ee9ec597a26"
 build_output = "release/libsnolc_adapter_tun.so"
 
 [[artifacts]]
@@ -64,6 +64,6 @@ target = "armv7-linux-androideabi"
 minimum_isa = "armv7-a"
 minimum_android_api = 24
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-tun-0.0.1-armv7-linux-androideabi.tar.gz"
-byte_size = 258298
-sha256 = "7d1a64bbafaee41bd047e11cc2847a958433126227691abca906ad14df496282"
+byte_size = 258297
+sha256 = "54ddab6736d50b244248bb4f970aa639ff85493893d771ff24e0fcebc0dadc45"
 build_output = "release/libsnolc_adapter_tun.so"

@@ -11,7 +11,7 @@ toolchain = "1.98.1"
 dependencies = []
 
 [source]
-revision = "dc4432b62ced51953beb662d6879beec2128486d"
+revision = "83aadeda5c5ae26f27588b64b67a04b3584b31c6"
 
 [build]
 package = "snolc-adapter-socks5"
@@ -41,8 +41,8 @@ target = "x86_64-unknown-linux-gnu"
 minimum_isa = "x86-64"
 minimum_libc = "2.28"
 url = "https://github.com/owenewans/snolc/releases/download/v0.0.1/adapter-socks5-0.0.1-x86_64-unknown-linux-gnu.tar.gz"
-byte_size = 312043
-sha256 = "72dc8e8ced28263db783529b12731d33dd70e70f640f6bdaf82e2f8beb41ded3"
+byte_size = 309425
+sha256 = "02b793a3756e0b833c7155796f8c8a31f2678246406740b7081350d44ffad87e"
 build_output = "release/libsnolc_adapter_socks5.so"
 
 [[artifacts]]
