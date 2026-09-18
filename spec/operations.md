@@ -121,6 +121,15 @@ The helper generates 32 random bytes, sends their SHA-256 in `credential.add`,
 checks the committed response, and places the bearer in the returned URI. The
 server database never stores the bearer.
 
+`clients/snolcNG/examples/panel.rs` shows the same panel integration through
+the Rust APIs:
+
+```sh
+cargo run --locked -p snolc-ng --no-default-features --example panel -- \
+  /run/snolc/snolc.sock policy-main provision-profile.toml \
+  <32-hex-user-id> panel-main 2
+```
+
 ## quota and revoke
 
 Add quota with the next sequence:
