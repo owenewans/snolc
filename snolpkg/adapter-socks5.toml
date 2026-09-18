@@ -19,6 +19,7 @@ package = "snolc-adapter-socks5"
 [[templates]]
 role = "client"
 source = "config/templates/modules/socks5.toml"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-linux-android", "armv7-linux-androideabi"]
 
 [[platforms]]
 target = "x86_64-unknown-linux-gnu"

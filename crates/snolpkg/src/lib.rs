@@ -137,6 +137,7 @@ pub struct PlatformCapability {
 pub struct PackageTemplate {
     pub role: String,
     pub source: PathBuf,
+    pub targets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -235,22 +236,8 @@ impl PublicationManifest {
                 return Err(PackageError::ManifestValue);
             }
         }
-        let mut template_roles = BTreeSet::new();
-        let mut template_sources = BTreeSet::new();
-        for template in &self.templates {
-            validate_module_name(&template.role)?;
-            validate_relative_path(&template.source)?;
-            if !roles.contains(&template.role)
-                || !template_roles.insert(&template.role)
-                || !template_sources.insert(&template.source)
-            {
-                return Err(PackageError::ManifestValue);
-            }
-        }
-        if template_roles != roles {
-            return Err(PackageError::ManifestValue);
-        }
         let mut platform_targets = BTreeSet::new();
+        let mut platform_pairs = BTreeSet::new();
         for platform in &self.platforms {
             if platform.target.is_empty()
                 || platform.roles.is_empty()
@@ -262,7 +249,10 @@ impl PublicationManifest {
             let mut platform_roles = BTreeSet::new();
             for role in &platform.roles {
                 validate_module_name(role)?;
-                if !roles.contains(role) || !platform_roles.insert(role) {
+                if !roles.contains(role)
+                    || !platform_roles.insert(role)
+                    || !platform_pairs.insert((platform.target.clone(), role.clone()))
+                {
                     return Err(PackageError::ManifestValue);
                 }
             }
@@ -273,6 +263,30 @@ impl PublicationManifest {
                     return Err(PackageError::ManifestValue);
                 }
             }
+        }
+        let mut template_pairs = BTreeSet::new();
+        let mut template_sources = BTreeSet::new();
+        for template in &self.templates {
+            validate_module_name(&template.role)?;
+            validate_relative_path(&template.source)?;
+            if !roles.contains(&template.role)
+                || template.targets.is_empty()
+                || !template_sources.insert(&template.source)
+            {
+                return Err(PackageError::ManifestValue);
+            }
+            let mut targets = BTreeSet::new();
+            for target in &template.targets {
+                if !platform_targets.contains(target)
+                    || !targets.insert(target)
+                    || !template_pairs.insert((target.clone(), template.role.clone()))
+                {
+                    return Err(PackageError::ManifestValue);
+                }
+            }
+        }
+        if template_pairs != platform_pairs {
+            return Err(PackageError::ManifestValue);
         }
         let mut dependencies = BTreeSet::new();
         for dependency in &self.dependencies {
@@ -644,19 +658,29 @@ pub fn install_source(
     fs::create_dir_all(entry.parent().ok_or(PackageError::Path)?)?;
     fs::copy(&built, &entry)?;
     copy_notices(&source_tree, &content)?;
-    copy_templates(&publication.manifest, &source_tree, &content)?;
+    copy_templates(
+        &publication.manifest,
+        &artifact.target,
+        &source_tree,
+        &content,
+    )?;
     install_extracted(&publication.manifest, source, artifact, &content, options)
 }
 
 fn copy_templates(
     manifest: &PublicationManifest,
+    target: &str,
     source: &Path,
     content: &Path,
 ) -> Result<(), PackageError> {
     let source = source.canonicalize()?;
     let output = content.join("templates");
     fs::create_dir(&output)?;
-    for template in &manifest.templates {
+    for template in manifest
+        .templates
+        .iter()
+        .filter(|template| template.targets.iter().any(|candidate| candidate == target))
+    {
         let input = source.join(&template.source).canonicalize()?;
         if !input.starts_with(&source) || !input.is_file() {
             return Err(PackageError::Template);
@@ -759,7 +783,12 @@ fn install_extracted(
     if !entry.is_file() {
         return Err(PackageError::Entry);
     }
-    for template in &manifest.templates {
+    for template in manifest.templates.iter().filter(|template| {
+        template
+            .targets
+            .iter()
+            .any(|target| target == &artifact.target)
+    }) {
         let template = content
             .join("templates")
             .join(format!("{}.toml", template.role));
@@ -1366,10 +1395,12 @@ package = "snolc-carrier-tcp"
 [[templates]]
 role = "client"
 source = "config/templates/modules/tcp-client.toml"
+targets = ["x86_64-unknown-linux-gnu"]
 
 [[templates]]
 role = "server"
 source = "config/templates/modules/tcp.toml"
+targets = ["x86_64-unknown-linux-gnu"]
 
 [[platforms]]
 target = "x86_64-unknown-linux-gnu"
@@ -1398,6 +1429,36 @@ build_output = "release/libsnolc_carrier_tcp.so"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn copies_only_the_installed_targets_template() {
+        let root = temporary_directory("target-template");
+        let source = root.join("source");
+        let content = root.join("content");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&content).unwrap();
+        fs::write(source.join("linux.toml"), b"mode = \"linux\"\n").unwrap();
+        fs::write(source.join("android.toml"), b"mode = \"android-fd\"\n").unwrap();
+        let mut manifest = PublicationManifest::parse(MANIFEST.as_bytes()).unwrap();
+        manifest.templates = vec![
+            PackageTemplate {
+                role: "client".into(),
+                source: "linux.toml".into(),
+                targets: vec!["x86_64-unknown-linux-gnu".into()],
+            },
+            PackageTemplate {
+                role: "client".into(),
+                source: "android.toml".into(),
+                targets: vec!["aarch64-linux-android".into()],
+            },
+        ];
+        copy_templates(&manifest, "aarch64-linux-android", &source, &content).unwrap();
+        assert_eq!(
+            fs::read_to_string(content.join("templates/client.toml")).unwrap(),
+            "mode = \"android-fd\"\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1757,10 +1818,12 @@ package = "snolc-test"
 [[templates]]
 role = "client"
 source = "config/client.toml"
+targets = ["{0}"]
 
 [[templates]]
 role = "server"
 source = "config/server.toml"
+targets = ["{0}"]
 
 [[platforms]]
 target = "{0}"
@@ -2010,10 +2073,12 @@ package = "source-test"
 [[templates]]
 role = "client"
 source = "config/client.toml"
+targets = ["{1}"]
 
 [[templates]]
 role = "server"
 source = "config/server.toml"
+targets = ["{1}"]
 
 [[platforms]]
 target = "{1}"

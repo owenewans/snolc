@@ -19,10 +19,12 @@ package = "snolc-policy-dummy"
 [[templates]]
 role = "client"
 source = "config/templates/modules/policy-dummy.toml"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-linux-android", "armv7-linux-androideabi"]
 
 [[templates]]
 role = "server"
 source = "config/templates/modules/policy-dummy-server.toml"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-linux-android", "armv7-linux-androideabi"]
 
 [[platforms]]
 target = "x86_64-unknown-linux-gnu"

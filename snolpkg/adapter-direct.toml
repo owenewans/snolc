@@ -19,6 +19,7 @@ package = "snolc-adapter-direct"
 [[templates]]
 role = "server"
 source = "config/templates/modules/direct.toml"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-linux-android", "armv7-linux-androideabi"]
 
 [[platforms]]
 target = "x86_64-unknown-linux-gnu"

@@ -19,10 +19,12 @@ package = "snolc-carrier-tcp"
 [[templates]]
 role = "client"
 source = "config/templates/modules/tcp-client.toml"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-linux-android", "armv7-linux-androideabi"]
 
 [[templates]]
 role = "server"
 source = "config/templates/modules/tcp.toml"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-linux-android", "armv7-linux-androideabi"]
 
 [[platforms]]
 target = "x86_64-unknown-linux-gnu"
