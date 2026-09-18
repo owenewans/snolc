@@ -7,6 +7,13 @@ if (sdkRoot == null) {
 }
 def ndkRoot = new File(sdkRoot, "ndk/29.0.14206865")
 def toolchain = new File(ndkRoot, "toolchains/llvm/prebuilt/linux-x86_64/bin")
+def releaseSigning = [
+    store: System.getenv("SNOLC_ANDROID_KEYSTORE"),
+    storePassword: System.getenv("SNOLC_ANDROID_STORE_PASSWORD"),
+    alias: System.getenv("SNOLC_ANDROID_KEY_ALIAS"),
+    keyPassword: System.getenv("SNOLC_ANDROID_KEY_PASSWORD"),
+]
+def releaseSigningConfigured = releaseSigning.values().every { it != null && !it.isEmpty() }
 def rustPackages = [
     "snolc-ng",
     "snolc-adapter-tun",
@@ -53,6 +60,32 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            release {
+                storeFile = file(releaseSigning.store)
+                storePassword = releaseSigning.storePassword
+                keyAlias = releaseSigning.alias
+                keyPassword = releaseSigning.keyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.release
+            }
+        }
+    }
+}
+
+gradle.taskGraph.whenReady { graph ->
+    def buildsRelease = graph.allTasks.any { it.name.toLowerCase().contains("release") }
+    if (buildsRelease && !releaseSigningConfigured) {
+        throw new GradleException("release signing environment is incomplete")
     }
 }
 
