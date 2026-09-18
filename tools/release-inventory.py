@@ -100,6 +100,7 @@ def main() -> None:
         )
 
     module_assets, revisions = module_metadata(source)
+    build_source_commit = revisions.pop() if len(revisions) == 1 else sorted(revisions)
     files = []
     for path in sorted(value for value in assets.iterdir() if value.is_file()):
         target = module_assets.get(path.name)
@@ -126,8 +127,9 @@ def main() -> None:
         "package_version": workspace["workspace"]["package"]["version"],
         "wire_version": 1,
         "publication_commit": command(["git", "rev-parse", "HEAD"], source),
+        "build_source_commit": build_source_commit,
         "dirty": False,
-        "module_source_commit": revisions.pop() if len(revisions) == 1 else sorted(revisions),
+        "module_source_commit": build_source_commit,
         "rustc": command(["rustc", "+1.98.1", "--version", "--verbose"], source),
         "cargo": command(["cargo", "+1.98.1", "--version", "--verbose"], source),
         "cargo_lock_sha256": sha256(source / "Cargo.lock"),
