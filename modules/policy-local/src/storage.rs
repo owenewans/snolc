@@ -504,6 +504,7 @@ fn prefix_end(prefix: &str) -> Result<String, StorageError> {
 
 fn prepare_path(path: &Path) -> Result<(), StorageError> {
     let directory = path.parent().ok_or(StorageError::Invalid)?;
+    #[cfg(unix)]
     let existed = directory.exists();
     fs::create_dir_all(directory)?;
     #[cfg(unix)]

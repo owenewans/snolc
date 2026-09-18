@@ -866,12 +866,15 @@ fn secure_directory(path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn secure_file(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 

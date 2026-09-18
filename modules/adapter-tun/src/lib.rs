@@ -2,10 +2,14 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::task::{Context, Poll, Waker};
 
@@ -13,10 +17,18 @@ use serde::Deserialize;
 use snolc_sdk::abi::{self, SnolAdapterApiV1, SnolDatagramIoV1, SnolHostApiV1, SnolWakeHandle};
 use snolc_sdk::{DatagramIo, DatagramRecv, ForeignDatagramIo};
 
+#[cfg(not(unix))]
+type RawFd = i32;
+
+#[cfg(unix)]
 pub struct TunFd {
     file: File,
 }
 
+#[cfg(not(unix))]
+pub struct TunFd;
+
+#[cfg(unix)]
 impl TunFd {
     #[cfg(target_os = "linux")]
     pub fn open(name: &str) -> io::Result<Self> {
@@ -84,11 +96,36 @@ impl TunFd {
         self.file.read(output)
     }
 
-    pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
-        self.file.write_all(packet)
+    pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<usize> {
+        self.file.write(packet)
     }
 }
 
+#[cfg(not(unix))]
+impl TunFd {
+    pub fn duplicate_fd(_fd: RawFd) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TUN descriptors are unsupported",
+        ))
+    }
+
+    pub fn read_packet(&mut self, _output: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TUN descriptors are unsupported",
+        ))
+    }
+
+    pub fn write_packet(&mut self, _packet: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TUN descriptors are unsupported",
+        ))
+    }
+}
+
+#[cfg(unix)]
 fn set_nonblocking(file: &File) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
@@ -254,7 +291,7 @@ fn poll_instance(instance: u64, _wake: SnolWakeHandle) -> u32 {
             }
         }
         if let Some(length) = state.egress_len {
-            match state.tun.file.write(&state.egress[..length]) {
+            match state.tun.write_packet(&state.egress[..length]) {
                 Ok(written) if written == length => state.egress_len = None,
                 Ok(_) => return abi::STATUS_IO,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -352,7 +389,7 @@ snolc_sdk::declare_stateful_module! {
     policy: std::ptr::null(),
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::VecDeque;
     use std::os::fd::{AsRawFd, IntoRawFd};
