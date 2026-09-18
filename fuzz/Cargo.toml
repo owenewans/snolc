@@ -1,0 +1,53 @@
+[package]
+name = "snolc-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+snolc = { path = "../crates/snolc" }
+snolc-ng = { path = "../clients/snolcNG", default-features = false }
+snolc-policy-local = { path = "../modules/policy-local" }
+snolpkg = { path = "../crates/snolpkg" }
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy-frame"
+path = "fuzz_targets/policy_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile-uri"
+path = "fuzz_targets/profile_uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive-path"
+path = "fuzz_targets/archive_path.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
