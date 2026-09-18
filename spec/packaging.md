@@ -102,6 +102,12 @@ publish Linux x86_64 and Android arm64/armv7 artifacts built from commit
 third-party dependency notices. Release checks compare archive size and SHA-256
 to every signed row before upload.
 
+`tools/package-release.py` consumes a checkout at that revision and explicit
+prebuilt target directories. It writes deterministic archives, updates signed
+artifact rows, and signs each manifest with the release Ed25519 key. Run
+`tools/verify-release.py <dist>` before upload. A second package run must produce
+byte-identical archives.
+
 ## failure behavior
 
 A signature, hash, size, target, dependency, path, extraction, build, or move
