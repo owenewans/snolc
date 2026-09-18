@@ -23,14 +23,14 @@ def rustPackages = [
 
 android {
     namespace = "org.owenewans.snolc"
-    compileSdk = 37
-    buildToolsVersion = "37.0.0"
+    compileSdk = 36
+    buildToolsVersion = "36.0.0"
     ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "org.owenewans.snolc"
         minSdk = 24
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 1
         versionName = "0.0.1"
         ndk {
