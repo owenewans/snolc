@@ -20,11 +20,12 @@ modular userspace network stack for linux and android.
 
 ## install
 
-snolc 0.0.1 is under development. Build the development branch with Rust
-1.98.1:
+Download signed 0.0.1 artifacts from the
+[release](https://github.com/owenewans/snolc/releases/tag/v0.0.1), or build the
+source with Rust 1.98.1:
 
 ```sh
-git clone --branch dev https://github.com/owenewans/snolc
+git clone --branch v0.0.1 https://github.com/owenewans/snolc
 cd snolc
 cargo build --locked
 ```
@@ -39,8 +40,8 @@ snolc run snolc.toml
 snolc control /run/snolc/snolc.sock policy-main request.toml
 ```
 
-Native modules run in the process and must come from a trusted source. The
-project will publish 0.0.1 after the acceptance suite and Tier 1 tests pass.
+Native modules run in the process and must come from a trusted source. Release
+notes list measured gates and unavailable platform checks.
 
 ## architecture
 
