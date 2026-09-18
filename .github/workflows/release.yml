@@ -59,7 +59,11 @@ jobs:
     steps:
       - name: install build tools
         run: |
-          printf '%s\n' 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20240612T000000Z buster main' > /etc/apt/sources.list
+          printf '%s\n' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20240612T000000Z buster main' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20240612T000000Z buster/updates main' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20240612T000000Z buster-updates main' \
+            > /etc/apt/sources.list
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install --yes build-essential ca-certificates curl git python3 pkg-config cmake libegl1-mesa-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev ${{ matrix.apt }}
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
