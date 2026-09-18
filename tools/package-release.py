@@ -17,6 +17,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--dist", type=Path, required=True)
     parser.add_argument("--signing-key", type=Path, required=True)
     parser.add_argument("--output", action="append", required=True, metavar="TARGET=DIR")
+    parser.add_argument("--bundle-output", action="append", default=[], metavar="TARGET=DIR")
     return parser.parse_args()
 
 
@@ -25,6 +26,7 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     source = args.source.resolve()
     outputs = parse_outputs(args.output)
+    bundle_outputs = parse_outputs(args.bundle_output)
     dist = args.dist.resolve()
     if not source.is_dir() or not args.signing_key.is_file():
         raise SystemExit("source checkout or signing key is missing")
@@ -47,7 +49,7 @@ def main() -> None:
 
     for manifest_path in sorted((root / "snolpkg").glob("*.toml")):
         manifest = tomllib.loads(manifest_path.read_text())
-        notices = dependency_notices(manifest["build"]["package"], local, packages, nodes)
+        notices = dependency_notices([manifest["build"]["package"]], local, packages, nodes)
         updates = {}
         for artifact in manifest["artifacts"]:
             target = artifact["target"]
@@ -82,6 +84,15 @@ def main() -> None:
             ],
             check=True,
         )
+    notices = dependency_notices(sorted(local), local, packages, nodes)
+    for target, output in sorted(bundle_outputs.items()):
+        write_bundle(
+            dist / f"snolc-0.0.1-{target}.tar.gz",
+            source,
+            target,
+            output,
+            notices,
+        )
     print(f"created {len(list(dist.glob('*.tar.gz')))} release artifacts")
 
 
@@ -96,9 +107,9 @@ def parse_outputs(values: list[str]) -> dict[str, Path]:
 
 
 def dependency_notices(
-    crate: str, local: dict, packages: dict, nodes: dict
+    crates: list[str], local: dict, packages: dict, nodes: dict
 ) -> bytes:
-    pending = [local[crate]]
+    pending = [local[crate] for crate in crates]
     seen = set()
     while pending:
         package = pending.pop()
@@ -157,6 +168,70 @@ def write_archive(
     with path.open("wb") as output:
         with gzip.GzipFile(
             filename="", mode="wb", fileobj=output, mtime=0, compresslevel=9
+        ) as compressed:
+            compressed.write(raw.getvalue())
+
+
+def write_bundle(
+    path: Path,
+    source: Path,
+    target: str,
+    output: Path,
+    notices: bytes,
+) -> None:
+    if "windows" in target:
+        binary_suffix = ".exe"
+        library_prefix = ""
+        library_suffix = ".dll"
+    elif "apple" in target:
+        binary_suffix = ""
+        library_prefix = "lib"
+        library_suffix = ".dylib"
+    else:
+        binary_suffix = ""
+        library_prefix = "lib"
+        library_suffix = ".so"
+    files = []
+    for name in ("snolc", "snolpkg"):
+        artifact = output / f"{name}{binary_suffix}"
+        if not artifact.is_file():
+            raise SystemExit(f"missing bundle binary: {artifact}")
+        files.append((f"bin/{artifact.name}", artifact, 0o755))
+    gui = output / f"snolcNG{binary_suffix}"
+    if gui.is_file():
+        files.append((f"bin/{gui.name}", gui, 0o755))
+    modules = (
+        "adapter_direct",
+        "adapter_http_connect",
+        "adapter_socks5",
+        "adapter_tun",
+        "carrier_ssh",
+        "carrier_tcp",
+        "policy_dummy",
+        "policy_local",
+        "protection_dummy",
+        "protection_noise",
+    )
+    for module in modules:
+        name = f"{library_prefix}snolc_{module}{library_suffix}"
+        artifact = output / name
+        if not artifact.is_file():
+            raise SystemExit(f"missing bundle module: {artifact}")
+        files.append((f"lib/{name}", artifact, 0o755))
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name, artifact, mode in sorted(files):
+            add_bytes(archive, name, artifact.read_bytes(), mode)
+        add_bytes(archive, "include/snolc.h", (source / "include/snolc.h").read_bytes(), 0o644)
+        add_bytes(archive, "LICENSE", (source / "LICENSE").read_bytes(), 0o644)
+        add_bytes(archive, "THIRD_PARTY_NOTICES.txt", notices, 0o644)
+        for template in sorted((source / "config/templates").rglob("*.toml")):
+            relative = template.relative_to(source)
+            add_bytes(archive, relative.as_posix(), template.read_bytes(), 0o644)
+    with path.open("wb") as output_file:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=output_file, mtime=0, compresslevel=9
         ) as compressed:
             compressed.write(raw.getvalue())
 

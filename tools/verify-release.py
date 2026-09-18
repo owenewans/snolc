@@ -40,9 +40,15 @@ def main() -> None:
             rows += 1
 
     disk_assets = {path.name for path in dist.glob("*.tar.gz")}
-    if rows != 30 or disk_assets != assets:
-        fail(f"expected 30 exact assets, found {rows} rows and {len(disk_assets)} files")
-    print(f"verified {rows} release artifacts")
+    bundle_assets = {name for name in disk_assets if name.startswith("snolc-0.0.1-")}
+    if rows != 30 or disk_assets - bundle_assets != assets:
+        fail(
+            f"expected 30 exact module assets, found {rows} rows and "
+            f"{len(disk_assets - bundle_assets)} files"
+        )
+    for name in sorted(bundle_assets):
+        verify_bundle(root, dist / name)
+    print(f"verified {rows} module artifacts and {len(bundle_assets)} bundles")
 
 
 def verify_archive(root: Path, path: Path, manifest: dict, target: str) -> None:
@@ -84,6 +90,71 @@ def verify_archive(root: Path, path: Path, manifest: dict, target: str) -> None:
                 fail(f"empty notice file {name}: {path.name}")
     if seen != expected:
         fail(f"archive entries differ: {path.name}")
+
+
+def verify_bundle(root: Path, path: Path) -> None:
+    data = path.read_bytes()
+    if len(data) < 10 or int.from_bytes(data[4:8], "little") != 0:
+        fail(f"gzip timestamp is not zero: {path.name}")
+    target = path.name.removeprefix("snolc-0.0.1-").removesuffix(".tar.gz")
+    if "windows" in target:
+        binary_suffix = ".exe"
+        library_prefix = ""
+        library_suffix = ".dll"
+    elif "apple" in target:
+        binary_suffix = ""
+        library_prefix = "lib"
+        library_suffix = ".dylib"
+    else:
+        binary_suffix = ""
+        library_prefix = "lib"
+        library_suffix = ".so"
+    modules = {
+        f"lib/{library_prefix}snolc_{name}{library_suffix}"
+        for name in (
+            "adapter_direct",
+            "adapter_http_connect",
+            "adapter_socks5",
+            "adapter_tun",
+            "carrier_ssh",
+            "carrier_tcp",
+            "policy_dummy",
+            "policy_local",
+            "protection_dummy",
+            "protection_noise",
+        )
+    }
+    required = {
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.txt",
+        "include/snolc.h",
+        f"bin/snolc{binary_suffix}",
+        f"bin/snolpkg{binary_suffix}",
+        *modules,
+        *(template.relative_to(root).as_posix() for template in (root / "config/templates").rglob("*.toml")),
+    }
+    seen = set()
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive:
+            name = member.name
+            pure = PurePosixPath(name)
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or name in seen
+                or not member.isfile()
+                or member.uid != 0
+                or member.gid != 0
+                or member.mtime != 0
+            ):
+                fail(f"invalid bundle entry {name}: {path.name}")
+            mode = 0o755 if name.startswith(("bin/", "lib/")) else 0o644
+            if member.mode != mode:
+                fail(f"invalid bundle mode for {name}: {path.name}")
+            seen.add(name)
+    optional = {f"bin/snolcNG{binary_suffix}"}
+    if seen - optional != required:
+        fail(f"incomplete release bundle: {path.name}")
 
 
 if __name__ == "__main__":
