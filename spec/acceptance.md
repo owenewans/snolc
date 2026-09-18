@@ -84,7 +84,8 @@ SNOLC_LONG_RUN_SECONDS=3600 SNOLC_STORED_USERS=10000 \
 ```
 
 The test prints duration, stored users, flows, payload throughput, RSS, and HWM.
-It fails outside 0.95..1.05 Mbit/s or the 32/64/96 MiB RSS limits.
+It opens eight TCP and eight UDP flows across two users. It fails outside
+0.95..1.05 Mbit/s or the 32/64/96 MiB RSS limits.
 
 Measure the available host's unthrottled ceiling through the same path:
 
