@@ -72,7 +72,6 @@ you trust.
 - [acceptance](spec/acceptance.md)
 - [operations](spec/operations.md)
 - [benchmarks](spec/benchmarks.md)
-- [comparison plan](spec/xray-and-sing-vs-snolc.md)
 
 ## license
 

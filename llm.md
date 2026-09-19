@@ -317,8 +317,7 @@ target and host. Mark missing hardware `unverified`; do not convert it to pass.
 - `spec/platforms.md`: target tiers and platform limits
 - `spec/operations.md`: deployment and maintenance
 - `spec/acceptance.md`: required release evidence
-- `spec/benchmarks.md`: stress methods and raw result policy
-- `spec/xray-and-sing-vs-snolc.md`: matched comparison protocol
+- `spec/benchmarks.md`: resource, loopback and real-server results
 
 ## change checklist
 
